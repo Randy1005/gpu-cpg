@@ -1,5 +1,6 @@
-#include "gpucpg.cuh"
-
+#include "gpucpg.h"
+#include <thrust/execution_policy.h>
+#include <thrust/device_vector.h>
 
 namespace gpucpg {
 

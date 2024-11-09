@@ -1,4 +1,4 @@
-#include "gpucpg.cuh"
+#include "gpucpg.h"
 
 int main() {
   //int const N = 1000;

@@ -10,6 +10,6 @@ foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}
     PUBLIC ${PROJECT_SOURCE_DIR}/gpucpg) 
   target_link_libraries(${example}
-    PUBLIC gpucpg CCCL::CCCL)
+    PUBLIC gpucpg)
 
 endforeach()

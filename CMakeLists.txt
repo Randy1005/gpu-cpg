@@ -2,9 +2,6 @@ cmake_minimum_required(VERSION 3.21.0)
 
 project(gpuCPG VERSION 1.0 LANGUAGES CXX CUDA)
 
-
-include_directories(/usr/local/cuda/include)
-
 # This example uses the CMake Package Manager (CPM) to simplify fetching CCCL from GitHub
 # For more information, see https://github.com/cpm-cmake/CPM.cmake
 include(cmake/CPM.cmake)
@@ -20,7 +17,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 # Default to building for the GPU on the current system
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
+  set(CMAKE_CUDA_ARCHITECTURES 86)
 endif()
 
 
