@@ -1,9 +1,11 @@
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/build/examples)
 
-add_executable(reduce ${GPUCPG_EXAMPLE_DIR}/reduce.cpp)
+add_executable(reduce ${GPUCPG_EXAMPLE_DIR}/reduce.cu)
+add_executable(read_input ${GPUCPG_EXAMPLE_DIR}/read_input.cpp)
 
 list(APPEND GPUCPG_EXAMPLES
   reduce
+  read_input
 )
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
