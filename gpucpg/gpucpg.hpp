@@ -27,9 +27,8 @@ private:
   std::vector<float> _h_fanout_wgts;
 
   // store source and sink vertices
-  std::vector<int> srcs;
-  std::vector<int> sinks;
-
+  std::vector<int> _srcs;
+  std::vector<int> _sinks;
 };
 
 

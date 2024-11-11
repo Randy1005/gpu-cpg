@@ -24,8 +24,8 @@ endif()
 # compile and link CUDA code separately from the rest of your code to
 # speed up the build process and reduce the size of your final executable.
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wall -O3 --extended-lambda")
-
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wall -O3 --extended-lambda -g -G")
+set(CUDA_NVCC_FLAGS "-g -G")
 
 # set compilation flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")

@@ -75,7 +75,7 @@ void CpGen::read_input(const std::string& filename) {
     _h_fanout_adjp[i + 1] = _h_fanout_adjp[i] + fanout_edges[i].size();
     
     if (fanout_edges[i].size() == 0) {
-      sinks.emplace_back(i);
+      _sinks.emplace_back(i);
     }
     
     for (const auto& [to, weight] : fanout_edges[i]) {
@@ -89,7 +89,7 @@ void CpGen::read_input(const std::string& filename) {
     _h_fanin_adjp[i + 1] = _h_fanin_adjp[i] + fanin_edges[i].size();
     
     if (fanin_edges[i].size() == 0) {
-      srcs.emplace_back(i);
+      _srcs.emplace_back(i);
     }
 
     for (const auto& [from, weight] : fanin_edges[i]) {
@@ -134,6 +134,7 @@ __global__ void prop_distance(
     int new_dist_int = new_distance * 100.0f;
 
     atomicMin(&distances_cache[neighbor], new_dist_int);
+    dist_updated[neighbor] = true;
   }
 
 }
@@ -161,9 +162,12 @@ void CpGen::report_paths(int k) {
   // indicator of whether the distance of a vertex is updated
   thrust::device_vector<bool> dists_updated(num_verts, false);
   
+  // each vertex's successor
+  thrust::device_vector<int> successors(num_verts, -1);
+
   // set the distance of the sink vertices to 0
   // and they are ready to be propagated
-  for (const auto sink : sinks) {
+  for (const auto sink : _sinks) {
     dists_cache[sink] = 0;
     dists_updated[sink] = true;
   }
@@ -175,16 +179,23 @@ void CpGen::report_paths(int k) {
   int* d_dists_cache = thrust::raw_pointer_cast(&dists_cache[0]);
   bool* d_dists_updated = thrust::raw_pointer_cast(&dists_updated[0]);
 
-  
-  prop_distance<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
-    (num_verts, 
-     num_fanin_edges,
-     d_fanin_adjp,
-     d_fanin_adjncy,
-     d_fanin_wgts,
-     d_dists_cache,
-     d_dists_updated); 
+ 
+  for (size_t i = 0; i < 3; i++) { 
+    prop_distance<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_fanin_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_dists_updated);
+    
 
+    //thrust::copy(dists_cache.begin(), dists_cache.end(), std::ostream_iterator<float>(std::cout, " "));
+    //std::cout << '\n';
+    //thrust::copy(dists_updated.begin(), dists_updated.end(), std::ostream_iterator<float>(std::cout, " "));
+    //std::cout << '\n';
+  }
 }
 
 
@@ -196,8 +207,7 @@ void CpGen::dump_csrs(std::ostream& os) const {
     }
     os << "\nweights: ";
     for (int j = _h_fanin_adjp[i]; j < _h_fanin_adjp[i+1]; j++) {
-      auto from_vertex = _h_fanin_adjncy[j];
-      os << _h_fanin_wgts[from_vertex] << '(' << from_vertex << "->" << i << ") ";
+      os << _h_fanin_wgts[j] << '(' << _h_fanin_adjncy[j] << "->" << i << ") ";
     }
     os << '\n';
   } 
@@ -209,12 +219,24 @@ void CpGen::dump_csrs(std::ostream& os) const {
     }
     os << "\nweights: ";
     for (int j = _h_fanout_adjp[i]; j < _h_fanout_adjp[i+1]; j++) {
-      auto to_vertex = _h_fanout_adjncy[j];
-      os << _h_fanout_wgts[to_vertex] << '(' << i << "->" << to_vertex << ") ";
+      os << _h_fanout_wgts[j] << '(' << i << "->" << _h_fanout_adjncy[j] << ") ";
     }
 
     os << '\n';
+  }
+
+
+  os << "source vertices: ";
+  for (const auto& src : _srcs) {
+    os << src << ' ';
   } 
+  os << '\n';
+
+  os << "sink vertices: ";
+  for (const auto& sink : _sinks) {
+    os << sink << ' ';
+  } 
+  os << '\n';
 }
 
 void CpGen::do_reduction() {
