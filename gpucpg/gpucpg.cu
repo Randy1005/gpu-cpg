@@ -108,7 +108,8 @@ __global__ void prop_distance(
   int* edges,
   float* wgts,
   int* distances_cache,
-  bool* dist_updated) {
+  bool* dist_updated,
+  int* succs) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   
   if (tid >= num_verts) {
@@ -132,9 +133,14 @@ __global__ void prop_distance(
     // multiply new distance by 100 to make it a integer
     // so we can work with atomicMin
     int new_dist_int = new_distance * 100.0f;
-
+    
     atomicMin(&distances_cache[neighbor], new_dist_int);
-    dist_updated[neighbor] = true;
+    int mult_wgt = wgt * 100;
+    if (distances_cache[neighbor] == distances_cache[tid] + mult_wgt) {
+      succs[neighbor] = tid;
+      dist_updated[neighbor] = true;
+    }
+
   }
 
 }
@@ -178,7 +184,7 @@ void CpGen::report_paths(int k) {
   float* d_fanin_wgts = thrust::raw_pointer_cast(&fanin_wgts[0]);
   int* d_dists_cache = thrust::raw_pointer_cast(&dists_cache[0]);
   bool* d_dists_updated = thrust::raw_pointer_cast(&dists_updated[0]);
-
+  int* d_succs = thrust::raw_pointer_cast(&successors[0]);
  
   for (size_t i = 0; i < 3; i++) { 
     prop_distance<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
@@ -188,13 +194,16 @@ void CpGen::report_paths(int k) {
        d_fanin_adjncy,
        d_fanin_wgts,
        d_dists_cache,
-       d_dists_updated);
+       d_dists_updated,
+       d_succs);
     
 
-    //thrust::copy(dists_cache.begin(), dists_cache.end(), std::ostream_iterator<float>(std::cout, " "));
-    //std::cout << '\n';
-    //thrust::copy(dists_updated.begin(), dists_updated.end(), std::ostream_iterator<float>(std::cout, " "));
-    //std::cout << '\n';
+    thrust::copy(dists_cache.begin(), dists_cache.end(), std::ostream_iterator<float>(std::cout, " "));
+    std::cout << '\n';
+    thrust::copy(dists_updated.begin(), dists_updated.end(), std::ostream_iterator<float>(std::cout, " "));
+    std::cout << '\n';
+    thrust::copy(successors.begin(), successors.end(), std::ostream_iterator<float>(std::cout, " "));
+    std::cout << '\n';
   }
 }
 
@@ -237,15 +246,6 @@ void CpGen::dump_csrs(std::ostream& os) const {
     os << sink << ' ';
   } 
   os << '\n';
-}
-
-void CpGen::do_reduction() {
-  int const N = 1000;
-  thrust::device_vector<int> data(N);
-  thrust::fill(data.begin(), data.end(), 1);
-  int const result = thrust::reduce(thrust::device, data.begin(), data.end(), 0);
-
-  std::cout << "reduce sum=" << result << '\n';
 }
 
 

@@ -2,7 +2,6 @@
 
 int main() {
   gpucpg::CpGen c;
-  c.do_reduction();
 }
 
 

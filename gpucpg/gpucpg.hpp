@@ -10,7 +10,6 @@ namespace gpucpg {
 class CpGen {
 public:
   CpGen() = default;
-  void do_reduction();  
   void read_input(const std::string& filename);
   void report_paths(int k);
   
