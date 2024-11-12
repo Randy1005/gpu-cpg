@@ -16,7 +16,6 @@
 
 namespace gpucpg {
 
-  
 void checkError_t(cudaError_t error, std::string msg) {
   if (error != cudaSuccess) {
     printf("%s: %d\n", msg.c_str(), error);
@@ -108,6 +107,21 @@ void CpGen::read_input(const std::string& filename) {
 }
 
 
+__global__ void check_if_no_dists_updated(
+  int num_verts, 
+  bool* dists_updated,
+  bool* converged) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+  if (tid >= num_verts) {
+    return;
+  }
+
+  if (dists_updated[tid]) {
+    *converged = false;
+  }
+  
+}
+
 __global__ void prop_distance(
   int num_verts, 
   int num_edges,
@@ -116,8 +130,7 @@ __global__ void prop_distance(
   float* wgts,
   int* distances_cache,
   bool* dist_updated,
-  int* succs,
-  bool* converged) {
+  int* succs) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   
   if (tid >= num_verts) {
@@ -146,7 +159,6 @@ __global__ void prop_distance(
     // match the edge weight to update the successor array
     if (distances_cache[neighbor] == distances_cache[tid] + wgt) {
       succs[neighbor] = tid;
-      *converged = false;
     }
     dist_updated[neighbor] = true;
   }
@@ -201,7 +213,7 @@ void CpGen::report_paths(int k) {
   checkError_t(
     cudaMemcpy(d_converged, h_converged.get(), sizeof(bool),
       cudaMemcpyHostToDevice),
-    "d_converged memcpy failed.");
+    "d_converged memcpy failed."); 
 
   int iters{0};
   size_t prop_time{0};
@@ -212,7 +224,10 @@ void CpGen::report_paths(int k) {
     // currently we reset the converged flag every time
     // befor we invoke the kernel, and copy the flag back
     // to the host to check, but it's slower than the kernel itself
-    cudaMemset(d_converged, true, sizeof(bool));
+    checkError_t(
+      cudaMemset(d_converged, true, sizeof(bool)), 
+      "memset d_converged failed.");
+    
     prop_distance<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
       (num_verts, 
        num_fanin_edges,
@@ -221,11 +236,18 @@ void CpGen::report_paths(int k) {
        d_fanin_wgts,
        d_dists_cache,
        d_dists_updated,
-       d_succs,
-       d_converged);
-    
-    cudaMemcpy(h_converged.get(), d_converged, sizeof(bool),
-        cudaMemcpyDeviceToHost); 
+       d_succs);
+
+    check_if_no_dists_updated<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, d_dists_updated, d_converged);
+
+    checkError_t(
+      cudaMemcpy(
+        h_converged.get(), 
+        d_converged, 
+        sizeof(bool), 
+        cudaMemcpyDeviceToHost),
+      "memcpy d_converged failed.");
 
     if (*h_converged) {
       break;
@@ -245,6 +267,18 @@ void CpGen::report_paths(int k) {
   
   std::cout << "prop_distance converged with " << iters << " iters.\n";
   std::cout << "prop_disance runtime: " << prop_time << " us.\n";
+
+
+
+
+
+
+
+
+
+
+
+  cudaFree(d_converged);
 }
 
 

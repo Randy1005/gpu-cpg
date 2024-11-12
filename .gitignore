@@ -8,3 +8,5 @@
 build/
 build*/
 tags
+*.swp
+*.swo
