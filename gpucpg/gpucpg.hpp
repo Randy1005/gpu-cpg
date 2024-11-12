@@ -4,6 +4,7 @@
 #include <fstream>
 #include <vector>
 #include <limits>
+#include <chrono>
 
 namespace gpucpg {
 

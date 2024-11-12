@@ -16,9 +16,7 @@ CPMAddPackage(
 set(CMAKE_CXX_STANDARD 17)
 
 # Default to building for the GPU on the current system
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 86)
-endif()
+set(CMAKE_CUDA_ARCHITECTURES 86)
 
 
 # compile and link CUDA code separately from the rest of your code to

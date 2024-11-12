@@ -1,11 +1,18 @@
 #include "gpucpg.hpp"
+#include <thrust/device_new.h>
 #include <thrust/execution_policy.h>
 #include <thrust/device_vector.h>
 
-#define BLOCKSIZE 256 
+#define BLOCKSIZE 512 
 // macros for blocks calculation
-#define ROUNDUPBLOCKS(DATALEN, NTHREADS)							     \
+#define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
 		(((DATALEN) + (NTHREADS) - 1) / (NTHREADS))
+
+#define SCALE_UP 100
+
+#define NOW std::chrono::steady_clock::now()
+#define US std::chrono::microseconds
+#define MS std::chrono::milliseconds
 
 namespace gpucpg {
 
@@ -109,7 +116,8 @@ __global__ void prop_distance(
   float* wgts,
   int* distances_cache,
   bool* dist_updated,
-  int* succs) {
+  int* succs,
+  bool* converged) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   
   if (tid >= num_verts) {
@@ -125,24 +133,23 @@ __global__ void prop_distance(
   dist_updated[tid] = false;
   auto edge_start = vertices[tid];
   auto edge_end = (tid == num_verts - 1) ? num_edges : vertices[tid+1]; 
+      
   for (int eid = edge_start; eid < edge_end; eid++) {
-    auto neighbor = edges[eid];
-    auto wgt = wgts[eid];
-    float new_distance = distances_cache[tid] / 100.0f + wgt;
-    
-    // multiply new distance by 100 to make it a integer
+    int neighbor = edges[eid];
+    // multiply new distance by SCALE_UP to make it a integer
     // so we can work with atomicMin
-    int new_dist_int = new_distance * 100.0f;
+    int wgt = wgts[eid] * SCALE_UP;
+    int new_distance = distances_cache[tid] + wgt;
     
-    atomicMin(&distances_cache[neighbor], new_dist_int);
-    int mult_wgt = wgt * 100;
-    if (distances_cache[neighbor] == distances_cache[tid] + mult_wgt) {
+    atomicMin(&distances_cache[neighbor], new_distance);
+
+    // match the edge weight to update the successor array
+    if (distances_cache[neighbor] == distances_cache[tid] + wgt) {
       succs[neighbor] = tid;
-      dist_updated[neighbor] = true;
+      *converged = false;
     }
-
+    dist_updated[neighbor] = true;
   }
-
 }
 
 
@@ -185,8 +192,27 @@ void CpGen::report_paths(int k) {
   int* d_dists_cache = thrust::raw_pointer_cast(&dists_cache[0]);
   bool* d_dists_updated = thrust::raw_pointer_cast(&dists_updated[0]);
   int* d_succs = thrust::raw_pointer_cast(&successors[0]);
- 
-  for (size_t i = 0; i < 3; i++) { 
+  auto h_converged = std::make_unique<bool>(true);
+  bool* d_converged;
+  checkError_t(
+    cudaMalloc(&d_converged, sizeof(bool)),
+    "d_converged allocation failed.");
+
+  checkError_t(
+    cudaMemcpy(d_converged, h_converged.get(), sizeof(bool),
+      cudaMemcpyHostToDevice),
+    "d_converged memcpy failed.");
+
+  int iters{0};
+  size_t prop_time{0};
+  auto beg = NOW;
+  while (true) {
+    // NOTE: is there a better way to check for the 
+    // completion of distance updates?
+    // currently we reset the converged flag every time
+    // befor we invoke the kernel, and copy the flag back
+    // to the host to check, but it's slower than the kernel itself
+    cudaMemset(d_converged, true, sizeof(bool));
     prop_distance<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
       (num_verts, 
        num_fanin_edges,
@@ -195,16 +221,30 @@ void CpGen::report_paths(int k) {
        d_fanin_wgts,
        d_dists_cache,
        d_dists_updated,
-       d_succs);
+       d_succs,
+       d_converged);
     
+    cudaMemcpy(h_converged.get(), d_converged, sizeof(bool),
+        cudaMemcpyDeviceToHost); 
 
-    thrust::copy(dists_cache.begin(), dists_cache.end(), std::ostream_iterator<float>(std::cout, " "));
-    std::cout << '\n';
-    thrust::copy(dists_updated.begin(), dists_updated.end(), std::ostream_iterator<float>(std::cout, " "));
-    std::cout << '\n';
-    thrust::copy(successors.begin(), successors.end(), std::ostream_iterator<float>(std::cout, " "));
-    std::cout << '\n';
+    if (*h_converged) {
+      break;
+    }
+
+    iters++;
   }
+  auto end = NOW;
+ 
+  prop_time = std::chrono::duration_cast<US>(end-beg).count();
+  //thrust::copy(dists_cache.begin(), dists_cache.end(), std::ostream_iterator<float>(std::cout, " "));
+  //std::cout << '\n';
+  //thrust::copy(dists_updated.begin(), dists_updated.end(), std::ostream_iterator<float>(std::cout, " "));
+  //std::cout << '\n';
+  //thrust::copy(successors.begin(), successors.end(), std::ostream_iterator<float>(std::cout, " "));
+  //std::cout << '\n';
+  
+  std::cout << "prop_distance converged with " << iters << " iters.\n";
+  std::cout << "prop_disance runtime: " << prop_time << " us.\n";
 }
 
 
