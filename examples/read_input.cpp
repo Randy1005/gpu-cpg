@@ -5,7 +5,7 @@ int main(int argc, char* argv[]) {
   gpucpg::CpGen cpgen;
   cpgen.read_input(filename);
   //cpgen.dump_csrs(std::cout);
-  cpgen.report_paths(5);
+  cpgen.report_paths(5, 2);
   
   return 0;
 }
