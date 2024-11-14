@@ -13,7 +13,6 @@ int main(int argc, char* argv[]) {
   cpgen.read_input(filename);
   //cpgen.dump_csrs(std::cout);
   cpgen.report_paths(num_paths, max_dev_lvls, "run-1.txt");
-  cpgen.report_paths(num_paths, max_dev_lvls, "run-2.txt");
   
   return 0;
 }

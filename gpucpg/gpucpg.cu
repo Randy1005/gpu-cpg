@@ -159,20 +159,51 @@ __global__ void prop_distance(
     int new_distance = distances_cache[tid] + wgt;
     
     atomicMin(&distances_cache[neighbor], new_distance);
-
-    // match the edge weight to update the successor array
-    if (distances_cache[neighbor] == distances_cache[tid] + wgt) {
-      succs[neighbor] = tid;
-    }
     dist_updated[neighbor] = true;
   }
 }
+
+__global__ void update_successors(
+  int num_verts, 
+  int num_edges,
+  int* vertices,
+  int* edges,
+  float* wgts,
+  int* distances_cache,
+  int* d_succs) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+  if (tid >= num_verts) {
+    return;
+  }
+
+  auto edge_start = vertices[tid];
+  auto edge_end = (tid == num_verts - 1) ? num_edges : vertices[tid+1]; 
+
+  for (int eid = edge_start; eid < edge_end; eid++) {
+    auto neighbor = edges[eid];
+    // multiply new distance by SCALE_UP to make it a integer
+    // so we can work with atomicMin
+    int wgt = wgts[eid] * SCALE_UP;
+    int new_distance = distances_cache[tid] + wgt;
+    
+    // match weights to decide successor
+    if (distances_cache[neighbor] == new_distance) {
+      // use atomic max to make sure if 
+      // encountered neighbor with same distance
+      // we always pick the neighbor with
+      // the largest vertex id
+      atomicMax(&d_succs[neighbor], tid);  
+    }
+  
+  }
+
+}
+
 
 __global__ void compute_path_counts(
   int num_verts,
   int num_edges,
   int* vertices,
-  int* edges,
   int* succs,
   PfxtNode* pfxt_nodes,
   int* lvl_offsets,
@@ -191,12 +222,13 @@ __global__ void compute_path_counts(
   while (v != -1) {
     auto edge_start = vertices[v];
     auto edge_end = (v == num_verts - 1) ? num_edges : vertices[v+1];
-    auto fanout_count = edge_end - edge_start; 
     // the deviation edge count at this vertex
     // is the num of fanout minus the successor edge
+    auto fanout_count = edge_end - edge_start;
     if (fanout_count > 1) {
-      path_count += (fanout_count - 1); 
+      path_count += (fanout_count - 1);
     }
+
     // traverse to next successor
     v = succs[v];
   }
@@ -259,8 +291,8 @@ __global__ void expand_new_level(
       new_path.parent = tid;
       new_path.num_children = 0;
       
-      float dist_neighbor = (float)dists[neighbor] / SCALE_UP;
-      float dist_v = (float)dists[v] / SCALE_UP;
+      auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
+      auto dist_v = (float)dists[v] / SCALE_UP;
       
       new_path.slack = 
         slack + dist_neighbor + wgt - dist_v;
@@ -364,7 +396,25 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
   prop_time = std::chrono::duration_cast<US>(end-beg).count();
   std::cout << "prop_distance converged with " << iters << " iters.\n";
   std::cout << "prop_disance runtime: " << prop_time << " us.\n";
-  std::cout << "sizeof(PfxtNode): " << sizeof(PfxtNode) << " bytes.\n";
+  
+  update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_fanin_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_succs);
+
+  // TODO: found issue, successor array is different every run!
+  std::vector<int> tmp(num_verts);
+  thrust::copy(successors.begin(), successors.end(),
+      tmp.begin());
+  for (auto& t : tmp) {
+    os << t << '\n';
+  }
+
+
 
   // copy distance vector back to host
   std::vector<int> h_dists(num_verts);
@@ -386,6 +436,7 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
     float dist = (float)h_dists[src] / SCALE_UP;
     h_pfxt_nodes.emplace_back(0, -1, src, -1, 0, dist);
   }
+
 
   // copy pfxt node from host to device
   thrust::device_vector<PfxtNode> pfxt_nodes(h_pfxt_nodes);
@@ -420,36 +471,31 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
         num_verts,
         num_fanout_edges,
         d_fanout_adjp,
-        d_fanout_adjncy,
         d_succs,
         d_pfxt_nodes,
         d_lvl_offsets,
         curr_lvl, 
         d_path_prefix_sums); 
   
-    //TODO: some issues with compute path count
-    //different runs have different path_prefix_sums 
-    //std::vector<int> dump(curr_lvl_size);
-    //thrust::copy(path_prefix_sums.begin(), path_prefix_sums.end(),
-    //    dump.begin());
-    //for (const auto& d : dump) {
-    //  os << d << '\n';
-    //}
-
+    std::cout << "computed path counts\n"; 
+        
     // prefix sum
     thrust::inclusive_scan(
-      thrust::device, 
+      thrust::device,
       d_path_prefix_sums,
       d_path_prefix_sums + curr_lvl_size,
       d_path_prefix_sums);
-    
+   
     checkError_t(
       cudaMemcpy(
         &h_total_paths, 
         &d_path_prefix_sums[curr_lvl_size-1], sizeof(int),
         cudaMemcpyDeviceToHost),
       "total_paths memcpy to host failed.");
-    std::cout << "total_paths=" << h_total_paths << '\n'; 
+    
+    
+    
+    std::cout << "next_level_total_paths=" << h_total_paths << '\n'; 
 
     if (h_total_paths != 0) {
       found_new_child_paths = true;
@@ -459,7 +505,7 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
       // allocate new space for new level
       pfxt_size += h_total_paths;
       h_pfxt_nodes.resize(pfxt_size);
-  
+
       // allocate new device pfxt node vector
       thrust::device_vector<PfxtNode> new_pfxt_nodes(h_pfxt_nodes);
 
@@ -484,7 +530,7 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
       // increment level counter
       curr_lvl++;
       curr_lvl_size = h_total_paths;
-      
+
       // update the level offset info
       h_lvl_offsets[curr_lvl+1] = pfxt_size; 
 

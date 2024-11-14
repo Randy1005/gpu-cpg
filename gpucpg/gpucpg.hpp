@@ -48,25 +48,11 @@ struct PfxtNode {
   }
  
   ~PfxtNode() = default;
-  //PfxtNode(const PfxtNode& other) :
-  //  level(other.level), from(other.from), to(other.to),
-  //  parent(other.parent), num_children(other.num_children),
-  //  slack(other.slack)
-  //{
-  //}
   
-  //PfxtNode(PfxtNode&& other) :
-  //  level(other.level), from(other.from), to(other.to),
-  //  parent(other.parent), num_children(other.num_children),
-  //  slack(other.slack)
-  //{
-  //}
-
   void dump_info(std::ostream& os) const {
-    os << "============\n";
     os << "lvl=" << level << '\n';
-    //os << "from=" << from << '\n';
-    //os << "to=" << to << '\n';
+    os << "from=" << from << '\n';
+    os << "to=" << to << '\n';
     os << "parent=" << parent << '\n';
     os << "num_children=" << num_children << '\n';
     os << "slack=" << slack << '\n';
