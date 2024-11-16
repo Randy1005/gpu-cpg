@@ -1,5 +1,4 @@
 #include "gpucpg.hpp"
-#include <cub/cub.cuh>
 #include <thrust/scan.h>
 #include <thrust/device_new.h>
 #include <thrust/execution_policy.h>
@@ -194,7 +193,6 @@ __global__ void update_successors(
       // the largest vertex id
       atomicMax(&d_succs[neighbor], tid);  
     }
-  
   }
 
 }
@@ -308,8 +306,7 @@ __global__ void expand_new_level(
 
 
 
-void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
-  std::ofstream os(output);
+void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
   
   // copy host csr to device
   thrust::device_vector<int> fanin_adjncy(_h_fanin_adjncy);
@@ -357,6 +354,9 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
 
   int iters{0};
   size_t prop_time{0};
+  size_t expand_time{0};
+  
+  
   auto beg = NOW;
   while (!h_converged) {
     // NOTE: is there a better way to check for the 
@@ -393,9 +393,6 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
   }
   auto end = NOW;
  
-  prop_time = std::chrono::duration_cast<US>(end-beg).count();
-  std::cout << "prop_distance converged with " << iters << " iters.\n";
-  std::cout << "prop_disance runtime: " << prop_time << " us.\n";
   
   update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
       (num_verts, 
@@ -406,43 +403,37 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
        d_dists_cache,
        d_succs);
 
-  // TODO: found issue, successor array is different every run!
-  std::vector<int> tmp(num_verts);
-  thrust::copy(successors.begin(), successors.end(),
-      tmp.begin());
-  for (auto& t : tmp) {
-    os << t << '\n';
-  }
-
-
-
+  prop_time = std::chrono::duration_cast<US>(end-beg).count();
+  std::cout << "prop_distance converged with " << iters << " iters.\n";
+  std::cout << "prop_disance runtime: " << prop_time << " us.\n";
+  
   // copy distance vector back to host
   std::vector<int> h_dists(num_verts);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
 
   // host level offsets
-  std::vector<int> h_lvl_offsets(max_dev_lvls+1, 0);
+  std::vector<int> _h_lvl_offsets(max_dev_lvls+1, 0);
   
   int curr_lvl{0};
   // fill out the offset for the first level
-  h_lvl_offsets[curr_lvl+1] = _srcs.size();
+  _h_lvl_offsets[curr_lvl+1] = _srcs.size();
   
   // copy level offsets from host to device
-  thrust::device_vector<int> lvl_offsets(h_lvl_offsets); 
+  thrust::device_vector<int> lvl_offsets(_h_lvl_offsets); 
   
   // host pfxt node initialization
-  std::vector<PfxtNode> h_pfxt_nodes;
+  _h_pfxt_nodes.clear();
   for (const auto& src : _srcs) {
     float dist = (float)h_dists[src] / SCALE_UP;
-    h_pfxt_nodes.emplace_back(0, -1, src, -1, 0, dist);
+    _h_pfxt_nodes.emplace_back(0, -1, src, -1, 0, dist);
   }
 
 
   // copy pfxt node from host to device
-  thrust::device_vector<PfxtNode> pfxt_nodes(h_pfxt_nodes);
- 
+  thrust::device_vector<PfxtNode> pfxt_nodes(_h_pfxt_nodes);
+
   // record current level size, update during the expansion loop 
-  int curr_lvl_size = h_pfxt_nodes.size();
+  int curr_lvl_size = _h_pfxt_nodes.size();
   
 
   // get raw pointer of device vectors to pass to kernel
@@ -453,8 +444,9 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
   int* d_lvl_offsets = thrust::raw_pointer_cast(&lvl_offsets[0]);
   
   int pfxt_size{curr_lvl_size};
+  
+  beg = NOW;
   while (curr_lvl < max_dev_lvls) {
-    bool found_new_child_paths{false};
 
     // variable to record path counts in the same level
     int h_total_paths;
@@ -462,7 +454,6 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
     // record the prefix sum of path counts
     // so we can obtain the correct output location
     // of each child path
-    std::cout << "current lvl size=" << curr_lvl_size << '\n';
     thrust::device_vector<int> path_prefix_sums(curr_lvl_size, 0);
     int* d_path_prefix_sums = thrust::raw_pointer_cast(&path_prefix_sums[0]);
 
@@ -477,7 +468,6 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
         curr_lvl, 
         d_path_prefix_sums); 
   
-    std::cout << "computed path counts\n"; 
         
     // prefix sum
     thrust::inclusive_scan(
@@ -492,74 +482,118 @@ void CpGen::report_paths(int k, int max_dev_lvls, std::string output) {
         &d_path_prefix_sums[curr_lvl_size-1], sizeof(int),
         cudaMemcpyDeviceToHost),
       "total_paths memcpy to host failed.");
-    
-    
-    
-    std::cout << "next_level_total_paths=" << h_total_paths << '\n'; 
 
-    if (h_total_paths != 0) {
-      found_new_child_paths = true;
-    }
-
-    if (found_new_child_paths) {
-      // allocate new space for new level
-      pfxt_size += h_total_paths;
-      h_pfxt_nodes.resize(pfxt_size);
-
-      // allocate new device pfxt node vector
-      thrust::device_vector<PfxtNode> new_pfxt_nodes(h_pfxt_nodes);
-
-      // point the device pointer to the new space
-      d_pfxt_nodes = thrust::raw_pointer_cast(&new_pfxt_nodes[0]);
-  
-      // level preparation is completed
-      // now invoke the inter-level expansion kernel
-      expand_new_level<<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
-        num_verts,
-        num_fanout_edges,
-        d_fanout_adjp,
-        d_fanout_adjncy,
-        d_fanout_wgts,
-        d_succs,
-        d_dists_cache,
-        d_pfxt_nodes,
-        d_lvl_offsets,
-        curr_lvl,
-        d_path_prefix_sums);
-
-      // increment level counter
-      curr_lvl++;
-      curr_lvl_size = h_total_paths;
-
-      // update the level offset info
-      h_lvl_offsets[curr_lvl+1] = pfxt_size; 
-
-      // copy the host level offset to device
-      thrust::copy(h_lvl_offsets.begin(), h_lvl_offsets.end(),
-          lvl_offsets.begin());
-      
-      thrust::copy(new_pfxt_nodes.begin(), new_pfxt_nodes.end(), h_pfxt_nodes.begin());
-    }
-    else {
+    if (h_total_paths == 0) {
       break;
+    }    
+
+    // allocate new space for new level
+    pfxt_size += h_total_paths;
+    _h_pfxt_nodes.resize(pfxt_size);
+    
+    pfxt_nodes = _h_pfxt_nodes;
+    assert(pfxt_nodes.size() == pfxt_size); 
+    d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
+
+    // level preparation is completed
+    // now invoke the inter-level expansion kernel
+    expand_new_level<<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
+      num_verts,
+      num_fanout_edges,
+      d_fanout_adjp,
+      d_fanout_adjncy,
+      d_fanout_wgts,
+      d_succs,
+      d_dists_cache,
+      d_pfxt_nodes,
+      d_lvl_offsets,
+      curr_lvl,
+      d_path_prefix_sums);
+
+    thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
+
+    // increment level counter
+    curr_lvl++;
+    curr_lvl_size = h_total_paths;
+
+    // update the level offset info
+    _h_lvl_offsets[curr_lvl+1] = pfxt_size; 
+    
+    // compress pfxt nodes on host if level size is bigger than k
+    if (curr_lvl_size > k && enable_compress) {
+      auto lvl_start = _h_lvl_offsets[curr_lvl];  
+      std::ranges::sort(
+        _h_pfxt_nodes.begin() + lvl_start,
+        _h_pfxt_nodes.end(),
+        [](const auto& a, const auto& b) {
+          return a.slack < b.slack;
+        }); 
+      
+      // size down the pfxt node storage
+      auto downsize = curr_lvl_size - k;
+      curr_lvl_size = k;
+      pfxt_size -= downsize;
+      _h_pfxt_nodes.resize(pfxt_size);
+
+      // also update the level offset
+      _h_lvl_offsets[curr_lvl+1] = pfxt_size;
+    
+      // copy pfxt nodes back to device
+      pfxt_nodes.resize(pfxt_size);
+      pfxt_nodes = _h_pfxt_nodes;
+      d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
     }
+
+    // copy the host level offset to device
+    thrust::copy(_h_lvl_offsets.begin(), _h_lvl_offsets.end(),
+        lvl_offsets.begin());
   }
+  end = NOW;
 
+  expand_time = std::chrono::duration_cast<US>(end-beg).count();
+  std::cout << "level expansion runtime: " << expand_time << " us.\n";
 
-  //for (size_t i = 0; i < h_lvl_offsets.size() - 1; i++) {
-  //  auto beg = h_lvl_offsets[i];
-  //  auto end = h_lvl_offsets[i+1];
+  //for (size_t i = 0; i < _h_lvl_offsets.size() - 1; i++) {
+  //  auto beg = _h_lvl_offsets[i];
+  //  auto end = _h_lvl_offsets[i+1];
   //  std::cout << "======= lvl " << i << " =======\n";
   //  for (auto id = beg; id < end; id++) {
-  //    std::cout << h_pfxt_nodes[id].slack << ' ';
+  //    std::cout << _h_pfxt_nodes[id].slack << ' ';
   //  }
   //  std::cout << '\n';
 
   //}
 
+  for (int i = 0; i < max_dev_lvls; i++) {
+    auto beg = _h_lvl_offsets[i];
+    auto end = _h_lvl_offsets[i+1];
+    auto lvl_size = (beg > end) ? 0 : end-beg;
+    std::cout << "level " << i << " size=" << lvl_size << '\n';
+  }
+  std::cout << "total pfxt nodes=" << _h_pfxt_nodes.size() << '\n';
+
   cudaFree(d_converged);
 }
 
+std::vector<float> CpGen::get_slacks(int k) {
+  std::vector<float> slacks;
+  std::ranges::sort(
+    _h_pfxt_nodes.begin(),
+    _h_pfxt_nodes.end(),
+    [](const auto& a, const auto& b) {
+      return a.slack < b.slack;
+    });
+
+  int i{0};
+  for (const auto& node : _h_pfxt_nodes) {
+    if (i >= k) {
+      break;
+    }
+    slacks.emplace_back(node.slack);
+    i++;
+  }
+  return slacks;
+}  
 
 void CpGen::dump_csrs(std::ostream& os) const {
   for (size_t i = 0; i < _h_fanin_adjp.size() - 1; i++) {

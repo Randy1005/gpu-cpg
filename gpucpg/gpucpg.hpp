@@ -5,14 +5,19 @@
 #include <vector>
 #include <limits>
 #include <chrono>
+#include <algorithm>
 
 namespace gpucpg {
 
-class CpGen {
+struct PfxtNode;
+class CpGen;
+
+class CpGen {  
 public:
   CpGen() = default;
   void read_input(const std::string& filename);
-  void report_paths(int k, int max_dev_lvls, std::string output);
+  void report_paths(int k, int max_dev_lvls, bool enable_compress);
+  std::vector<float> get_slacks(int k);
   
   void dump_csrs(std::ostream& os) const;
 private:
@@ -29,6 +34,13 @@ private:
   // store source and sink vertices
   std::vector<int> _srcs;
   std::vector<int> _sinks;
+
+  // prefix tree nodes
+  std::vector<PfxtNode> _h_pfxt_nodes;
+  
+  // prefix tree level offsets
+  std::vector<int> _h_lvl_offsets;
+
 };
 
 
