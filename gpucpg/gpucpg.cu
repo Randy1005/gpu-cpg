@@ -3,18 +3,18 @@
 #include <thrust/device_new.h>
 #include <thrust/execution_policy.h>
 #include <thrust/device_vector.h>
+#include <cub/cub.cuh>
+#include <cuda_runtime.h>
 
 #define BLOCKSIZE 512 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
 		(((DATALEN) + (NTHREADS) - 1) / (NTHREADS))
 
-#define SCALE_UP 100
-
+#define SCALE_UP 100000
 #define NOW std::chrono::steady_clock::now()
 #define US std::chrono::microseconds
 #define MS std::chrono::milliseconds
-#define DEFAULT_PFXT_SIZE 1000000
 
 namespace gpucpg {
 
@@ -25,6 +25,15 @@ void checkError_t(cudaError_t error, std::string msg) {
     std::exit(1);
   }
 }
+
+size_t CpGen::num_verts() const {
+  return _h_fanout_adjp.size() - 1; 
+}
+
+size_t CpGen::num_edges() const {
+  return _h_fanout_wgts.size();
+}
+
 
 void CpGen::read_input(const std::string& filename) {
   std::ifstream infile(filename);
@@ -66,7 +75,7 @@ void CpGen::read_input(const std::string& filename) {
 
     int from = std::stoi(from_str);
     int to = std::stoi(to_str);
-  
+
     if (line.find(",") != std::string::npos) { // Check for optional weight
       std::string weight_str;
       std::getline(iss, weight_str, ',');
@@ -106,7 +115,6 @@ void CpGen::read_input(const std::string& filename) {
       _h_fanin_wgts.push_back(weight);
     }
   }
-
 }
 
 
@@ -122,7 +130,6 @@ __global__ void check_if_no_dists_updated(
   if (dists_updated[tid]) {
     *converged = false;
   }
-  
 }
 
 __global__ void prop_distance(
@@ -132,8 +139,7 @@ __global__ void prop_distance(
   int* edges,
   float* wgts,
   int* distances_cache,
-  bool* dist_updated,
-  int* succs) {
+  bool* dist_updated) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   
   if (tid >= num_verts) {
@@ -161,6 +167,86 @@ __global__ void prop_distance(
     dist_updated[neighbor] = true;
   }
 }
+
+// the conditional graph node kernel
+// uses the convergence boolean as condition check
+__global__ void condition_converged(
+  bool* converged,
+  cudaGraphConditionalHandle handle) {
+
+  if (*converged) {
+    cudaGraphSetConditional(handle, 0);
+  } else {
+    *converged = true;
+  }
+  // printf("GPU: converged=%d\n", *converged);
+}
+
+__global__ void prop_dist_seg_reduction(
+  int num_verts,
+  int num_edges,
+  int* fanin_verts,
+  int* fanout_verts,
+  int* fanin_edges,
+  int* fanout_edges,
+  float* wgts,
+  int* distances_cache,
+  int* relax_tmp_buf, 
+  bool* dist_updated) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+  
+  if (tid >= num_verts) {
+    return;
+  }
+
+  if (!dist_updated[tid]) {
+    return;
+  }
+
+  // mark this vertex's distance as not updated
+  // so other threads don't update simultaneously
+  dist_updated[tid] = false;
+
+  // get the adjacent fanin edges of this vertex
+  auto edge_start = fanin_verts[tid];
+  auto edge_end = (tid == num_verts - 1) ? num_edges : fanin_verts[tid+1];
+
+  // visit its neighbor and do relaxation 
+  for (auto eid = edge_start; eid < edge_end; eid++) {
+    auto neighbor = fanin_edges[eid];
+    // multiply new distance by SCALE_UP to make it a integer
+    // NOTE: we're not using atomicMin here so 
+    // we don't need distance to be an integer but
+    // to keep it consistent let's still scale up 
+    int wgt = wgts[eid] * SCALE_UP;
+    int new_distance = distances_cache[tid] + wgt;
+   
+    // instead using an atomicMin to compare
+    // we let each thread do its own relaxation and
+    // write to its corresponding location in the 
+    // relaxation buffer
+    
+    // we want to look up the location by matching
+    // the vertex id (tid) with neighbor's fanout
+    // adjacencies
+    auto nfanout_start = fanout_verts[neighbor];
+    auto nfanout_end = 
+      (neighbor == num_verts - 1) ? num_edges : fanout_verts[neighbor+1];
+
+    for (auto eid = nfanout_start; eid < nfanout_end; eid++) {
+      if (fanout_edges[eid] == tid) {
+        // matched the current relaxing vertex id
+        // store the relaxation result to relax_buffer[eid]
+        relax_tmp_buf[eid] = new_distance;
+        break;
+      }
+    }
+    
+    dist_updated[neighbor] = true;
+  }
+}
+
+
 
 __global__ void update_successors(
   int num_verts, 
@@ -300,13 +386,14 @@ __global__ void expand_new_level(
     // traverse to next successor
     v = succs[v];
   }
-
-
 }
 
 
-
-void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
+void CpGen::report_paths(
+  int k, 
+  int max_dev_lvls, 
+  bool enable_compress,
+  PropDistMethod method) {
   
   // copy host csr to device
   thrust::device_vector<int> fanin_adjncy(_h_fanin_adjncy);
@@ -316,12 +403,8 @@ void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
   thrust::device_vector<int> fanout_adjp(_h_fanout_adjp);
   thrust::device_vector<float> fanout_wgts(_h_fanout_wgts);
 
-  auto num_fanin_edges = _h_fanin_adjncy.size();
-  auto num_fanout_edges = _h_fanout_adjncy.size();
+  auto num_edges = _h_fanout_adjncy.size();
   auto num_verts = _h_fanin_adjp.size() - 1;
-  // shortest distances from any vertex to the sink vertices
-  thrust::device_vector<float> dists(num_verts,
-      std::numeric_limits<float>::max());
   
   // shortest distances cache
   thrust::device_vector<int> dists_cache(num_verts,
@@ -329,23 +412,29 @@ void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
   
   // indicator of whether the distance of a vertex is updated
   thrust::device_vector<bool> dists_updated(num_verts, false);
-  
+
   // each vertex's successor
   thrust::device_vector<int> successors(num_verts, -1);
 
-  // set the distance of the sink vertices to 0
-  // and they are ready to be propagated
-  for (const auto sink : _sinks) {
-    dists_cache[sink] = 0;
-    dists_updated[sink] = true;
-  }
+  // relax buffer to store relaxation results from 
+  // all fanout vertices
+  thrust::device_vector<int> relax_buffer(num_edges,
+      std::numeric_limits<int>::max());
 
   int* d_fanin_adjp = thrust::raw_pointer_cast(&fanin_adjp[0]);
   int* d_fanin_adjncy = thrust::raw_pointer_cast(&fanin_adjncy[0]);
   float* d_fanin_wgts = thrust::raw_pointer_cast(&fanin_wgts[0]);
+  
+  int* d_fanout_adjp = thrust::raw_pointer_cast(&fanout_adjp[0]);
+  int* d_fanout_adjncy = thrust::raw_pointer_cast(&fanout_adjncy[0]);
+  float* d_fanout_wgts = thrust::raw_pointer_cast(&fanout_wgts[0]);
+  
   int* d_dists_cache = thrust::raw_pointer_cast(&dists_cache[0]);
   bool* d_dists_updated = thrust::raw_pointer_cast(&dists_updated[0]);
   int* d_succs = thrust::raw_pointer_cast(&successors[0]);
+  
+  int* d_relax_buf = thrust::raw_pointer_cast(&relax_buffer[0]);
+
   bool h_converged{false};
   bool* d_converged;
   checkError_t(
@@ -356,53 +445,208 @@ void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
   size_t prop_time{0};
   size_t expand_time{0};
   
-  
+  // set the distance of the sink vertices to 0
+  // and they are ready to be propagated
+  for (const auto sink : _sinks) {
+    dists_cache[sink] = 0;
+    dists_updated[sink] = true;
+  }
+
   auto beg = NOW;
-  while (!h_converged) {
-    // NOTE: is there a better way to check for the 
-    // completion of distance updates?
-    // currently we reset the converged flag every time
-    // befor we invoke the kernel, and copy the flag back
-    // to the host to check, but it's slower than the kernel itself
-    checkError_t(
-      cudaMemset(d_converged, true, sizeof(bool)), 
-      "memset d_converged failed.");
+  if (method == PropDistMethod::ATOMICMIN) { 
+    while (!h_converged) {
+      checkError_t(
+        cudaMemset(d_converged, true, sizeof(bool)), 
+        "memset d_converged failed.");
+      
+      prop_distance<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts, 
+         num_edges,
+         d_fanin_adjp,
+         d_fanin_adjncy,
+         d_fanin_wgts,
+         d_dists_cache,
+         d_dists_updated);
+
+      check_if_no_dists_updated<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts, d_dists_updated, d_converged);
+
+      checkError_t(
+        cudaMemcpy(
+          &h_converged, 
+          d_converged, 
+          sizeof(bool), 
+          cudaMemcpyDeviceToHost),
+        "memcpy d_converged failed.");
+
+      iters++;
+    }
+  } else if (method == PropDistMethod::SEG_REDUCTION) {
+   while (!h_converged) {
+      checkError_t(
+        cudaMemset(d_converged, true, sizeof(bool)), 
+        "memset d_converged failed.");
+      
+      prop_dist_seg_reduction<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts, 
+         num_edges,
+         d_fanin_adjp,
+         d_fanout_adjp,
+         d_fanin_adjncy,
+         d_fanout_adjncy,
+         d_fanin_wgts,
+         d_dists_cache,
+         d_relax_buf,
+         d_dists_updated);
+      
+      // do a segmented reduction to obtain
+      // the min distance in each segment of
+      // relax_buffer
+      int num_segments = num_verts;
+      auto d_offsets_it = 
+        thrust::raw_pointer_cast(fanout_adjp.data());
+
+      // Determine temporary device storage requirements
+      void* d_temp_storage      = nullptr;
+      size_t temp_storage_bytes = 0;
+      cub::DeviceSegmentedReduce::Min(
+        d_temp_storage, 
+        temp_storage_bytes, 
+        relax_buffer.begin(), 
+        dists_cache.begin(), 
+        num_segments, 
+        d_offsets_it, 
+        d_offsets_it+1);
+
+      thrust::device_vector<std::uint8_t> temp_storage(temp_storage_bytes);
+      d_temp_storage = thrust::raw_pointer_cast(temp_storage.data());
+
+      // Run reduction
+      cub::DeviceSegmentedReduce::Min(
+        d_temp_storage, 
+        temp_storage_bytes, 
+        relax_buffer.begin(), 
+        dists_cache.begin(), 
+        num_segments, 
+        d_offsets_it, 
+        d_offsets_it+1);
+
+      check_if_no_dists_updated<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts, d_dists_updated, d_converged);
+
+      checkError_t(
+        cudaMemcpy(
+          &h_converged, 
+          d_converged, 
+          sizeof(bool), 
+          cudaMemcpyDeviceToHost),
+        "memcpy d_converged failed.");
+
+      iters++;
+    }
+
+    for (const auto& sink : _sinks) {
+      dists_cache[sink] = 0;
+    } 
+
+  } else if (method == PropDistMethod::CUDA_GRAPH) {
+    cudaGraph_t cug;
+    cudaGraphExec_t cug_exec;
+    cudaGraphNode_t while_node;
+
+    // create cuda graph
+    checkError_t(cudaGraphCreate(&cug, 0), "create cudaGraph failed");
+    cudaGraphConditionalHandle handle;
     
-    prop_distance<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+    // create conditional handle
+    checkError_t(
+      cudaGraphConditionalHandleCreate(&handle, cug, 1, 
+        cudaGraphCondAssignDefault),
+      "create conditional handle failed.");
+    
+    // add the conditional node to cudaGraph
+    cudaGraphNodeParams while_params = { cudaGraphNodeTypeConditional };
+    while_params.conditional.handle = handle;
+    while_params.conditional.type = cudaGraphCondTypeWhile;
+    while_params.conditional.size = 1;
+    checkError_t(
+      cudaGraphAddNode(&while_node, cug, NULL, 0, &while_params),
+      "add cudaGraph while_node failed.");
+        
+    // create body graph for the conditional node
+    cudaGraph_t bodyg = while_params.conditional.phGraph_out[0];
+    
+    // create a capture stream to capture the kernel calls
+    cudaStream_t capture_stream;
+    checkError_t(
+      cudaStreamCreate(&capture_stream), 
+      "create capture stream failed.");
+ 
+    // initialize the convergence flag to true 
+    checkError_t(
+        cudaMemset(d_converged, true, sizeof(bool)), 
+        "memset d_converged failed.");
+    
+    // begin stream capture
+    checkError_t(
+      cudaStreamBeginCaptureToGraph(
+        capture_stream, bodyg, nullptr, 
+        nullptr, 0, cudaStreamCaptureModeRelaxed),
+      "begin capture stream failed.");
+    
+    prop_distance
+      <<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE, 0, capture_stream>>>
       (num_verts, 
-       num_fanin_edges,
+       num_edges,
        d_fanin_adjp,
        d_fanin_adjncy,
        d_fanin_wgts,
        d_dists_cache,
-       d_dists_updated,
-       d_succs);
+       d_dists_updated);
 
-    check_if_no_dists_updated<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+    check_if_no_dists_updated
+      <<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE, 0, capture_stream>>>
       (num_verts, d_dists_updated, d_converged);
+    
+    condition_converged<<<1, 1, 0, capture_stream>>>(d_converged, handle);
+    
+    // end capture stream
+    checkError_t(
+      cudaStreamEndCapture(capture_stream, nullptr),
+      "end capture stream failed.");
 
     checkError_t(
-      cudaMemcpy(
-        &h_converged, 
-        d_converged, 
-        sizeof(bool), 
-        cudaMemcpyDeviceToHost),
-      "memcpy d_converged failed.");
+      cudaStreamDestroy(capture_stream),
+      "destroy capture stream failed.");
+    
+    // instantiate graph executor
+    checkError_t(
+      cudaGraphInstantiate(&cug_exec, cug, NULL, NULL, 0),
+      "cuGraph instantiate failed.");
 
-    iters++;
-  }
-  auto end = NOW;
- 
+    // launch cuda graph
+    checkError_t(cudaGraphLaunch(cug_exec, 0), "launch cuda graph failed");
+    checkError_t(cudaDeviceSynchronize(), "device sync failed.");
+
+    // cleanup cuda graph
+    checkError_t(
+      cudaGraphExecDestroy(cug_exec), 
+      "destroy cuGraph executor failed.");
   
+    checkError_t(cudaGraphDestroy(cug), "destory cuGraph failed.");
+    // std::cout << "conditional graph launch completed.\n";
+  }
+ 
   update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
       (num_verts, 
-       num_fanin_edges,
+       num_edges,
        d_fanin_adjp,
        d_fanin_adjncy,
        d_fanin_wgts,
        d_dists_cache,
        d_succs);
 
+  auto end = NOW;
   prop_time = std::chrono::duration_cast<US>(end-beg).count();
   std::cout << "prop_distance converged with " << iters << " iters.\n";
   std::cout << "prop_disance runtime: " << prop_time << " us.\n";
@@ -428,18 +672,13 @@ void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
     _h_pfxt_nodes.emplace_back(0, -1, src, -1, 0, dist);
   }
 
-
   // copy pfxt node from host to device
   thrust::device_vector<PfxtNode> pfxt_nodes(_h_pfxt_nodes);
 
   // record current level size, update during the expansion loop 
   int curr_lvl_size = _h_pfxt_nodes.size();
   
-
   // get raw pointer of device vectors to pass to kernel
-  int* d_fanout_adjp = thrust::raw_pointer_cast(&fanout_adjp[0]);
-  int* d_fanout_adjncy = thrust::raw_pointer_cast(&fanout_adjncy[0]);
-  float* d_fanout_wgts = thrust::raw_pointer_cast(&fanout_wgts[0]);
   PfxtNode* d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
   int* d_lvl_offsets = thrust::raw_pointer_cast(&lvl_offsets[0]);
   
@@ -460,7 +699,7 @@ void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
     compute_path_counts
       <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
         num_verts,
-        num_fanout_edges,
+        num_edges,
         d_fanout_adjp,
         d_succs,
         d_pfxt_nodes,
@@ -499,7 +738,7 @@ void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
     // now invoke the inter-level expansion kernel
     expand_new_level<<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
       num_verts,
-      num_fanout_edges,
+      num_edges,
       d_fanout_adjp,
       d_fanout_adjncy,
       d_fanout_wgts,
@@ -575,6 +814,51 @@ void CpGen::report_paths(int k, int max_dev_lvls, bool enable_compress) {
   cudaFree(d_converged);
 }
 
+
+void CpGen::levelize() {
+  
+  _lvl.resize(num_verts(), -1);
+  for (const auto& sink : _sinks) {
+    _lvl[sink] = 0;
+  }
+
+
+  std::queue<int> q(std::deque(_sinks.begin(), _sinks.end()));
+  int max_lvl{0};
+
+  while(!q.empty()) {
+    auto v = q.front();
+    q.pop();
+    auto edge_start = _h_fanin_adjp[v];
+    auto edge_end = _h_fanin_adjp[v+1];
+    for (auto e = edge_start; e < edge_end; e++) {
+      auto neighbor = _h_fanin_adjncy[e];
+      // update level of neighbor
+      _lvl[neighbor] = std::max(_lvl[neighbor], _lvl[v]+1);
+      max_lvl = std::max(max_lvl, _lvl[neighbor]);
+      q.push(neighbor);
+    }
+  } 
+
+  // build level list
+  _lvl_list.resize(max_lvl+1);
+  for (size_t i = 0; i < _lvl.size(); i++) {
+    _lvl_list[_lvl[i]].emplace_back(i);
+  }
+
+  // build levelized CSR
+  _h_lvlp.emplace_back(0);
+  for (const auto& l : _lvl_list) {
+    auto prev_lvlp = _h_lvlp.back();
+    _h_lvlp.emplace_back(l.size() + prev_lvlp);
+    for (const auto& v : l) {
+      _h_verts_by_lvl.emplace_back(v);
+    }
+  
+  }
+
+}
+
 std::vector<float> CpGen::get_slacks(int k) {
   std::vector<float> slacks;
   std::ranges::sort(
@@ -633,6 +917,20 @@ void CpGen::dump_csrs(std::ostream& os) const {
     os << sink << ' ';
   } 
   os << '\n';
+}
+
+void CpGen::dump_lvls(std::ostream& os) const {
+  for (size_t i = 0; i < _h_lvlp.size() - 1; i++) {
+    auto lvl_start = _h_lvlp[i];
+    auto lvl_end = _h_lvlp[i+1];
+    os << "level " << i << ":\n";
+    for (auto v = lvl_start; v < lvl_end; v++) {
+      os << _h_verts_by_lvl[v] << ' ';
+    }
+    os << '\n';
+  }
+
+
 }
 
 

@@ -1,25 +1,30 @@
 #include "gpucpg.hpp"
 
 int main(int argc, char* argv[]) {
-  if (argc != 5) {
-    std::cerr << "usage: ./a.out [benchmark] [#paths] [max_dev_lvls] [enable_compress]\n";
+  if (argc != 6) {
+    std::cerr << "usage: ./a.out [benchmark] [#paths] [max_dev_lvls] [enable_compress] [method]\n";
     std::exit(1);
   }
 
   std::string filename = argv[1];
-  int num_paths = std::stoi(argv[2]);
-  int max_dev_lvls = std::stoi(argv[3]);
+  auto num_paths = std::stoi(argv[2]);
+  auto max_dev_lvls = std::stoi(argv[3]);
   bool enable_compress = std::stoi(argv[4]);
+  auto method = static_cast<gpucpg::PropDistMethod>(std::stoi(argv[5]));
   gpucpg::CpGen cpgen;
   cpgen.read_input(filename);
-  //cpgen.dump_csrs(std::cout);
-  cpgen.report_paths(num_paths, max_dev_lvls, enable_compress);
- 
-  auto slacks = cpgen.get_slacks(num_paths);
+  
+  std::cout << "num_verts=" << cpgen.num_verts() << '\n';
+  std::cout << "num_edges=" << cpgen.num_edges() << '\n';
+
+  std::cout << "method=" << static_cast<int>(method) << '\n';
+  cpgen.report_paths(num_paths, max_dev_lvls, enable_compress, method);
+
+  //std::ofstream os("paths.txt");
+  //auto slacks = cpgen.get_slacks(num_paths);
   //for (const auto s : slacks) {
-  //  std::cout << s << ' ';
+  //  os << s << '\n';
   //}
-  //std::cout << '\n';
 
   return 0;
 }

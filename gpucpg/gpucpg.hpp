@@ -6,20 +6,39 @@
 #include <limits>
 #include <chrono>
 #include <algorithm>
+#include <queue>
 
 namespace gpucpg {
 
 struct PfxtNode;
 class CpGen;
 
+enum class PropDistMethod {
+  ATOMICMIN = 0,
+  SEG_REDUCTION,
+  CUDA_GRAPH
+  // and other methods
+};
+
 class CpGen {  
 public:
   CpGen() = default;
   void read_input(const std::string& filename);
-  void report_paths(int k, int max_dev_lvls, bool enable_compress);
+  void levelize();
+  void report_paths(
+    int k, 
+    int max_dev_lvls, 
+    bool enable_compress, 
+    PropDistMethod method);
   std::vector<float> get_slacks(int k);
   
   void dump_csrs(std::ostream& os) const;
+  void dump_lvls(std::ostream& os) const;
+ 
+
+  size_t num_verts() const;
+  size_t num_edges() const;
+
 private:
   // fanin CSR storage
   std::vector<int> _h_fanin_adjp;
@@ -41,6 +60,13 @@ private:
   // prefix tree level offsets
   std::vector<int> _h_lvl_offsets;
 
+  // levelized CSR storage (we only need these two to store level info)
+  std::vector<int> _h_verts_by_lvl;
+  std::vector<int> _h_lvlp;
+
+  // level list for the graph
+  std::vector<std::vector<int>> _lvl_list;
+  std::vector<int> _lvl;
 };
 
 

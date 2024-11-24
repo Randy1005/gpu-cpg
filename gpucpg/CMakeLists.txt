@@ -5,5 +5,6 @@ find_package(Threads REQUIRED)
 
 target_link_libraries(gpucpg 
   PUBLIC CCCL::CCCL
+  PRIVATE cudart
 )
 

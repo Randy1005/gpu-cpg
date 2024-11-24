@@ -12,6 +12,7 @@ CPMAddPackage(
     GITHUB_REPOSITORY "nvidia/cccl" 
     GIT_TAG "main"
 )
+
 set(CMAKE_C_STANDARD    17)
 set(CMAKE_CXX_STANDARD  20)
 set(CMAKE_CUDA_STANDARD 20)
@@ -21,8 +22,7 @@ if(NOT DEFINED CMAKE_CUDA20_STANDARD_COMPILE_OPTION)
   set(CMAKE_CUDA20_EXTENSION_COMPILE_OPTION "")
 endif()
 
-set(CMAKE_CUDA_FLAGS "-std=c++20")
-
+set(CMAKE_CXX_FLAGS "-std=c++20")
 
 
 # Default to building for the GPU on the current system
@@ -32,8 +32,7 @@ set(CMAKE_CUDA_ARCHITECTURES 86)
 # compile and link CUDA code separately from the rest of your code to
 # speed up the build process and reduce the size of your final executable.
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wall -O3 --extended-lambda -g -G")
-set(CUDA_NVCC_FLAGS "-g -G")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CXX_FLAGS} -Wall -O3 --extended-lambda -g -G")
 
 # set compilation flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
@@ -56,9 +55,9 @@ endif()
 
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
-set(GPUCPG_3RD_PARTY_DIR ${PROJECT_SOURCE_DIR}/3rd-party)
 set(GPUCPG_EXAMPLE_DIR ${PROJECT_SOURCE_DIR}/examples)
 set(GPUCPG_BENCHMARKS_DIR ${PROJECT_SOURCE_DIR}/benchmarks)
+set(GPUCPG_3RDPARTY_DIR ${PROJECT_SOURCE_DIR}/3rd-party)
 
 # -----------------------------------------------------------------------------
 # must-have package include

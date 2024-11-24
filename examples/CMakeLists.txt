@@ -1,9 +1,11 @@
 add_executable(reduce ${GPUCPG_EXAMPLE_DIR}/reduce.cu)
 add_executable(read_input ${GPUCPG_EXAMPLE_DIR}/read_input.cpp)
+add_executable(levelize ${GPUCPG_EXAMPLE_DIR}/levelize.cpp)
 
 list(APPEND GPUCPG_EXAMPLES
   reduce
   read_input
+  levelize
 )
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
