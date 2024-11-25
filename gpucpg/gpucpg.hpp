@@ -14,9 +14,9 @@ struct PfxtNode;
 class CpGen;
 
 enum class PropDistMethod {
-  ATOMICMIN = 0,
-  SEG_REDUCTION,
-  CUDA_GRAPH
+  BASIC = 0,
+  CUDA_GRAPH,
+  BFS
   // and other methods
 };
 
@@ -40,6 +40,13 @@ public:
   size_t num_edges() const;
 
 private:
+  int _get_qsize();
+  
+  void _free();
+
+  // convergence condition
+  bool* _d_converged;
+  
   // fanin CSR storage
   std::vector<int> _h_fanin_adjp;
   std::vector<int> _h_fanin_adjncy;
@@ -67,6 +74,15 @@ private:
   // level list for the graph
   std::vector<std::vector<int>> _lvl_list;
   std::vector<int> _lvl;
+
+  // queue for the BFS of the graph
+  int* _queue;
+  
+  // pointers to queue head and tail
+  // queue size is tail minus head 
+  int* _q_head;
+  int* _q_tail;
+
 };
 
 
