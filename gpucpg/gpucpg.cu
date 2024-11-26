@@ -11,11 +11,11 @@
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
   (((DATALEN) + (NTHREADS) - 1) / (NTHREADS))
 
-#define SCALE_UP 100000
+#define SCALE_UP 10000
 #define NOW std::chrono::steady_clock::now()
 #define US std::chrono::microseconds
 #define MS std::chrono::milliseconds
-#define QSIZE_MULTIPLIER 28 
+#define QSIZE_MULTIPLIER 80000 
 
 #define cudaCheckErrors(msg) \
   do { \
@@ -46,7 +46,6 @@ size_t CpGen::num_verts() const {
 size_t CpGen::num_edges() const {
   return _h_fanout_wgts.size();
 }
-
 
 void CpGen::read_input(const std::string& filename) {
   std::ifstream infile(filename);
@@ -196,7 +195,6 @@ __global__ void prop_distance(
     dist_updated[neighbor] = true;
   }
 }
-
 
 
 // the conditional graph node kernel
@@ -404,13 +402,14 @@ __global__ void prop_distance_bfs(
     int* edges,
     float* wgts,
     int* distances_cache) {
-  
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (tid >= qsize) {
     return;
   }
 
   const int vid = dequeue(queue, q_head);
+  //printf("tid %d dequeues vid %d\n", tid, vid);
+
   auto edge_start = vertices[vid];
   auto edge_end = (vid == num_verts - 1) ? num_edges : vertices[vid+1]; 
 
@@ -422,6 +421,7 @@ __global__ void prop_distance_bfs(
     int new_distance = distances_cache[vid] + wgt;
 
     atomicMin(&distances_cache[neighbor], new_distance);
+    //printf("tid %d enqueue vid %d's neighbor %d\n", tid, vid, neighbor);
     enqueue(neighbor, queue, q_tail);
   }
 }
@@ -488,21 +488,6 @@ void CpGen::report_paths(
     dists_updated[sink] = true;
   }
   
-  // memory for the queue
-  cudaMalloc((void**)&_queue, QSIZE_MULTIPLIER*num_verts*sizeof(int));
-  cudaMalloc((void**)&_q_head, sizeof(int));    
-  cudaMalloc((void**)&_q_tail, sizeof(int));
-  
-  cudaCheckErrors("allocate queue memory failed.");
-
-  // initialize queue
-  cudaMemset(_queue, 0, num_verts*sizeof(int));
-  cudaMemset(_q_head, 0, sizeof(int));
-  cudaMemset(_q_tail, 0, sizeof(int));
-
-  thrust::device_vector<int> sinks(_sinks);
-  int* d_sinks = thrust::raw_pointer_cast(&sinks[0]);
-  
   auto beg = NOW;
   if (method == PropDistMethod::BASIC) { 
     while (!h_converged) {
@@ -533,9 +518,22 @@ void CpGen::report_paths(
       iters++;
     }
   } else if (method == PropDistMethod::BFS) {
+    // memory for the queue
+    cudaMalloc((void**)&_queue, QSIZE_MULTIPLIER*num_verts*sizeof(int));
+    cudaMalloc((void**)&_q_head, sizeof(int));    
+    cudaMalloc((void**)&_q_tail, sizeof(int));
+    cudaCheckErrors("allocate queue memory failed.");
+
+    // initialize queue
+    cudaMemset(_queue, 0, num_verts*sizeof(int));
+    cudaMemset(_q_head, 0, sizeof(int));
+    cudaMemset(_q_tail, 0, sizeof(int));
+
+    thrust::device_vector<int> sinks(_sinks);
+    int* d_sinks = thrust::raw_pointer_cast(&sinks[0]);
+    
     // enqueue sinks
     size_t num_sinks = _sinks.size();
-
     enqueue_sinks
       <<<ROUNDUPBLOCKS(num_sinks, BLOCKSIZE), BLOCKSIZE>>>
       (d_sinks, num_sinks, _queue, _q_tail);
@@ -555,22 +553,11 @@ void CpGen::report_paths(
          d_fanin_wgts,
          d_dists_cache);
      
-      cudaDeviceSynchronize(); 
-      cudaCheckErrors("cuda device sync failed.");
       qsize = _get_qsize(); 
-      //cudaDeviceSynchronize(); 
-      //cudaCheckErrors("cuda device sync failed.");
       iters++;
     }
 
   } else if (method == PropDistMethod::CUDA_GRAPH) {
-    // set the distance of the sink vertices to 0
-    // and they are ready to be propagated
-    for (const auto sink : _sinks) {
-      dists_cache[sink] = 0;
-      dists_updated[sink] = true;
-    }
-    
     cudaGraph_t cug;
     cudaGraphExec_t cug_exec;
     cudaGraphNode_t while_node;
@@ -674,6 +661,12 @@ void CpGen::report_paths(
   // copy distance vector back to host
   std::vector<int> h_dists(num_verts);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
+
+  //std::ofstream ofs("method-" + std::to_string(static_cast<int>(method)) + ".txt");
+  //for (auto d : h_dists) {
+  //  ofs << d << '\n';
+  //}
+  
 
   // host level offsets
   std::vector<int> _h_lvl_offsets(max_dev_lvls+1, 0);

@@ -24,7 +24,6 @@ endif()
 
 set(CMAKE_CXX_FLAGS "-std=c++20")
 
-
 # Default to building for the GPU on the current system
 set(CMAKE_CUDA_ARCHITECTURES 86)
 
@@ -32,10 +31,11 @@ set(CMAKE_CUDA_ARCHITECTURES 86)
 # compile and link CUDA code separately from the rest of your code to
 # speed up the build process and reduce the size of your final executable.
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CXX_FLAGS} -Wall -O3 --extended-lambda")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CXX_FLAGS} -Wall --extended-lambda")
 
 # set compilation flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+set(CMAKE_CUDA_FLAGS_DEBUG "-g -G")
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "Setting build type to Release ")
   set(
