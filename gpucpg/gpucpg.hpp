@@ -16,7 +16,8 @@ class CpGen;
 enum class PropDistMethod {
   BASIC = 0,
   CUDA_GRAPH,
-  BFS
+  BFS,
+  LEVELIZED_SHAREDMEM
   // and other methods
 };
 
@@ -67,13 +68,13 @@ private:
   // prefix tree level offsets
   std::vector<int> _h_lvl_offsets;
 
-  // levelized CSR storage (we only need these two to store level info)
+  // levelized vertices storage
+  std::vector<int> _h_out_degrees;
+  std::vector<int> _h_in_degrees;
   std::vector<int> _h_verts_by_lvl;
-  std::vector<int> _h_lvlp;
+  std::vector<int> _h_verts_lvlp;
 
-  // level list for the graph
-  std::vector<std::vector<int>> _lvl_list;
-  std::vector<int> _lvl;
+  
 
   // queue for the BFS of the graph
   int* _queue;
@@ -82,7 +83,6 @@ private:
   // queue size is tail minus head 
   int* _q_head;
   int* _q_tail;
-
 };
 
 
