@@ -7,7 +7,7 @@
 #include <cuda_runtime_api.h>
 
 #define MAX_INTS_ON_SMEM 12288
-#define BLOCKSIZE 512 
+#define BLOCKSIZE 1024 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
   (((DATALEN) + (NTHREADS) - 1) / (NTHREADS))
@@ -16,7 +16,6 @@
 #define NOW std::chrono::steady_clock::now()
 #define US std::chrono::microseconds
 #define MS std::chrono::milliseconds
-#define QSIZE_MULTIPLIER 80000 
 
 #define cudaCheckErrors(msg) \
   do { \
@@ -29,6 +28,27 @@
       exit(1); \
     } \
   } while (0)
+
+struct printf_functor
+{
+  __host__ __device__
+  void operator() (int x)
+  {
+      printf("%4d ", x);
+  }
+};
+
+template <typename Iterator>
+void print_range(const std::string& name, Iterator first, Iterator last)
+{
+  // Print Vector Name
+  std::cout << name << ": ";
+
+  // Print Each Element
+  thrust::for_each(thrust::device, first, last, printf_functor());
+
+  std::cout << '\n';
+}
 
 
 namespace gpucpg {
@@ -204,57 +224,152 @@ __global__ void prop_distance(
 }
 
 __global__ void prop_distance_levelized_sharedmem(
-  int lvl_beg,
-  int lvl_end,
+  int start_lvl,
+  int end_lvl,
   int* verts_by_lvl,
   int* verts_lvlp,
-  int total_parents,
-  int* parent_dists,
-  int* parents,
-  int* parent_p
-    ) {
-  // load parent distances from global memory
-  __shared__ int s_parent_dists[MAX_INTS_ON_SMEM];
+  int total_verts_smem,
+  int* dists_cache,
+  int num_verts,
+  int num_edges,
+  int* vertices,
+  int* edges,
+  float* wgts) {
+  // load distances from global memory
+  __shared__ int s_dists[MAX_INTS_ON_SMEM];
   
   int tid = threadIdx.x;
 
-  // if total parent is less than block size
+  // if total vertices is less than block size
   // simply let one thread load one data
-  if (total_parents <= BLOCKSIZE && tid < total_parents) {
-    s_parent_dists[tid] = parent_dists[tid];
+  if (total_verts_smem <= BLOCKSIZE && tid < total_verts_smem) {
+    s_dists[tid] = dists_cache[tid];
   }
   else {
-    int chunk_size = total_parents / BLOCKSIZE;
-    int rem = total_parents % BLOCKSIZE;
+    int chunk_size = total_verts_smem / BLOCKSIZE;
+    int rem = total_verts_smem % BLOCKSIZE;
+    int chunk_start = tid*chunk_size;
+    int chunk_end = (tid == BLOCKSIZE-1) ? (tid+1)*chunk_size+rem
+      : (tid+1)*chunk_size;
     // let one thread load a chunk of data
-    for (int i = tid*chunk_size; i < (tid+1)*chunk_size; i++) {
-      s_parent_dists[i] = parent_dists[i];
-    }
-
-    if (tid == BLOCKSIZE-1) {
-      // if I'm the last thread, also load the remainder
-      for (int i = (tid+1)*chunk_size; i < (tid+1)*chunk_size+rem; i++) {
-        s_parent_dists[i] = parent_dists[i];
-      }
+    for (int i = chunk_start; i < chunk_end; i++) {
+      s_dists[i] = dists_cache[i];
     }
   }
   __syncthreads();
 
   // levelized relaxation
-  for (int l = lvl_beg; l < lvl_end; l++) {
+  for (size_t l = start_lvl; l < end_lvl; l++) {
     // get the vertices at level l
-    const auto start = parent_p[l];
-    const auto end = parent_p[l+1];
-    const auto lvl_size = end - start; 
+    const auto v_beg = verts_lvlp[l];
+    const auto v_end = verts_lvlp[l+1];
+    const auto lvl_size = v_end - v_beg;
 
+    // if level size is less than block size
+    // each thread can pick up just one vertex
+    // and run relaxation
+    auto vid = v_beg + tid;
+    if (lvl_size < BLOCKSIZE && vid < v_end) {
+      const auto edge_start = vertices[vid];
+      const auto edge_end = (vid == num_verts-1) ? num_edges : vertices[vid+1];
+      for (auto eid = edge_start; eid < edge_end; eid++) {
+        auto neighbor = edges[eid];
 
+        // own distance must be in smem
+        int own_dist = s_dists[vid];
+        int wgt = wgts[eid] * SCALE_UP;
+        
+        int new_distance = own_dist + wgt;
+          
+        // if neighbor is not in smem, load distance from global memory
+        if (neighbor >= total_verts_smem) {
+          atomicMin(&dists_cache[neighbor], new_distance);
+        } 
+        else {
+          atomicMin(&s_dists[neighbor], new_distance);
+        }
+      }
+    }
+    else {
+      // one thread has to relax multiple vertices
+      int chunk_size = lvl_size / BLOCKSIZE;
+      int rem = lvl_size % BLOCKSIZE;
+      auto chunk_start = v_beg + tid*chunk_size;
+      auto chunk_end = (tid == BLOCKSIZE-1) ? chunk_start+chunk_size+rem
+        : chunk_start+chunk_size;
+      for (int vid = chunk_start; vid < chunk_end; vid++) {
+        const auto edge_start = vertices[vid];
+        const auto edge_end = (vid == num_verts-1) ? num_edges : vertices[vid+1];
+        for (auto eid = edge_start; eid < edge_end; eid++) {
+          auto neighbor = edges[eid];
+
+          // own distance must be in smem
+          int own_dist = s_dists[vid];
+          int wgt = wgts[eid] * SCALE_UP;
+          int new_distance = own_dist + wgt;
+            
+          // if neighbor is not in smem, load distance from global memory
+          if (neighbor >= total_verts_smem) {
+            atomicMin(&dists_cache[neighbor], new_distance);
+          } 
+          else {
+            atomicMin(&s_dists[neighbor], new_distance);
+          }
+        }
+      }
+    }
     // intra-block sync
     __syncthreads();
   }
 
+  // write s_dists back to global memory
+  // if total vertices is less than block size
+  // simply let one thread store one data
+  if (total_verts_smem <= BLOCKSIZE && tid < total_verts_smem) {
+    dists_cache[tid] = s_dists[tid];
+  }
+  else {
+    int chunk_size = total_verts_smem / BLOCKSIZE;
+    int rem = total_verts_smem % BLOCKSIZE;
+    int chunk_start = tid*chunk_size;
+    int chunk_end = (tid == BLOCKSIZE-1) ? (tid+1)*chunk_size+rem
+      : (tid+1)*chunk_size;
+    // let one thread load a chunk of data
+    for (int i = chunk_start; i < chunk_end; i++) {
+      dists_cache[i] = s_dists[i];
+    }
+  }
+  __syncthreads();
 
 }
 
+__global__ void prop_distance_levelized(
+    int* verts_by_lvl,
+    int v_beg,
+    int v_end,
+    int num_verts,
+    int num_edges,
+    int* vertices,
+    int* edges,
+    float* wgts,
+    int* distances_cache) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  auto vid = tid + v_beg;
+  if (vid >= v_end) {
+    return;
+  }
+  
+  auto edge_start = vertices[vid];
+  auto edge_end = (vid == num_verts - 1) ? num_edges : vertices[vid+1]; 
+  for (int eid = edge_start; eid < edge_end; eid++) {
+    auto neighbor = edges[eid];
+    // multiply new distance by SCALE_UP to make it a integer
+    // so we can work with atomicMin
+    int wgt = wgts[eid] * SCALE_UP;
+    int new_distance = distances_cache[vid] + wgt;
+    atomicMin(&distances_cache[neighbor], new_distance);
+  }
+}
 
 // the conditional graph node kernel
 // uses the convergence boolean as condition check
@@ -423,73 +538,14 @@ __global__ void expand_new_level(
   }
 }
 
-
-__device__ void enqueue(
-  const int element,
-  int* queue,
-  int* q_tail) {
-  int pos = atomicAdd(q_tail, 1);
-  queue[pos] = element;
-}
-
-__device__ int dequeue(
-  int* queue,
-  int* q_head) {
-  int pos = atomicAdd(q_head, 1);
-  return queue[pos];
-}
-
-__global__ void enqueue_sinks(
-  int* sinks,
-  int num_sinks,
-  int* queue,
-  int* q_tail) {
-  const int tid = threadIdx.x + blockIdx.x*blockDim.x;
-  if (tid < num_sinks) {
-    enqueue(sinks[tid], queue, q_tail);
-  }
-}
-
-__global__ void prop_distance_bfs(
-    int* queue,
-    int* q_head,
-    int* q_tail,
-    int qsize,
-    int num_verts,
-    int num_edges,
-    int* vertices,
-    int* edges,
-    float* wgts,
-    int* distances_cache) {
-  const int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (tid >= qsize) {
-    return;
-  }
-
-  const int vid = dequeue(queue, q_head);
-
-  auto edge_start = vertices[vid];
-  auto edge_end = (vid == num_verts - 1) ? num_edges : vertices[vid+1]; 
-
-  for (int eid = edge_start; eid < edge_end; eid++) {
-    auto neighbor = edges[eid];
-    // multiply new distance by SCALE_UP to make it a integer
-    // so we can work with atomicMin
-    int wgt = wgts[eid] * SCALE_UP;
-    int new_distance = distances_cache[vid] + wgt;
-
-    atomicMin(&distances_cache[neighbor], new_distance);
-    enqueue(neighbor, queue, q_tail);
-  }
-}
-
-
-
 void CpGen::report_paths(
     int k, 
     int max_dev_lvls, 
     bool enable_compress,
     PropDistMethod method) {
+
+  levelize();
+  reindex_verts();
 
   // copy host csr to device
   thrust::device_vector<int> fanin_adjncy(_h_fanin_adjncy);
@@ -529,7 +585,6 @@ void CpGen::report_paths(
   bool* d_dists_updated = thrust::raw_pointer_cast(&dists_updated[0]);
   int* d_succs = thrust::raw_pointer_cast(&successors[0]);
 
-
   bool h_converged{false};
   checkError_t(
       cudaMalloc(&_d_converged, sizeof(bool)),
@@ -544,19 +599,12 @@ void CpGen::report_paths(
     dists_cache[sink] = 0;
     dists_updated[sink] = true;
   }
- 
 
   cudaDeviceProp dev_prop; 
   cudaGetDeviceProperties(&dev_prop, 0);
   // get shared memory size on this GPU
   const auto sharedmem_sz = dev_prop.sharedMemPerBlock;
   std::cout << "deviceProp.sharedMemPerBlock=" << sharedmem_sz << " bytes.\n";
-  
-  auto beg_lvlize = NOW;  
-  levelize(); 
-  auto end_lvlize = NOW;
-  std::cout << "levelize time=" <<
-    std::chrono::duration_cast<US>(end_lvlize-beg_lvlize).count() << '\n';
 
   auto beg = NOW;
   if (method == PropDistMethod::BASIC) { 
@@ -587,125 +635,95 @@ void CpGen::report_paths(
 
       iters++;
     }
-  } else if (method == PropDistMethod::BFS) {
-    // memory for the queue
-    cudaMalloc((void**)&_queue, QSIZE_MULTIPLIER*num_verts*sizeof(int));
-    cudaMalloc((void**)&_q_head, sizeof(int));    
-    cudaMalloc((void**)&_q_tail, sizeof(int));
-    cudaCheckErrors("allocate queue memory failed.");
-
-    // initialize queue
-    cudaMemset(_queue, 0, num_verts*sizeof(int));
-    cudaMemset(_q_head, 0, sizeof(int));
-    cudaMemset(_q_tail, 0, sizeof(int));
-
-    thrust::device_vector<int> sinks(_sinks);
-    int* d_sinks = thrust::raw_pointer_cast(&sinks[0]);
+  } else if (method == PropDistMethod::LEVELIZED) {
+    auto total_lvls = _h_verts_lvlp.size() - 1; 
+    thrust::device_vector<int> t_verts_by_lvl(_h_verts_by_lvl);
+    thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
+    int* d_verts_by_lvl = thrust::raw_pointer_cast(&t_verts_by_lvl[0]);
+    int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
     
-    // enqueue sinks
-    size_t num_sinks = _sinks.size();
-    enqueue_sinks
-      <<<ROUNDUPBLOCKS(num_sinks, BLOCKSIZE), BLOCKSIZE>>>
-      (d_sinks, num_sinks, _queue, _q_tail);
-
-    int qsize = num_sinks;
-    while (qsize > 0) {
-      prop_distance_bfs
-        <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-        (_queue, 
-         _q_head,
-         _q_tail,
-         qsize,
+    for (size_t l = 0; l < total_lvls; l++) {
+      // get level size to determine how many blocks to launch
+      const auto lvl_start = _h_verts_lvlp[l];
+      const auto lvl_end = _h_verts_lvlp[l+1];
+      const auto lvl_size = lvl_end - lvl_start;
+       
+      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE),BLOCKSIZE>>>
+        (d_verts_by_lvl,
+         lvl_start,
+         lvl_end,
          num_verts,
          num_edges,
          d_fanin_adjp,
          d_fanin_adjncy,
          d_fanin_wgts,
          d_dists_cache);
-     
-      qsize = _get_qsize(); 
-      iters++;
     }
-
+  
   } else if (method == PropDistMethod::LEVELIZED_SHAREDMEM) {
     const int verts_per_block = sharedmem_sz / sizeof(int);
     std::cout << "can fit " << verts_per_block << " vertices per block.\n";
 
-    // calculate how many parent distances to fit in
-    // a thread block's shared memory
-    int total_parents{0};
+    int total_lvls_to_fit_in_smem{0};
+    int total_verts_to_fit_in_smem{0};
+   
+    auto total_lvls = _h_verts_lvlp.size() - 1; 
     
-    // go through level list and 
-    // accumulate the number of parents
-    // for each level until we reach
-    // the limit
-    std::vector<int> parents;
-    std::vector<int> parent_p;
-    parent_p.emplace_back(0);
-    int max_lvl{0};
-
-    for (size_t i = 0; i < _h_verts_lvlp.size()-1; i++) {
+    for (size_t i = 0; i < total_lvls; i++) {
       const auto lvl_start = _h_verts_lvlp[i];
       const auto lvl_end = _h_verts_lvlp[i+1];
-      int total_parents_per_lvl{0};
-      for (auto l = lvl_start; l < lvl_end; l++) {
-        const auto v = _h_verts_by_lvl[l];
-        total_parents_per_lvl += _h_in_degrees[v];            
-      }
-      
-      if (total_parents_per_lvl == 0) {
-        continue;
-      }
-
-      if (total_parents + total_parents_per_lvl > verts_per_block) {
+      const auto lvl_size = lvl_end - lvl_start;
+      if (total_verts_to_fit_in_smem + lvl_size > verts_per_block) {
         break;
       }
       else {
-        max_lvl++;
-        // store parents and update parent pointer
-        total_parents += total_parents_per_lvl;
-        for (auto l = lvl_start; l < lvl_end; l++) {
-          const auto v = _h_verts_by_lvl[l];
-          const auto edge_start = _h_fanin_adjp[v];
-          const auto edge_end = _h_fanin_adjp[v+1];
-          const auto num_parents = edge_end - edge_start;
-          parent_p.emplace_back(parent_p.back()+num_parents);
-          for (auto e = edge_start; e < edge_end; e++) {
-            // note that we store the fanin edge ids as 
-            // parents, so we can look up wgts when
-            // calling prop_distance
-            parents.emplace_back(e);
-          }
-        }
+        total_verts_to_fit_in_smem += lvl_size;
+        total_lvls_to_fit_in_smem++;
       }
-    }   
+    }
     
+    std::cout << "can fit " << total_lvls_to_fit_in_smem << " lvls.\n";
+    std::cout << "can fit total of " << total_verts_to_fit_in_smem << " verts.\n"; 
+
     thrust::device_vector<int> t_verts_by_lvl(_h_verts_by_lvl);
     thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
-    std::vector<int> _h_parent_dists(total_parents,
-        std::numeric_limits<int>::max());
-    thrust::device_vector<int> t_parent_dists(_h_parent_dists);
-    thrust::device_vector<int> t_parents(parents);
-    thrust::device_vector<int> t_parent_p(t_parent_p);
     int* d_verts_by_lvl = thrust::raw_pointer_cast(&t_verts_by_lvl[0]);
     int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
-    int* d_parent_dists = thrust::raw_pointer_cast(&t_parent_dists[0]);
-    int* d_parents = thrust::raw_pointer_cast(&t_parents[0]);
-    int* d_parent_p = thrust::raw_pointer_cast(&t_parent_p[0]);
 
-
-    // TODO: need to rethink what infos to put on sharedmem...
     prop_distance_levelized_sharedmem<<<1, BLOCKSIZE>>>(
       0,
-      max_lvl,
+      total_lvls_to_fit_in_smem,
       d_verts_by_lvl,
       d_verts_lvlp,
-      total_parents,
-      d_parent_dists,
-      d_parents,
-      d_parent_p);
+      total_verts_to_fit_in_smem,
+      d_dists_cache,
+      num_verts,
+      num_edges,
+      d_fanin_adjp,
+      d_fanin_adjncy,
+      d_fanin_wgts);
 
-    
+
+    // finish relaxing the rest of the levels here
+    for (size_t l = total_lvls_to_fit_in_smem; l < total_lvls; l++) {
+      // get level size to determine how many blocks to launch
+      const auto lvl_start = _h_verts_lvlp[l];
+      const auto lvl_end = _h_verts_lvlp[l+1];
+      const auto lvl_size = lvl_end - lvl_start;
+       
+      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE),BLOCKSIZE>>>
+        (d_verts_by_lvl,
+         lvl_start,
+         lvl_end,
+         num_verts,
+         num_edges,
+         d_fanin_adjp,
+         d_fanin_adjncy,
+         d_fanin_wgts,
+         d_dists_cache);
+    }
+
+       
   } else if (method == PropDistMethod::CUDA_GRAPH) {
     cudaGraph_t cug;
     cudaGraphExec_t cug_exec;
@@ -810,12 +828,12 @@ void CpGen::report_paths(
   // copy distance vector back to host
   std::vector<int> h_dists(num_verts);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
-
-  //std::ofstream ofs("method-" + std::to_string(static_cast<int>(method)) + ".txt");
+ 
   //for (auto d : h_dists) {
-  //  ofs << d << '\n';
+  //  std::cout << d << ' ';
   //}
-  
+  //std::cout << '\n';
+
 
   // host level offsets
   std::vector<int> _h_lvl_offsets(max_dev_lvls+1, 0);
@@ -1013,9 +1031,7 @@ void CpGen::levelize() {
       const auto prev_lvlp = _h_verts_lvlp.back();
       _h_verts_lvlp.emplace_back(prev_lvlp+q.size());
     }
-
   }
-
 }
 
 std::vector<float> CpGen::get_slacks(int k) {
@@ -1090,20 +1106,103 @@ void CpGen::dump_lvls(std::ostream& os) const {
   }
 }
 
-int CpGen::_get_qsize() {
-  int head, tail;
-  cudaMemcpy(&head, _q_head, sizeof(int), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&tail, _q_tail, sizeof(int), cudaMemcpyDeviceToHost);
-  int size = tail - head; 
-  // printf("_get_qsize head = %d, tail = %d, q_sz = %d\n", head, tail, size);
-  return size;
+void CpGen::reindex_verts() {
+  auto vs = num_verts();
+  auto es = num_edges();
+  _reindex_map.resize(vs);
+
+  // traverse the level list
+  // and record the new id to map to
+  for (size_t i = 0; i < vs; i++) {
+    auto old_id = _h_verts_by_lvl[i];
+    // update id
+    _reindex_map[old_id] = i;
+  }
+
+  // update src and sinks
+  for (auto& sink : _sinks) {
+    sink = _reindex_map[sink];
+  }
+  
+  for (auto& src : _srcs) {
+    src = _reindex_map[src];
+  }
+
+  // iterate through the level list
+  // rebuild csr
+  std::vector<int> _h_fanin_adjp_by_lvl;
+  std::vector<int> _h_fanin_adjncy_by_lvl;
+  std::vector<float> _h_fanin_wgts_by_lvl;
+  std::vector<int> _h_fanout_adjp_by_lvl;
+  std::vector<int> _h_fanout_adjncy_by_lvl;
+  std::vector<float> _h_fanout_wgts_by_lvl;
+
+  _h_fanin_adjp_by_lvl.emplace_back(0);
+  _h_fanout_adjp_by_lvl.emplace_back(0);
+
+  for (const auto vid : _h_verts_by_lvl) {
+    const auto edge_start = _h_fanin_adjp[vid];
+    const auto edge_end = _h_fanin_adjp[vid+1];
+    const auto num_fanin = edge_end - edge_start;
+    auto prev_p = _h_fanin_adjp_by_lvl.back();
+    _h_fanin_adjp_by_lvl.emplace_back(prev_p+num_fanin);
+    for (auto eid = edge_start; eid < edge_end; eid++) {
+      const auto neighbor = _h_fanin_adjncy[eid];
+      const auto wgt = _h_fanin_wgts[eid];
+      _h_fanin_adjncy_by_lvl.emplace_back(_reindex_map[neighbor]);
+      _h_fanin_wgts_by_lvl.emplace_back(wgt);
+    }
+  }
+  
+  for (const auto vid : _h_verts_by_lvl) {
+    const auto edge_start = _h_fanout_adjp[vid];
+    const auto edge_end = _h_fanout_adjp[vid+1];
+    const auto num_fanout = edge_end - edge_start;
+    auto prev_p = _h_fanout_adjp_by_lvl.back();
+    _h_fanout_adjp_by_lvl.emplace_back(prev_p+num_fanout);
+    for (auto eid = edge_start; eid < edge_end; eid++) {
+      const auto neighbor = _h_fanout_adjncy[eid];
+      const auto wgt = _h_fanout_wgts[eid];
+      _h_fanout_adjncy_by_lvl.emplace_back(_reindex_map[neighbor]);
+      _h_fanout_wgts_by_lvl.emplace_back(wgt);
+    }
+  }
+
+  _h_fanin_adjp.clear();
+  _h_fanin_adjp = std::move(_h_fanin_adjp_by_lvl);
+  _h_fanin_adjncy.clear();
+  _h_fanin_adjncy = std::move(_h_fanin_adjncy_by_lvl);
+  _h_fanin_wgts.clear();
+  _h_fanin_wgts = std::move(_h_fanin_wgts_by_lvl);
+
+  _h_fanout_adjp.clear();
+  _h_fanout_adjp = std::move(_h_fanout_adjp_by_lvl);
+  _h_fanout_adjncy.clear();
+  _h_fanout_adjncy = std::move(_h_fanout_adjncy_by_lvl);
+  _h_fanout_wgts.clear();
+  _h_fanout_wgts = std::move(_h_fanout_wgts_by_lvl);
+  
+  // update level list
+  _h_verts_by_lvl.clear();
+  _h_verts_by_lvl.resize(vs);
+  std::iota(_h_verts_by_lvl.begin(), _h_verts_by_lvl.end(), 0);
+
+  // also record which vertex
+  // is in which level
+  _h_lvl_of.resize(vs);
+  for (size_t i = 0; i < _h_verts_lvlp.size()-1; i++) {
+    const auto lvl_start = _h_verts_lvlp[i];
+    const auto lvl_end = _h_verts_lvlp[i+1];
+    for (auto l = lvl_start; l < lvl_end; l++) {
+      const auto v = _h_verts_by_lvl[l];
+      _h_lvl_of[v] = i;
+    }
+  }
+
 }
 
 void CpGen::_free() {
   cudaFree(_d_converged);
-  cudaFree(_queue);
-  cudaFree(_q_head);
-  cudaFree(_q_tail);
 } 
 
 } // namespace gpucpg

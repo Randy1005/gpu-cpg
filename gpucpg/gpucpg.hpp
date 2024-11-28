@@ -7,6 +7,7 @@
 #include <chrono>
 #include <algorithm>
 #include <queue>
+#include <numeric>
 
 namespace gpucpg {
 
@@ -16,7 +17,7 @@ class CpGen;
 enum class PropDistMethod {
   BASIC = 0,
   CUDA_GRAPH,
-  BFS,
+  LEVELIZED,
   LEVELIZED_SHAREDMEM
   // and other methods
 };
@@ -35,14 +36,17 @@ public:
   
   void dump_csrs(std::ostream& os) const;
   void dump_lvls(std::ostream& os) const;
- 
+  
+  // re-assign index after levelization
+  // this is to save the trouble of
+  // maintaining messy mapping on GPU
+  // shared memory
+  void reindex_verts();
 
   size_t num_verts() const;
   size_t num_edges() const;
 
 private:
-  int _get_qsize();
-  
   void _free();
 
   // convergence condition
@@ -74,15 +78,8 @@ private:
   std::vector<int> _h_verts_by_lvl;
   std::vector<int> _h_verts_lvlp;
 
-  
-
-  // queue for the BFS of the graph
-  int* _queue;
-  
-  // pointers to queue head and tail
-  // queue size is tail minus head 
-  int* _q_head;
-  int* _q_tail;
+  std::vector<int> _reindex_map;
+  std::vector<int> _h_lvl_of;
 };
 
 
@@ -112,7 +109,6 @@ struct PfxtNode {
     os << "slack=" << slack << '\n';
   }
 
-   
   int level;
   int from;
   int to;
