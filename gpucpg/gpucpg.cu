@@ -278,7 +278,6 @@ __global__ void prop_distance_levelized_sharedmem(
         // own distance must be in smem
         int own_dist = s_dists[vid];
         int wgt = wgts[eid] * SCALE_UP;
-        
         int new_distance = own_dist + wgt;
           
         // if neighbor is not in smem, load distance from global memory
@@ -344,7 +343,6 @@ __global__ void prop_distance_levelized_sharedmem(
 }
 
 __global__ void prop_distance_levelized(
-    int* verts_by_lvl,
     int v_beg,
     int v_end,
     int num_verts,
@@ -370,6 +368,52 @@ __global__ void prop_distance_levelized(
     atomicMin(&distances_cache[neighbor], new_distance);
   }
 }
+
+__global__ void prop_distance_levelized_merged(
+    int* verts_lvlp,
+    int lvl_beg,
+    int lvl_end,
+    int num_verts,
+    int num_edges,
+    int* vertices,
+    int* edges,
+    float* wgts,
+    int* distances_cache) {
+  const int tid = threadIdx.x;
+   
+  for (int i = lvl_beg; i < lvl_end; i++) {
+    const auto v_beg = verts_lvlp[i];
+    const auto v_end = verts_lvlp[i+1];
+    const auto lvl_size = v_end - v_beg;
+   
+    // we let one thread relax multiple vertices
+    const int chunk_size = lvl_size / BLOCKSIZE;
+    const int rem = lvl_size % BLOCKSIZE;
+    const int chunk_beg = v_beg+tid*chunk_size;
+    const int chunk_end = (tid == BLOCKSIZE-1) ? 
+      chunk_beg+(tid+1)*chunk_size+rem : 
+      chunk_beg+(tid+1)*chunk_size;
+    
+    for (int vid = chunk_beg; vid < chunk_end; vid++) {
+      const auto edge_start = vertices[vid];
+      const auto edge_end = (vid == num_verts - 1) ? num_edges : vertices[vid+1]; 
+      for (int eid = edge_start; eid < edge_end; eid++) {
+        const auto neighbor = edges[eid];
+        // multiply new distance by SCALE_UP to make it a integer
+        // so we can work with atomicMin
+        const int wgt = wgts[eid] * SCALE_UP;
+        const auto new_distance = distances_cache[vid] + wgt;
+        atomicMin(&distances_cache[neighbor], new_distance);
+      }
+    }
+    
+    __syncthreads();
+  }  
+}
+
+
+
+
 
 // the conditional graph node kernel
 // uses the convergence boolean as condition check
@@ -546,6 +590,11 @@ void CpGen::report_paths(
 
   levelize();
   reindex_verts();
+  const auto total_lvls = _h_verts_lvlp.size() - 1; 
+  std::cout << "total " << total_lvls << " levels.\n"; 
+
+  std::ofstream ofs_lvls("lvls.txt");
+  dump_lvls(ofs_lvls);
 
   // copy host csr to device
   thrust::device_vector<int> fanin_adjncy(_h_fanin_adjncy);
@@ -555,8 +604,8 @@ void CpGen::report_paths(
   thrust::device_vector<int> fanout_adjp(_h_fanout_adjp);
   thrust::device_vector<float> fanout_wgts(_h_fanout_wgts);
 
-  auto num_edges = _h_fanout_adjncy.size();
-  auto num_verts = _h_fanin_adjp.size() - 1;
+  const auto num_edges = _h_fanout_adjncy.size();
+  const auto num_verts = _h_fanin_adjp.size() - 1;
 
   // shortest distances cache
   thrust::device_vector<int> dists_cache(num_verts,
@@ -635,23 +684,20 @@ void CpGen::report_paths(
 
       iters++;
     }
-  } else if (method == PropDistMethod::LEVELIZED) {
-    auto total_lvls = _h_verts_lvlp.size() - 1; 
-    thrust::device_vector<int> t_verts_by_lvl(_h_verts_by_lvl);
+  } 
+  else if (method == PropDistMethod::LEVELIZED) {
     thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
-    int* d_verts_by_lvl = thrust::raw_pointer_cast(&t_verts_by_lvl[0]);
     int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
     
     for (size_t l = 0; l < total_lvls; l++) {
       // get level size to determine how many blocks to launch
-      const auto lvl_start = _h_verts_lvlp[l];
-      const auto lvl_end = _h_verts_lvlp[l+1];
-      const auto lvl_size = lvl_end - lvl_start;
+      const auto v_beg = _h_verts_lvlp[l];
+      const auto v_end = _h_verts_lvlp[l+1];
+      const auto lvl_size = v_end - v_beg;
        
-      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE),BLOCKSIZE>>>
-        (d_verts_by_lvl,
-         lvl_start,
-         lvl_end,
+      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
+        (v_beg,
+         v_end,
          num_verts,
          num_edges,
          d_fanin_adjp,
@@ -660,19 +706,18 @@ void CpGen::report_paths(
          d_dists_cache);
     }
   
-  } else if (method == PropDistMethod::LEVELIZED_SHAREDMEM) {
+  } 
+  else if (method == PropDistMethod::LEVELIZED_SHAREDMEM) {
     const int verts_per_block = sharedmem_sz / sizeof(int);
     std::cout << "can fit " << verts_per_block << " vertices per block.\n";
 
     int total_lvls_to_fit_in_smem{0};
     int total_verts_to_fit_in_smem{0};
-   
-    auto total_lvls = _h_verts_lvlp.size() - 1; 
     
     for (size_t i = 0; i < total_lvls; i++) {
-      const auto lvl_start = _h_verts_lvlp[i];
-      const auto lvl_end = _h_verts_lvlp[i+1];
-      const auto lvl_size = lvl_end - lvl_start;
+      const auto v_beg = _h_verts_lvlp[i];
+      const auto v_end = _h_verts_lvlp[i+1];
+      const auto lvl_size = v_end - v_beg;
       if (total_verts_to_fit_in_smem + lvl_size > verts_per_block) {
         break;
       }
@@ -707,14 +752,13 @@ void CpGen::report_paths(
     // finish relaxing the rest of the levels here
     for (size_t l = total_lvls_to_fit_in_smem; l < total_lvls; l++) {
       // get level size to determine how many blocks to launch
-      const auto lvl_start = _h_verts_lvlp[l];
-      const auto lvl_end = _h_verts_lvlp[l+1];
-      const auto lvl_size = lvl_end - lvl_start;
+      const auto v_beg = _h_verts_lvlp[l];
+      const auto v_end = _h_verts_lvlp[l+1];
+      const auto lvl_size = v_end - v_beg;
        
-      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE),BLOCKSIZE>>>
-        (d_verts_by_lvl,
-         lvl_start,
-         lvl_end,
+      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
+        (v_beg,
+         v_end,
          num_verts,
          num_edges,
          d_fanin_adjp,
@@ -722,9 +766,8 @@ void CpGen::report_paths(
          d_fanin_wgts,
          d_dists_cache);
     }
-
-       
-  } else if (method == PropDistMethod::CUDA_GRAPH) {
+  } 
+  else if (method == PropDistMethod::CUDA_GRAPH) {
     cudaGraph_t cug;
     cudaGraphExec_t cug_exec;
     cudaGraphNode_t while_node;
@@ -808,7 +851,72 @@ void CpGen::report_paths(
         cudaGraphExecDestroy(cug_exec), 
         "destroy cuGraph executor failed.");
 
-    checkError_t(cudaGraphDestroy(cug), "destory cuGraph failed.");
+    checkError_t(cudaGraphDestroy(cug), "destroy cuGraph failed.");
+  }
+  else if (method == PropDistMethod::LEVELIZED_MERGE) {
+    const int chunk_size = 2;
+    std::vector<bool> can_merge(total_lvls, false);
+    for (size_t l = 0; l < total_lvls; l++) {
+      const auto v_beg = _h_verts_lvlp[l];
+      const auto v_end = _h_verts_lvlp[l+1];
+      const auto lvl_size = v_end - v_beg;
+      if (lvl_size <= BLOCKSIZE*chunk_size) {
+        // can be run with one block, merge
+        can_merge[l] = true;
+      }
+    }
+ 
+    for (auto m : can_merge) {
+      std::cout << m << ' ';
+    }
+    std::cout << '\n';
+
+    //thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
+    //int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
+   
+    //size_t lvl{0}; 
+    //while (lvl < total_lvls) {
+    //  size_t peeks{1};
+    //  while (can_merge[lvl+peeks] == can_merge[lvl]) {
+    //    peeks++;
+    //  }
+    //    
+    //  if (can_merge[lvl]) {
+    //    std::cout << "merging " << lvl << " -- " << lvl+peeks << '\n';
+    //    prop_distance_levelized_merged<<<1, BLOCKSIZE>>>
+    //      (d_verts_lvlp,
+    //       lvl,
+    //       lvl+peeks,
+    //       num_verts,
+    //       num_edges,
+    //       d_fanin_adjp,
+    //       d_fanin_adjncy,
+    //       d_fanin_wgts,
+    //       d_dists_cache);
+    //  }
+    //  else {
+    //    std::cout << "regular levelized " << lvl << " -- " << lvl+peeks <<
+    //      '\n';
+    //    for (size_t l = lvl; l < lvl+peeks; l++) {
+    //      const auto v_beg = _h_verts_lvlp[l];
+    //      const auto v_end = _h_verts_lvlp[l+1];
+    //      const auto lvl_size = v_end - v_beg;
+    //       
+    //      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
+    //        (v_beg,
+    //         v_end,
+    //         num_verts,
+    //         num_edges,
+    //         d_fanin_adjp,
+    //         d_fanin_adjncy,
+    //         d_fanin_wgts,
+    //         d_dists_cache);
+    //    }
+    //  }
+
+    //  lvl += peeks;
+    //}
+
   }
 
   update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
@@ -822,18 +930,11 @@ void CpGen::report_paths(
 
   auto end = NOW;
   prop_time = std::chrono::duration_cast<US>(end-beg).count();
-  std::cout << "prop_distance converged with " << iters << " iters.\n";
-  std::cout << "prop_disance runtime: " << prop_time << " us.\n";
+  std::cout << "prop_distance runtime: " << prop_time << " us.\n";
 
   // copy distance vector back to host
   std::vector<int> h_dists(num_verts);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
- 
-  //for (auto d : h_dists) {
-  //  std::cout << d << ' ';
-  //}
-  //std::cout << '\n';
-
 
   // host level offsets
   std::vector<int> _h_lvl_offsets(max_dev_lvls+1, 0);
@@ -1096,13 +1197,9 @@ void CpGen::dump_csrs(std::ostream& os) const {
 
 void CpGen::dump_lvls(std::ostream& os) const {
   for (size_t i = 0; i < _h_verts_lvlp.size()-1; i++) {
-    auto lvl_start = _h_verts_lvlp[i];
-    auto lvl_end = _h_verts_lvlp[i+1];
-    os << "level " << i << ":\n";
-    for (auto v = lvl_start; v < lvl_end; v++) {
-      os << _h_verts_by_lvl[v] << ' ';
-    }
-    os << '\n';
+    auto v_beg = _h_verts_lvlp[i];
+    auto v_end = _h_verts_lvlp[i+1];
+    os << v_end - v_beg << '\n';
   }
 }
 

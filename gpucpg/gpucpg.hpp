@@ -18,7 +18,8 @@ enum class PropDistMethod {
   BASIC = 0,
   CUDA_GRAPH,
   LEVELIZED,
-  LEVELIZED_SHAREDMEM
+  LEVELIZED_SHAREDMEM,
+  LEVELIZED_MERGE
   // and other methods
 };
 
