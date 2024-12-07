@@ -157,6 +157,36 @@ void CpGen::read_input(const std::string& filename) {
   }
 }
 
+
+__device__ void enqueue(
+    const int vid, 
+    int* queue, 
+    int* qtail) {
+  auto pos = atomicAdd(qtail, 1);
+  queue[pos] = vid;
+}
+
+__device__ int dequeue(
+    int* queue,
+    int* qhead) {
+  auto pos = atomicAdd(qhead, 1);
+  auto vid = queue[pos];
+
+  return vid;
+}
+
+__global__ void enqueue_sinks(
+    const int num_sinks,
+    int* queue,
+    int* qtail) {
+  int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  if (tid < num_sinks) {
+    enqueue(tid, queue, qtail);
+  }
+} 
+
+
+
 __global__ void check_if_no_dists_updated(
     int num_verts, 
     bool* dists_updated,
@@ -333,7 +363,7 @@ __global__ void prop_distance_levelized_sharedmem(
     int chunk_start = tid*chunk_size;
     int chunk_end = (tid == BLOCKSIZE-1) ? (tid+1)*chunk_size+rem
       : (tid+1)*chunk_size;
-    // let one thread load a chunk of data
+    // let one thread store a chunk of data
     for (int i = chunk_start; i < chunk_end; i++) {
       dists_cache[i] = s_dists[i];
     }
@@ -410,6 +440,50 @@ __global__ void prop_distance_levelized_merged(
     __syncthreads();
   }  
 }
+
+__global__ void prop_distance_bfs_sharedmem(
+    int num_verts, 
+    int num_edges,
+    int* vertices,
+    int* edges,
+    float* wgts,
+    int* distances_cache,
+    int* queue,
+    int* qhead,
+    int* qtail,
+    int qsize,
+    int* out_degs) {
+
+  __shared__ int s_dists[BLOCKSIZE];
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+
+  if (tid >= qsize) {
+    return;
+  }
+
+  // dequeue a vertex from the queue
+  const auto vid = dequeue(queue, qhead);
+  const auto edge_start = vertices[vid];
+  const auto edge_end = (vid == num_verts-1) ? num_edges : vertices[vid+1]; 
+
+  for (int eid = edge_start; eid < edge_end; eid++) {
+    const auto neighbor = edges[eid];
+    int wgt = wgts[eid] * SCALE_UP;
+    int new_distance = distances_cache[vid] + wgt;
+
+    atomicMin(&distances_cache[neighbor], new_distance);
+   
+    //printf("%d relaxed neighbor %d\n", vid, neighbor); 
+    // decrement the dependency counter for this neighbor
+    if (atomicSub(&out_degs[neighbor], 1) == 1) {
+      //printf("%d is the last dependent of %d\n", vid, neighbor);
+      // if this thread releases the last dependency
+      // it should add this neighbor to the queue
+      enqueue(neighbor, queue, qtail);
+    }
+  }
+
+} 
 
 
 
@@ -588,13 +662,47 @@ void CpGen::report_paths(
     bool enable_compress,
     PropDistMethod method) {
 
+  auto beg_lvlize = NOW; 
   levelize();
+  auto end_lvlize = NOW;
+  auto beg_reindex = NOW;
   reindex_verts();
+  auto end_reindex = NOW;
+  std::cout << "levelize time=" <<
+    std::chrono::duration_cast<US>(end_lvlize-beg_lvlize).count()
+    << " us.\n";
+  std::cout << "reindex time=" <<
+    std::chrono::duration_cast<US>(end_reindex-beg_reindex).count()
+    << " us.\n";
+ 
+  //for (size_t i = 0; i < _h_verts_lvlp.size()-1; i++) {
+  //  const auto beg = _h_verts_lvlp[i];
+  //  const auto end = _h_verts_lvlp[i+1];
+  //  for (auto v = beg; v < end; v++) {
+  //    std::cout << _h_verts_by_lvl[v] << ' ';
+  //  }
+  //  std::cout << '\n';
+  //}
+
   const auto total_lvls = _h_verts_lvlp.size() - 1; 
   std::cout << "total " << total_lvls << " levels.\n"; 
 
-  std::ofstream ofs_lvls("lvls.txt");
-  dump_lvls(ofs_lvls);
+  const auto num_edges = _h_fanout_adjncy.size();
+  const auto num_verts = _h_fanin_adjp.size() - 1;
+  
+  // copy host out degrees to device
+  // and initialize queue for bfs
+  std::vector<int> h_queue(_sinks);
+  h_queue.resize(num_verts);
+  thrust::device_vector<int> queue(h_queue);
+  thrust::device_vector<int> out_degs(_h_out_degrees);
+
+  checkError_t(cudaMalloc(&_d_qhead, sizeof(int)), "malloc qhead failed.");
+  checkError_t(cudaMalloc(&_d_qtail, sizeof(int)), "malloc qtail failed.");
+  checkError_t(cudaMemset(_d_qhead, 0, sizeof(int)), "memset qhead failed.");
+  checkError_t(cudaMemset(_d_qtail, 0, sizeof(int)), "memset qtail failed.");
+  int* d_queue = thrust::raw_pointer_cast(&queue[0]);
+  int* d_out_degs = thrust::raw_pointer_cast(&out_degs[0]);
 
   // copy host csr to device
   thrust::device_vector<int> fanin_adjncy(_h_fanin_adjncy);
@@ -604,8 +712,6 @@ void CpGen::report_paths(
   thrust::device_vector<int> fanout_adjp(_h_fanout_adjp);
   thrust::device_vector<float> fanout_wgts(_h_fanout_wgts);
 
-  const auto num_edges = _h_fanout_adjncy.size();
-  const auto num_verts = _h_fanin_adjp.size() - 1;
 
   // shortest distances cache
   thrust::device_vector<int> dists_cache(num_verts,
@@ -748,7 +854,6 @@ void CpGen::report_paths(
       d_fanin_adjncy,
       d_fanin_wgts);
 
-
     // finish relaxing the rest of the levels here
     for (size_t l = total_lvls_to_fit_in_smem; l < total_lvls; l++) {
       // get level size to determine how many blocks to launch
@@ -853,69 +958,31 @@ void CpGen::report_paths(
 
     checkError_t(cudaGraphDestroy(cug), "destroy cuGraph failed.");
   }
-  else if (method == PropDistMethod::LEVELIZED_MERGE) {
-    const int chunk_size = 2;
-    std::vector<bool> can_merge(total_lvls, false);
-    for (size_t l = 0; l < total_lvls; l++) {
-      const auto v_beg = _h_verts_lvlp[l];
-      const auto v_end = _h_verts_lvlp[l+1];
-      const auto lvl_size = v_end - v_beg;
-      if (lvl_size <= BLOCKSIZE*chunk_size) {
-        // can be run with one block, merge
-        can_merge[l] = true;
-      }
-    }
- 
-    for (auto m : can_merge) {
-      std::cout << m << ' ';
-    }
-    std::cout << '\n';
-
-    //thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
-    //int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
+  else if (method == PropDistMethod::BFS_SHAREDMEM) {
    
-    //size_t lvl{0}; 
-    //while (lvl < total_lvls) {
-    //  size_t peeks{1};
-    //  while (can_merge[lvl+peeks] == can_merge[lvl]) {
-    //    peeks++;
-    //  }
-    //    
-    //  if (can_merge[lvl]) {
-    //    std::cout << "merging " << lvl << " -- " << lvl+peeks << '\n';
-    //    prop_distance_levelized_merged<<<1, BLOCKSIZE>>>
-    //      (d_verts_lvlp,
-    //       lvl,
-    //       lvl+peeks,
-    //       num_verts,
-    //       num_edges,
-    //       d_fanin_adjp,
-    //       d_fanin_adjncy,
-    //       d_fanin_wgts,
-    //       d_dists_cache);
-    //  }
-    //  else {
-    //    std::cout << "regular levelized " << lvl << " -- " << lvl+peeks <<
-    //      '\n';
-    //    for (size_t l = lvl; l < lvl+peeks; l++) {
-    //      const auto v_beg = _h_verts_lvlp[l];
-    //      const auto v_end = _h_verts_lvlp[l+1];
-    //      const auto lvl_size = v_end - v_beg;
-    //       
-    //      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
-    //        (v_beg,
-    //         v_end,
-    //         num_verts,
-    //         num_edges,
-    //         d_fanin_adjp,
-    //         d_fanin_adjncy,
-    //         d_fanin_wgts,
-    //         d_dists_cache);
-    //    }
-    //  }
+    // enqueue the sinks
+    int qsize{static_cast<int>(_sinks.size())}; 
+    enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+      (qsize, d_queue, _d_qtail);
 
-    //  lvl += peeks;
-    //}
+    while (qsize > 0) {
+      prop_distance_bfs_sharedmem<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts,
+         num_edges,
+         d_fanin_adjp,
+         d_fanin_adjncy,
+         d_fanin_wgts,
+         d_dists_cache,
+         d_queue,
+         _d_qhead,
+         _d_qtail,
+         qsize,
+         d_out_degs);
+
+      // get queue size
+      qsize = _get_qsize();
+      iters++;
+    }
 
   }
 
@@ -930,6 +997,7 @@ void CpGen::report_paths(
 
   auto end = NOW;
   prop_time = std::chrono::duration_cast<US>(end-beg).count();
+  std::cout << "prop_distance converged with " << iters << " iters.\n";
   std::cout << "prop_distance runtime: " << prop_time << " us.\n";
 
   // copy distance vector back to host
@@ -1072,17 +1140,6 @@ void CpGen::report_paths(
 
   expand_time = std::chrono::duration_cast<US>(end-beg).count();
   std::cout << "level expansion runtime: " << expand_time << " us.\n";
-
-  //for (size_t i = 0; i < _h_lvl_offsets.size() - 1; i++) {
-  //  auto beg = _h_lvl_offsets[i];
-  //  auto end = _h_lvl_offsets[i+1];
-  //  std::cout << "======= lvl " << i << " =======\n";
-  //  for (auto id = beg; id < end; id++) {
-  //    std::cout << _h_pfxt_nodes[id].slack << ' ';
-  //  }
-  //  std::cout << '\n';
-
-  //}
 
   for (int i = 0; i < max_dev_lvls; i++) {
     auto beg = _h_lvl_offsets[i];
@@ -1243,6 +1300,7 @@ void CpGen::reindex_verts() {
     const auto num_fanin = edge_end - edge_start;
     auto prev_p = _h_fanin_adjp_by_lvl.back();
     _h_fanin_adjp_by_lvl.emplace_back(prev_p+num_fanin);
+    _h_in_degrees[_reindex_map[vid]] = num_fanin;
     for (auto eid = edge_start; eid < edge_end; eid++) {
       const auto neighbor = _h_fanin_adjncy[eid];
       const auto wgt = _h_fanin_wgts[eid];
@@ -1257,6 +1315,7 @@ void CpGen::reindex_verts() {
     const auto num_fanout = edge_end - edge_start;
     auto prev_p = _h_fanout_adjp_by_lvl.back();
     _h_fanout_adjp_by_lvl.emplace_back(prev_p+num_fanout);
+    _h_out_degrees[_reindex_map[vid]] = num_fanout;
     for (auto eid = edge_start; eid < edge_end; eid++) {
       const auto neighbor = _h_fanout_adjncy[eid];
       const auto wgt = _h_fanout_wgts[eid];
@@ -1286,20 +1345,51 @@ void CpGen::reindex_verts() {
 
   // also record which vertex
   // is in which level
-  _h_lvl_of.resize(vs);
-  for (size_t i = 0; i < _h_verts_lvlp.size()-1; i++) {
-    const auto lvl_start = _h_verts_lvlp[i];
-    const auto lvl_end = _h_verts_lvlp[i+1];
-    for (auto l = lvl_start; l < lvl_end; l++) {
-      const auto v = _h_verts_by_lvl[l];
-      _h_lvl_of[v] = i;
-    }
-  }
+  //_h_lvl_of.resize(vs);
+  //for (size_t i = 0; i < _h_verts_lvlp.size()-1; i++) {
+  //  const auto lvl_start = _h_verts_lvlp[i];
+  //  const auto lvl_end = _h_verts_lvlp[i+1];
+  //  for (auto l = lvl_start; l < lvl_end; l++) {
+  //    const auto v = _h_verts_by_lvl[l];
+  //    _h_lvl_of[v] = i;
+  //  }
+  //}
 
 }
 
 void CpGen::_free() {
   cudaFree(_d_converged);
+  cudaFree(_d_queue);
+  cudaFree(_d_out_degree);
 } 
+
+int CpGen::_get_qsize() {
+  int head, tail;
+  cudaMemcpy(&head, _d_qhead, sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&tail, _d_qtail, sizeof(int), cudaMemcpyDeviceToHost);
+  
+  int size = tail - head;
+  //printf("_get_queue_size head = %d, tail = %d, q_sz = %d\n", head, tail, size);
+  return size;
+}
+
+void CpGen::_cp_outdegree2gpu() {
+  const auto vs = num_verts();
+
+  // allocate global memory for queue
+  // and out degree
+  checkError_t(
+      cudaMalloc(&_d_queue, vs*sizeof(int)), "malloc queue failed.");
+  
+  checkError_t(cudaMalloc(&_d_qhead, sizeof(int)), "malloc qhead faied.");
+  checkError_t(cudaMalloc(&_d_qtail, sizeof(int)), "malloc qtail faied.");
+  
+  checkError_t(
+      cudaMalloc(&_d_out_degree, vs*sizeof(int)), "cudaMalloc outdegree failed.");
+
+  checkError_t(cudaMemcpy(_d_out_degree, _h_out_degrees.data(), vs*sizeof(int),
+        cudaMemcpyHostToDevice), "memcpy out degree failed.");
+}
+
 
 } // namespace gpucpg

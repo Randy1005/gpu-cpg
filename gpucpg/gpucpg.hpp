@@ -19,7 +19,7 @@ enum class PropDistMethod {
   CUDA_GRAPH,
   LEVELIZED,
   LEVELIZED_SHAREDMEM,
-  LEVELIZED_MERGE
+  BFS_SHAREDMEM
   // and other methods
 };
 
@@ -49,6 +49,10 @@ public:
 
 private:
   void _free();
+  
+  void _cp_outdegree2gpu();
+
+  int _get_qsize();
 
   // convergence condition
   bool* _d_converged;
@@ -81,6 +85,17 @@ private:
 
   std::vector<int> _reindex_map;
   std::vector<int> _h_lvl_of;
+
+
+  // queue for BFS
+  int* _d_queue;
+
+  // the out degree of each vertex
+  int* _d_out_degree;
+
+  // queue head and tail
+  int* _d_qhead;
+  int* _d_qtail;
 };
 
 

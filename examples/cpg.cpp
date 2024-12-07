@@ -16,9 +16,10 @@ int main(int argc, char* argv[]) {
   
   std::cout << "num_verts=" << cpgen.num_verts() << '\n';
   std::cout << "num_edges=" << cpgen.num_edges() << '\n';
-
   std::cout << "method=" << static_cast<int>(method) << '\n';
   cpgen.report_paths(num_paths, max_dev_lvls, enable_compress, method);
+  std::ofstream ofs("lvls.txt");
+  cpgen.dump_lvls(ofs);
 
   //std::ofstream os("paths.txt");
   //auto slacks = cpgen.get_slacks(num_paths);

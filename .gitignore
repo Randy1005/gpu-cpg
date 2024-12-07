@@ -10,3 +10,7 @@ build*/
 tags
 *.swp
 *.swo
+
+*.sh
+*.ncu-rep
+*.nsys-rep
