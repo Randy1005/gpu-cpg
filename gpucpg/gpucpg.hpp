@@ -19,8 +19,8 @@ enum class PropDistMethod {
   CUDA_GRAPH,
   LEVELIZED,
   LEVELIZED_SHAREDMEM,
+  BFS,
   BFS_SHAREDMEM
-  // and other methods
 };
 
 class CpGen {  
@@ -34,7 +34,7 @@ public:
     bool enable_compress, 
     PropDistMethod method);
   std::vector<float> get_slacks(int k);
-  
+ 
   void dump_csrs(std::ostream& os) const;
   void dump_lvls(std::ostream& os) const;
   
@@ -50,8 +50,6 @@ public:
 private:
   void _free();
   
-  void _cp_outdegree2gpu();
-
   int _get_qsize();
 
   // convergence condition
@@ -86,12 +84,10 @@ private:
   std::vector<int> _reindex_map;
   std::vector<int> _h_lvl_of;
 
-
-  // queue for BFS
-  int* _d_queue;
-
-  // the out degree of each vertex
-  int* _d_out_degree;
+  // sorted verts based on 
+  // their out degree
+  std::vector<int> _h_verts_by_odeg;
+  std::vector<int> _h_shm_map;
 
   // queue head and tail
   int* _d_qhead;

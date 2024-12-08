@@ -8,6 +8,10 @@
 
 #define MAX_INTS_ON_SMEM 12288
 #define BLOCKSIZE 1024 
+#define MAX_OUT_DEG_GLOBM 1
+#define VID_BITS 22
+#define SHM_IDX_BITS 10
+
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
   (((DATALEN) + (NTHREADS) - 1) / (NTHREADS))
@@ -173,6 +177,20 @@ __device__ int dequeue(
   auto vid = queue[pos];
 
   return vid;
+}
+
+__device__ int encode_vert(int orig_id, int shm_idx) {
+  auto encoded = (shm_idx << VID_BITS) | orig_id;
+  return encoded;
+}
+
+__device__ void decode(int to_decode, int* decoded) {
+  // extract the shm idx
+  const auto shm_idx = (to_decode >> VID_BITS) & ((1 << SHM_IDX_BITS)-1);
+  // extract the original vert id
+  const auto orig_id = to_decode & ((1 << VID_BITS)-1);
+  decoded[0] = shm_idx;
+  decoded[1] = orig_id;
 }
 
 __global__ void enqueue_sinks(
@@ -441,10 +459,10 @@ __global__ void prop_distance_levelized_merged(
   }  
 }
 
-__global__ void prop_distance_bfs_sharedmem(
+__global__ void prop_distance_bfs(
     int num_verts, 
     int num_edges,
-    int* vertices,
+    int* verts,
     int* edges,
     float* wgts,
     int* distances_cache,
@@ -452,31 +470,66 @@ __global__ void prop_distance_bfs_sharedmem(
     int* qhead,
     int* qtail,
     int qsize,
-    int* out_degs) {
+    int* deps) {
 
-  __shared__ int s_dists[BLOCKSIZE];
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-
   if (tid >= qsize) {
     return;
   }
 
   // dequeue a vertex from the queue
   const auto vid = dequeue(queue, qhead);
-  const auto edge_start = vertices[vid];
-  const auto edge_end = (vid == num_verts-1) ? num_edges : vertices[vid+1]; 
+  const auto edge_start = verts[vid];
+  const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
 
   for (int eid = edge_start; eid < edge_end; eid++) {
     const auto neighbor = edges[eid];
     int wgt = wgts[eid] * SCALE_UP;
     int new_distance = distances_cache[vid] + wgt;
-
     atomicMin(&distances_cache[neighbor], new_distance);
    
-    //printf("%d relaxed neighbor %d\n", vid, neighbor); 
     // decrement the dependency counter for this neighbor
-    if (atomicSub(&out_degs[neighbor], 1) == 1) {
-      //printf("%d is the last dependent of %d\n", vid, neighbor);
+    if (atomicSub(&deps[neighbor], 1) == 1) {
+      // if this thread releases the last dependency
+      // it should add this neighbor to the queue
+      enqueue(neighbor, queue, qtail);
+    }
+  }
+} 
+
+__global__ void prop_distance_bfs_sharedmem(
+    int num_verts, 
+    int num_edges,
+    int* verts,
+    int* edges,
+    float* wgts,
+    int* distances_cache,
+    int* queue,
+    int* qhead,
+    int* qtail,
+    int qsize,
+    int* deps) {
+  __shared__ int s_dists[BLOCKSIZE];
+  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
+
+  if (gid >= qsize) {
+    return;
+  }
+
+  // dequeue a vertex from the queue
+  const auto vid = dequeue(queue, qhead);
+  const auto edge_start = verts[vid];
+  const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
+
+  for (int eid = edge_start; eid < edge_end; eid++) {
+    const auto neighbor = edges[eid];
+    
+    int wgt = wgts[eid] * SCALE_UP;
+    int new_distance = distances_cache[vid] + wgt;
+    atomicMin(&distances_cache[neighbor], new_distance);
+   
+    // decrement the dependency counter for this neighbor
+    if (atomicSub(&deps[neighbor], 1) == 1) {
       // if this thread releases the last dependency
       // it should add this neighbor to the queue
       enqueue(neighbor, queue, qtail);
@@ -689,7 +742,7 @@ void CpGen::report_paths(
 
   const auto num_edges = _h_fanout_adjncy.size();
   const auto num_verts = _h_fanin_adjp.size() - 1;
-  
+ 
   // copy host out degrees to device
   // and initialize queue for bfs
   std::vector<int> h_queue(_sinks);
@@ -958,15 +1011,14 @@ void CpGen::report_paths(
 
     checkError_t(cudaGraphDestroy(cug), "destroy cuGraph failed.");
   }
-  else if (method == PropDistMethod::BFS_SHAREDMEM) {
-   
+  else if (method == PropDistMethod::BFS) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
     enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
       (qsize, d_queue, _d_qtail);
 
     while (qsize > 0) {
-      prop_distance_bfs_sharedmem<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+      prop_distance_bfs<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
         (num_verts,
          num_edges,
          d_fanin_adjp,
@@ -983,7 +1035,10 @@ void CpGen::report_paths(
       qsize = _get_qsize();
       iters++;
     }
-
+  }
+  else if (method == PropDistMethod::BFS_SHAREDMEM) {
+  
+  
   }
 
   update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
@@ -1359,37 +1414,17 @@ void CpGen::reindex_verts() {
 
 void CpGen::_free() {
   cudaFree(_d_converged);
-  cudaFree(_d_queue);
-  cudaFree(_d_out_degree);
+  cudaFree(_d_qhead);
+  cudaFree(_d_qtail);
 } 
 
 int CpGen::_get_qsize() {
   int head, tail;
   cudaMemcpy(&head, _d_qhead, sizeof(int), cudaMemcpyDeviceToHost);
   cudaMemcpy(&tail, _d_qtail, sizeof(int), cudaMemcpyDeviceToHost);
-  
   int size = tail - head;
   //printf("_get_queue_size head = %d, tail = %d, q_sz = %d\n", head, tail, size);
   return size;
 }
-
-void CpGen::_cp_outdegree2gpu() {
-  const auto vs = num_verts();
-
-  // allocate global memory for queue
-  // and out degree
-  checkError_t(
-      cudaMalloc(&_d_queue, vs*sizeof(int)), "malloc queue failed.");
-  
-  checkError_t(cudaMalloc(&_d_qhead, sizeof(int)), "malloc qhead faied.");
-  checkError_t(cudaMalloc(&_d_qtail, sizeof(int)), "malloc qtail faied.");
-  
-  checkError_t(
-      cudaMalloc(&_d_out_degree, vs*sizeof(int)), "cudaMalloc outdegree failed.");
-
-  checkError_t(cudaMemcpy(_d_out_degree, _h_out_degrees.data(), vs*sizeof(int),
-        cudaMemcpyHostToDevice), "memcpy out degree failed.");
-}
-
 
 } // namespace gpucpg
