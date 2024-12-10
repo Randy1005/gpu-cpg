@@ -8,7 +8,7 @@
 
 #define MAX_INTS_ON_SMEM 12288
 #define BLOCKSIZE 1024 
-#define MAX_OUT_DEG_GLOBM 1
+#define LOCAL_FRONTIER_CAPACITY 4096 
 #define VID_BITS 22
 #define SHM_IDX_BITS 10
 
@@ -497,43 +497,86 @@ __global__ void prop_distance_bfs(
   }
 } 
 
-__global__ void prop_distance_bfs_sharedmem(
+__global__ void prop_distance_bfs_privatized(
     int num_verts, 
     int num_edges,
     int* verts,
     int* edges,
     float* wgts,
     int* distances_cache,
-    int* queue,
+    int* glob_queue,
     int* qhead,
     int* qtail,
     int qsize,
     int* deps) {
-  __shared__ int s_dists[BLOCKSIZE];
+  // initialize privatized frontiers
+  __shared__ int s_curr_frontiers[LOCAL_FRONTIER_CAPACITY];
+
+  // shared counter to count fontiers in this block
+  __shared__ int s_num_curr_frontiers;
+  if (threadIdx.x == 0) {
+    // let tid 0 initialize the counter
+    s_num_curr_frontiers = 0;
+  }
+  __syncthreads();
+
+  // perform BFS
   int gid = threadIdx.x + blockIdx.x * blockDim.x;  
 
-  if (gid >= qsize) {
-    return;
-  }
-
   // dequeue a vertex from the queue
-  const auto vid = dequeue(queue, qhead);
-  const auto edge_start = verts[vid];
-  const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
-
-  for (int eid = edge_start; eid < edge_end; eid++) {
-    const auto neighbor = edges[eid];
-    
-    int wgt = wgts[eid] * SCALE_UP;
-    int new_distance = distances_cache[vid] + wgt;
-    atomicMin(&distances_cache[neighbor], new_distance);
-   
-    // decrement the dependency counter for this neighbor
-    if (atomicSub(&deps[neighbor], 1) == 1) {
-      // if this thread releases the last dependency
-      // it should add this neighbor to the queue
-      enqueue(neighbor, queue, qtail);
+  if (gid < qsize) {
+    const auto vid = dequeue(glob_queue, qhead);
+    const auto edge_start = verts[vid];
+    const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
+    for (int eid = edge_start; eid < edge_end; eid++) {
+      const auto neighbor = edges[eid];
+      
+      const int wgt = wgts[eid] * SCALE_UP;
+      const int new_distance = distances_cache[vid] + wgt;
+      atomicMin(&distances_cache[neighbor], new_distance);
+     
+      // decrement the dependency counter for this neighbor
+      if (atomicSub(&deps[neighbor], 1) == 1) {
+        // if this thread releases the last dependency
+        // it should add this neighbor to the frontier queue
+        
+        // we check if there's more space in the shared frontier storage
+        const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
+        if (s_curr_frontier_idx < LOCAL_FRONTIER_CAPACITY) {
+          // if we have space, store to the shared frontier storage
+          s_curr_frontiers[s_curr_frontier_idx] = neighbor;
+        }
+        else {
+          // if not, we have no choice but to store directly
+          // back to glob mem
+          s_num_curr_frontiers = LOCAL_FRONTIER_CAPACITY;
+          enqueue(neighbor, glob_queue, qtail);
+        }
+      }
     }
+  }
+  __syncthreads();
+
+  // calculate the index to start placing frontiers
+  // in the global queue
+  __shared__ int curr_frontier_beg;
+  if (threadIdx.x == 0) {
+    // let tid = 0 handle the calculation
+    curr_frontier_beg = atomicAdd(qtail, s_num_curr_frontiers);
+  }
+  __syncthreads();
+
+  // commit local frontiers to the global queue
+  // each thread will handle the frontiers in a strided fashion
+  // e.g., blocksize = 4, 8 local frontiers
+  // tid 0 will handle frontier idx 0 and 0 + 4
+  // tid 1 will handle frontier idx 1 and 1 + 4
+  // etc.
+  for (auto s_curr_frontier_idx = threadIdx.x; 
+      s_curr_frontier_idx < s_num_curr_frontiers; 
+      s_curr_frontier_idx += blockDim.x) {
+    auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
+    glob_queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
   }
 
 } 
@@ -728,15 +771,6 @@ void CpGen::report_paths(
     std::chrono::duration_cast<US>(end_reindex-beg_reindex).count()
     << " us.\n";
  
-  //for (size_t i = 0; i < _h_verts_lvlp.size()-1; i++) {
-  //  const auto beg = _h_verts_lvlp[i];
-  //  const auto end = _h_verts_lvlp[i+1];
-  //  for (auto v = beg; v < end; v++) {
-  //    std::cout << _h_verts_by_lvl[v] << ' ';
-  //  }
-  //  std::cout << '\n';
-  //}
-
   const auto total_lvls = _h_verts_lvlp.size() - 1; 
   std::cout << "total " << total_lvls << " levels.\n"; 
 
@@ -1036,9 +1070,31 @@ void CpGen::report_paths(
       iters++;
     }
   }
-  else if (method == PropDistMethod::BFS_SHAREDMEM) {
-  
-  
+  else if (method == PropDistMethod::BFS_PRIVATIZED) {
+    // enqueue the sinks
+    int qsize{static_cast<int>(_sinks.size())}; 
+    enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+      (qsize, d_queue, _d_qtail);
+
+    while (qsize > 0) {
+      prop_distance_bfs_privatized
+        <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts,
+         num_edges,
+         d_fanin_adjp,
+         d_fanin_adjncy,
+         d_fanin_wgts,
+         d_dists_cache,
+         d_queue,
+         _d_qhead,
+         _d_qtail,
+         qsize,
+         d_out_degs);
+
+      // get queue size
+      qsize = _get_qsize();
+      iters++;
+    }
   }
 
   update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
@@ -1409,7 +1465,6 @@ void CpGen::reindex_verts() {
   //    _h_lvl_of[v] = i;
   //  }
   //}
-
 }
 
 void CpGen::_free() {

@@ -2,7 +2,13 @@
 
 int main(int argc, char* argv[]) {
   if (argc != 6) {
-    std::cerr << "usage: ./a.out [benchmark] [#paths] [max_dev_lvls] [enable_compress] [method]\n";
+    std::cerr << "usage: ./a.out [benchmark] [#paths] [max_dev_lvls] [enable_compress] [prop_dist_method]\n";
+    std::cout << "method 0: baseline\n";
+    std::cout << "method 1: baseline + cuda graph\n";
+    std::cout << "method 2: levelized (need to include levelize time)\n";
+    std::cout << "method 3: levelized + smem (need to include levelize time)\n";
+    std::cout << "method 4: bfs\n";
+    std::cout << "method 5: bfs + frontier privatization\n";
     std::exit(1);
   }
 
