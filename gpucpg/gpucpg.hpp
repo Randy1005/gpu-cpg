@@ -11,6 +11,7 @@
 
 namespace gpucpg {
 
+
 struct PfxtNode;
 class CpGen;
 
@@ -83,11 +84,6 @@ private:
 
   std::vector<int> _reindex_map;
   std::vector<int> _h_lvl_of;
-
-  // sorted verts based on 
-  // their out degree
-  std::vector<int> _h_verts_by_odeg;
-  std::vector<int> _h_shm_map;
 
   // queue head and tail
   int* _d_qhead;

@@ -9,8 +9,6 @@
 #define MAX_INTS_ON_SMEM 12288
 #define BLOCKSIZE 1024 
 #define LOCAL_FRONTIER_CAPACITY 4096 
-#define VID_BITS 22
-#define SHM_IDX_BITS 10
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -179,19 +177,6 @@ __device__ int dequeue(
   return vid;
 }
 
-__device__ int encode_vert(int orig_id, int shm_idx) {
-  auto encoded = (shm_idx << VID_BITS) | orig_id;
-  return encoded;
-}
-
-__device__ void decode(int to_decode, int* decoded) {
-  // extract the shm idx
-  const auto shm_idx = (to_decode >> VID_BITS) & ((1 << SHM_IDX_BITS)-1);
-  // extract the original vert id
-  const auto orig_id = to_decode & ((1 << VID_BITS)-1);
-  decoded[0] = shm_idx;
-  decoded[1] = orig_id;
-}
 
 __global__ void enqueue_sinks(
     const int num_sinks,
@@ -202,7 +187,6 @@ __global__ void enqueue_sinks(
     enqueue(tid, queue, qtail);
   }
 } 
-
 
 
 __global__ void check_if_no_dists_updated(
@@ -459,6 +443,16 @@ __global__ void prop_distance_levelized_merged(
   }  
 }
 
+__device__ void inc_qhead(int* qhead, int n) {
+  *qhead += n;
+}
+
+__global__ void inc_qhead_kernel(int* qhead, int n) {
+  if (threadIdx.x == 0) {
+    inc_qhead(qhead, n);
+  }
+}
+
 __global__ void prop_distance_bfs(
     int num_verts, 
     int num_edges,
@@ -477,8 +471,8 @@ __global__ void prop_distance_bfs(
     return;
   }
 
-  // dequeue a vertex from the queue
-  const auto vid = dequeue(queue, qhead);
+  // process a vertex from the queue
+  const auto vid = queue[*qhead+tid];
   const auto edge_start = verts[vid];
   const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
 
@@ -523,9 +517,9 @@ __global__ void prop_distance_bfs_privatized(
   // perform BFS
   int gid = threadIdx.x + blockIdx.x * blockDim.x;  
 
-  // dequeue a vertex from the queue
+  // dequeue a vertex from the global queue
   if (gid < qsize) {
-    const auto vid = dequeue(glob_queue, qhead);
+    const auto vid = glob_queue[*qhead+gid];
     const auto edge_start = verts[vid];
     const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
     for (int eid = edge_start; eid < edge_end; eid++) {
@@ -568,6 +562,7 @@ __global__ void prop_distance_bfs_privatized(
 
   // commit local frontiers to the global queue
   // each thread will handle the frontiers in a strided fashion
+  // NOTE: I think this is to ensure coalesced access on glob mem?
   // e.g., blocksize = 4, 8 local frontiers
   // tid 0 will handle frontier idx 0 and 0 + 4
   // tid 1 will handle frontier idx 1 and 1 + 4
@@ -578,7 +573,6 @@ __global__ void prop_distance_bfs_privatized(
     auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
     glob_queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
   }
-
 } 
 
 
@@ -1064,8 +1058,11 @@ void CpGen::report_paths(
          _d_qtail,
          qsize,
          d_out_degs);
-
-      // get queue size
+      
+      // update queue head once here
+      inc_qhead_kernel<<<1, 1>>>(_d_qhead, qsize);
+        
+      // update queue size
       qsize = _get_qsize();
       iters++;
     }
@@ -1091,7 +1088,10 @@ void CpGen::report_paths(
          qsize,
          d_out_degs);
 
-      // get queue size
+      // update queue head once here
+      inc_qhead_kernel<<<1, 1>>>(_d_qhead, qsize);
+      
+      // update queue size
       qsize = _get_qsize();
       iters++;
     }
@@ -1106,14 +1106,14 @@ void CpGen::report_paths(
      d_dists_cache,
      d_succs);
 
+  // copy distance vector back to host
+  std::vector<int> h_dists(num_verts);
+  thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
+  
   auto end = NOW;
   prop_time = std::chrono::duration_cast<US>(end-beg).count();
   std::cout << "prop_distance converged with " << iters << " iters.\n";
   std::cout << "prop_distance runtime: " << prop_time << " us.\n";
-
-  // copy distance vector back to host
-  std::vector<int> h_dists(num_verts);
-  thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
 
   // host level offsets
   std::vector<int> _h_lvl_offsets(max_dev_lvls+1, 0);
@@ -1146,7 +1146,6 @@ void CpGen::report_paths(
 
   beg = NOW;
   while (curr_lvl < max_dev_lvls) {
-
     // variable to record path counts in the same level
     int h_total_paths;
 
@@ -1248,7 +1247,6 @@ void CpGen::report_paths(
         lvl_offsets.begin());
   }
   end = NOW;
-
   expand_time = std::chrono::duration_cast<US>(end-beg).count();
   std::cout << "level expansion runtime: " << expand_time << " us.\n";
 
@@ -1260,6 +1258,7 @@ void CpGen::report_paths(
   }
   std::cout << "total pfxt nodes=" << _h_pfxt_nodes.size() << '\n';
 
+  // free gpu memory
   _free();
 }
 
