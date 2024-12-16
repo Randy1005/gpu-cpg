@@ -9,6 +9,7 @@ int main(int argc, char* argv[]) {
     std::cout << "method 3: levelized + smem (need to include levelize time)\n";
     std::cout << "method 4: bfs\n";
     std::cout << "method 5: bfs + frontier privatization\n";
+    std::cout << "method 6: bfs + frontier privatization + use single block when qsize < BLOCKSIZE\n";
     std::exit(1);
   }
 
@@ -24,9 +25,10 @@ int main(int argc, char* argv[]) {
   std::cout << "num_edges=" << cpgen.num_edges() << '\n';
   std::cout << "method=" << static_cast<int>(method) << '\n';
   cpgen.report_paths(num_paths, max_dev_lvls, enable_compress, method);
+  
   std::ofstream ofs("lvls.txt");
   cpgen.dump_lvls(ofs);
-
+  
   //std::ofstream os("paths.txt");
   //auto slacks = cpgen.get_slacks(num_paths);
   //for (const auto s : slacks) {

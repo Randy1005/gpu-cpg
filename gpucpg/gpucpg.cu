@@ -5,10 +5,15 @@
 #include <thrust/device_vector.h>
 #include <cub/cub.cuh>
 #include <cuda_runtime_api.h>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
 
 #define MAX_INTS_ON_SMEM 12288
 #define BLOCKSIZE 1024 
-#define LOCAL_FRONTIER_CAPACITY 4096 
+#define WARPS_PER_BLOCK 32
+#define WARP_SIZE 32
+#define S_FRONTIER_CAPACITY 2048
+#define W_FRONTIER_CAPACITY 64
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -217,7 +222,6 @@ __global__ void check_if_no_dists_updated(
     *converged = false;
   }
 }
-
 
 __global__ void prop_distance(
     int num_verts, 
@@ -491,6 +495,100 @@ __global__ void prop_distance_bfs(
   }
 } 
 
+__global__ void prop_distance_bfs_single_block(
+    int num_verts, 
+    int num_edges,
+    int* verts,
+    int* edges,
+    float* wgts,
+    int* distances_cache,
+    int* glob_queue,
+    int* qhead,
+    int* qtail,
+    int* deps,
+    int qsize_threshold) {
+  // initialize privatized frontiers
+  __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
+
+  // shared counter to count fontiers in this block
+  __shared__ int s_num_curr_frontiers;
+  __shared__ int s_qsize;
+  if (threadIdx.x == 0) {
+    // let tid 0 initialize the counter
+    s_num_curr_frontiers = 0;
+    s_qsize = *qtail - *qhead;
+  }
+  __syncthreads();
+
+  // perform BFS
+  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
+  while (s_qsize <= qsize_threshold && s_qsize > 0) {
+    if (gid < s_qsize) {
+      const auto vid = dequeue(glob_queue, qhead);
+      const auto edge_start = verts[vid];
+      const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
+      for (int eid = edge_start; eid < edge_end; eid++) {
+        const auto neighbor = edges[eid];
+        const int wgt = wgts[eid] * SCALE_UP;
+        const int new_distance = distances_cache[vid] + wgt;
+        atomicMin(&distances_cache[neighbor], new_distance);
+       
+        // decrement the dependency counter for this neighbor
+        if (atomicSub(&deps[neighbor], 1) == 1) {
+          // if this thread releases the last dependency
+          // it should add this neighbor to the frontier queue
+          
+          // we check if there's more space in the shared frontier storage
+          const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
+          if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
+            // if we have space, store to the shared frontier storage
+            s_curr_frontiers[s_curr_frontier_idx] = neighbor;
+          }
+          else {
+            // if not, we have no choice but to store directly
+            // back to glob mem
+            s_num_curr_frontiers = S_FRONTIER_CAPACITY;
+            enqueue(neighbor, glob_queue, qtail);
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // write the frontiers in smem back to glob mem
+    // calculate the index to start placing frontiers
+    // in the global queue
+    __shared__ int curr_frontier_beg;
+    if (threadIdx.x == 0) {
+      // let tid = 0 handle the calculation
+      curr_frontier_beg = atomicAdd(qtail, s_num_curr_frontiers);
+    }
+    __syncthreads();
+
+    // commit local frontiers to the global queue
+    // each thread will handle the frontiers in a strided fashion
+    // but consecutive threads write to consecutive locations
+    for (auto s_curr_frontier_idx = threadIdx.x; 
+        s_curr_frontier_idx < s_num_curr_frontiers; 
+        s_curr_frontier_idx += blockDim.x) {
+      auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
+      glob_queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      // reset number of frontiers in smem
+      s_num_curr_frontiers = 0;
+      
+      // update queue size
+      s_qsize = *qtail - *qhead;
+    }
+    __syncthreads();
+  } 
+
+
+}
+
 __global__ void prop_distance_bfs_privatized(
     int num_verts, 
     int num_edges,
@@ -504,7 +602,7 @@ __global__ void prop_distance_bfs_privatized(
     int qsize,
     int* deps) {
   // initialize privatized frontiers
-  __shared__ int s_curr_frontiers[LOCAL_FRONTIER_CAPACITY];
+  __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
 
   // shared counter to count fontiers in this block
   __shared__ int s_num_curr_frontiers;
@@ -536,14 +634,14 @@ __global__ void prop_distance_bfs_privatized(
         
         // we check if there's more space in the shared frontier storage
         const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
-        if (s_curr_frontier_idx < LOCAL_FRONTIER_CAPACITY) {
+        if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
           // if we have space, store to the shared frontier storage
           s_curr_frontiers[s_curr_frontier_idx] = neighbor;
         }
         else {
           // if not, we have no choice but to store directly
           // back to glob mem
-          s_num_curr_frontiers = LOCAL_FRONTIER_CAPACITY;
+          s_num_curr_frontiers = S_FRONTIER_CAPACITY;
           enqueue(neighbor, glob_queue, qtail);
         }
       }
@@ -573,6 +671,110 @@ __global__ void prop_distance_bfs_privatized(
     auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
     glob_queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
   }
+} 
+
+template<typename group_t> __device__
+void memcpy_SIMD(group_t g, int N, int* dest, int* src) {
+  int lane = g.thread_rank();
+
+  for (int idx = lane; idx < N; idx += g.size()) {
+    dest[idx] = src[idx];
+  }
+  g.sync();
+} 
+
+__global__ void prop_distance_bfs_warp_centric(
+    int num_verts, 
+    int num_edges,
+    int* verts,
+    int* edges,
+    float* wgts,
+    int* distances_cache,
+    int* glob_queue,
+    int* qhead,
+    int* qtail,
+    int qsize,
+    int* deps) {
+  // initialize privatized frontiers
+  __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
+  __shared__ int w_num_curr_frontiers[WARPS_PER_BLOCK];
+  __shared__ int g_curr_frontier_idx[WARPS_PER_BLOCK];
+
+  // partition this block of threads into warps
+  cg::thread_block_tile<WARP_SIZE> warp = 
+    cg::tiled_partition<WARP_SIZE>(cg::this_thread_block());
+  
+  int warp_id = threadIdx.x / warp.size();
+  int lane = warp.thread_rank(); 
+
+  if (lane == 0) {
+    // let lane 0 in each warp initialize the
+    // number of w-frontiers
+    w_num_curr_frontiers[warp_id] = 0;
+  }
+  warp.sync();
+
+  // perform BFS
+  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
+  
+  if (gid < qsize) {
+    const auto vid = glob_queue[*qhead+gid];
+    const auto edge_start = verts[vid];
+    const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
+    for (int eid = edge_start; eid < edge_end; eid++) {
+      const auto neighbor = edges[eid];
+      const int wgt = wgts[eid] * SCALE_UP;
+      const int new_distance = distances_cache[vid] + wgt;
+      atomicMin(&distances_cache[neighbor], new_distance);
+     
+      // decrement the dependency counter for this neighbor
+      if (atomicSub(&deps[neighbor], 1) == 1) {
+        // if this thread releases the last dependency
+        // it should add this neighbor to the frontier queue
+        
+        // if there's space in w-frontiers for this warp
+        const int w_frontier_beg = W_FRONTIER_CAPACITY * warp_id;
+        const auto w_curr_frontier_idx
+          = atomicAdd(&w_num_curr_frontiers[warp_id], 1);
+        if (w_curr_frontier_idx < W_FRONTIER_CAPACITY) {
+          s_curr_frontiers[w_frontier_beg+w_curr_frontier_idx]
+           = neighbor; 
+        }
+        else {
+          if (lane == 0) {
+            g_curr_frontier_idx[warp_id] = atomicAdd(qtail, W_FRONTIER_CAPACITY);
+          }
+          warp.sync();
+
+          // copy frontiers to glob mem via warp
+          memcpy_SIMD(warp, W_FRONTIER_CAPACITY,
+              &glob_queue[g_curr_frontier_idx[warp_id]],
+              &s_curr_frontiers[w_frontier_beg]);
+          
+          w_num_curr_frontiers[warp_id] = 0;
+          warp.sync();
+
+          // now we can write the neighbor 
+          const auto w_curr_frontier_idx
+            = atomicAdd(&w_num_curr_frontiers[warp_id], 1);
+          s_curr_frontiers[w_frontier_beg+w_curr_frontier_idx]
+           = neighbor; 
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (lane == 0) {
+    g_curr_frontier_idx[warp_id] = atomicAdd(qtail, w_num_curr_frontiers[warp_id]);
+    printf("warp %d write starting from %d\n", warp_id, g_curr_frontier_idx[warp_id]);
+  }
+  warp.sync();
+
+  memcpy_SIMD(warp, w_num_curr_frontiers[warp_id],
+      &glob_queue[g_curr_frontier_idx[warp_id]],
+      &s_curr_frontiers[warp_id*W_FRONTIER_CAPACITY]);
+  
 } 
 
 
@@ -1095,6 +1297,55 @@ void CpGen::report_paths(
       qsize = _get_qsize();
       iters++;
     }
+  }
+  else if (method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
+    // enqueue the sinks
+    int qsize{static_cast<int>(_sinks.size())}; 
+    enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+      (qsize, d_queue, _d_qtail);
+
+    while (true) {
+      qsize = _get_qsize();
+      if (qsize == 0) {
+        break;
+      }
+
+      if (qsize < BLOCKSIZE) {
+        prop_distance_bfs_single_block
+        <<<1, BLOCKSIZE>>>
+        (num_verts,
+         num_edges,
+         d_fanin_adjp,
+         d_fanin_adjncy,
+         d_fanin_wgts,
+         d_dists_cache,
+         d_queue,
+         _d_qhead,
+         _d_qtail,
+         d_out_degs,
+         BLOCKSIZE);
+      }
+      else {
+        prop_distance_bfs_privatized
+          <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+          (num_verts,
+           num_edges,
+           d_fanin_adjp,
+           d_fanin_adjncy,
+           d_fanin_wgts,
+           d_dists_cache,
+           d_queue,
+           _d_qhead,
+           _d_qtail,
+           qsize,
+           d_out_degs);
+
+        // update queue head once here
+        inc_qhead_kernel<<<1, 1>>>(_d_qhead, qsize);
+      }
+      iters++; 
+    }
+
   }
 
   update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>

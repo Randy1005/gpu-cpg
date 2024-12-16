@@ -21,7 +21,8 @@ enum class PropDistMethod {
   LEVELIZED,
   LEVELIZED_SHAREDMEM,
   BFS,
-  BFS_PRIVATIZED
+  BFS_PRIVATIZED,
+  BFS_PRIVATIZED_MERGED
 };
 
 class CpGen {  
