@@ -457,11 +457,23 @@ __device__ void inc(int* val, int n) {
   *val += n;
 }
 
+__device__ void dec(int* val, int n) {
+  *val -= n;
+}
+
+
 __global__ void inc_kernel(int* val, int n) {
   if (threadIdx.x == 0) {
     inc(val, n);
   }
 }
+
+__global__ void dec_kernel(int* val, int n) {
+  if (threadIdx.x == 0) {
+    dec(val, n);
+  }
+}
+
 
 __global__ void prop_distance_bfs(
     int num_verts, 
@@ -967,34 +979,32 @@ __global__ void compute_path_counts(
   auto lvl_end = lvl_offsets[curr_lvl+1];
   const auto pfxt_node_idx = tid + lvl_start;
 
-  if (pfxt_node_idx >= lvl_end) {
-    return;
-  }
+  if (pfxt_node_idx < lvl_end) {
+    auto v = pfxt_nodes[pfxt_node_idx].to;
+    int path_count{0};
+    while (v != -1) {
+      auto edge_start = verts[v];
+      auto edge_end = (v == num_verts - 1) ? num_edges : verts[v+1];
+      // the deviation edge count at this vertex
+      // is the num of fanout minus the successor edge
+      auto fanout_count = edge_end - edge_start;
+      if (fanout_count > 1) {
+        path_count += (fanout_count - 1);
+      }
 
-  auto v = pfxt_nodes[pfxt_node_idx].to;
-  int path_count{0};
-  while (v != -1) {
-    auto edge_start = verts[v];
-    auto edge_end = (v == num_verts - 1) ? num_edges : verts[v+1];
-    // the deviation edge count at this vertex
-    // is the num of fanout minus the successor edge
-    auto fanout_count = edge_end - edge_start;
-    if (fanout_count > 1) {
-      path_count += (fanout_count - 1);
+      // traverse to next successor
+      v = succs[v];
     }
 
-    // traverse to next successor
-    v = succs[v];
+    // record deviation path count of this pfxt node
+    pfxt_nodes[pfxt_node_idx].num_children = path_count;
+
+    // record path count in the prefix sum array
+    // we run prefix sum outside of this kernel
+    // NOTE: we are only recording per-level
+    // so we get the relative local position
+    path_prefix_sums[tid] = path_count;
   }
-
-  // record deviation path count of this pfxt node
-  pfxt_nodes[pfxt_node_idx].num_children = path_count;
-
-  // record path count in the prefix sum array
-  // we run prefix sum outside of this kernel
-  // NOTE: we are only recording per-level
-  // so we get the relative local position
-  path_prefix_sums[tid] = path_count;
 }
 
 __global__ void populate_path_counts(
@@ -1037,42 +1047,40 @@ __global__ void expand_new_pfxt_level(
   auto lvl_end = lvl_offsets[curr_lvl+1];
   const auto pfxt_node_idx = tid + lvl_start;
 
-  if (pfxt_node_idx >= lvl_end) {
-    return;
-  }
+  if (pfxt_node_idx < lvl_end) {
+    auto offset = (tid == 0) ? 0 : path_prefix_sums[tid-1];
+    auto level = pfxt_nodes[pfxt_node_idx].level;
+    auto slack = pfxt_nodes[pfxt_node_idx].slack;
+    auto v = pfxt_nodes[pfxt_node_idx].to;
+    while (v != -1) {
+      auto edge_start = vertices[v];
+      auto edge_end = (v == num_verts-1) ? num_edges : vertices[v+1];
+      for (auto eid = edge_start; eid < edge_end; eid++) {
+        auto neighbor = edges[eid];
+        if (neighbor == succs[v]) {
+          continue;
+        }
 
-  auto offset = (tid == 0) ? 0 : path_prefix_sums[tid-1];
-  auto level = pfxt_nodes[pfxt_node_idx].level;
-  auto slack = pfxt_nodes[pfxt_node_idx].slack;
-  auto v = pfxt_nodes[pfxt_node_idx].to;
-  while (v != -1) {
-    auto edge_start = vertices[v];
-    auto edge_end = (v == num_verts-1) ? num_edges : vertices[v+1];
-    for (auto eid = edge_start; eid < edge_end; eid++) {
-      auto neighbor = edges[eid];
-      if (neighbor == succs[v]) {
-        continue;
-      }
+        auto wgt = wgts[eid];
+        // populate child path info
+        auto& new_path = pfxt_nodes[lvl_end+offset];
+        new_path.level = level + 1;
+        new_path.from = v;
+        new_path.to = neighbor;
+        new_path.parent = pfxt_node_idx;
+        new_path.num_children = 0;
 
-      auto wgt = wgts[eid];
-      // populate child path info
-      auto& new_path = pfxt_nodes[lvl_end+offset];
-      new_path.level = level + 1;
-      new_path.from = v;
-      new_path.to = neighbor;
-      new_path.parent = tid;
-      new_path.num_children = 0;
+        auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
+        auto dist_v = (float)dists[v] / SCALE_UP;
 
-      auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
-      auto dist_v = (float)dists[v] / SCALE_UP;
+        new_path.slack = 
+          slack + dist_neighbor + wgt - dist_v;
+        offset++;
+      } 
 
-      new_path.slack = 
-        slack + dist_neighbor + wgt - dist_v;
-      offset++;
-    } 
-
-    // traverse to next successor
-    v = succs[v];
+      // traverse to next successor
+      v = succs[v];
+    }
   }
 }
 
@@ -1092,7 +1100,6 @@ __global__ void expand_new_pfxt_level_atomic_enq(
   auto lvl_start = lvl_offsets[curr_lvl];
   auto lvl_end = lvl_offsets[curr_lvl+1];
   const auto pfxt_node_idx = tid + lvl_start;
-  const auto lvl_size = lvl_end - lvl_start;
 
   __shared__ PfxtNode s_pfxt_nodes[S_PFXT_CAPACITY];
   __shared__ int s_num_pfxt_nodes;
@@ -1106,7 +1113,6 @@ __global__ void expand_new_pfxt_level_atomic_enq(
     s_num_pfxt_nodes = 0;
   }
   __syncthreads();
-
 
   if (pfxt_node_idx < lvl_end) {
     auto level = pfxt_nodes[pfxt_node_idx].level;
@@ -1131,7 +1137,7 @@ __global__ void expand_new_pfxt_level_atomic_enq(
           new_path.level = level + 1;
           new_path.from = v;
           new_path.to = neighbor;
-          new_path.parent = tid;
+          new_path.parent = pfxt_node_idx;
           new_path.num_children = 0;
           auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
           auto dist_v = (float)dists[v] / SCALE_UP;
@@ -1149,7 +1155,7 @@ __global__ void expand_new_pfxt_level_atomic_enq(
           new_path.level = level + 1;
           new_path.from = v;
           new_path.to = neighbor;
-          new_path.parent = tid;
+          new_path.parent = pfxt_node_idx;
           new_path.num_children = 0;
           auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
           auto dist_v = (float)dists[v] / SCALE_UP;
@@ -1177,9 +1183,11 @@ __global__ void expand_new_pfxt_level_atomic_enq(
       s_pfxt_node_idx += blockDim.x) {
     // the location to write on glob mem
     const auto g_pfxt_node_idx = s_pfxt_beg + s_pfxt_node_idx;
-    
+
     // write to glob mem
-    pfxt_nodes[g_pfxt_node_idx] = s_pfxt_nodes[s_pfxt_node_idx];
+    pfxt_nodes[g_pfxt_node_idx] = s_pfxt_nodes[s_pfxt_node_idx]; 
+    //printf("pfxt_nodes[%d].to=%d\n", g_pfxt_node_idx,
+    //    pfxt_nodes[g_pfxt_node_idx].to);
   }
 
 }
@@ -1814,6 +1822,7 @@ void CpGen::report_paths(
             return a.slack < b.slack;
             }); 
 
+        
         // size down the pfxt node storage
         auto downsize = curr_lvl_size - k;
         curr_lvl_size = k;
@@ -1828,7 +1837,7 @@ void CpGen::report_paths(
         pfxt_nodes = _h_pfxt_nodes;
         d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
       }
-
+      
       // copy the host level offset to device
       thrust::copy(_h_lvl_offsets.begin(), _h_lvl_offsets.end(),
           lvl_offsets.begin());
@@ -1938,9 +1947,14 @@ void CpGen::report_paths(
   else if (pe_method == PfxtExpMethod::ATOMIC_ENQ) {
     // increment tail pointer to the current pfxt level size
     inc_kernel<<<1, 1>>>(_d_pfxt_tail, curr_lvl_size); 
+    
     while (curr_lvl < max_dev_lvls) {
       // variable to record path counts in the same level
       int h_total_paths;
+
+      // record the prefix sum of path counts
+      // so we can obtain the correct output location
+      // of each child path
       thrust::device_vector<int> path_prefix_sums(curr_lvl_size, 0);
       int* d_path_prefix_sums = thrust::raw_pointer_cast(&path_prefix_sums[0]);
 
@@ -1954,14 +1968,13 @@ void CpGen::report_paths(
             d_lvl_offsets,
             curr_lvl, 
             d_path_prefix_sums); 
-     
-      // we only need a sum of all the children paths
-      // so use reduction here
+
+
+      // prefix sum
       h_total_paths = thrust::reduce(
           thrust::device,
           d_path_prefix_sums,
-          d_path_prefix_sums + curr_lvl_size,
-          0);
+          d_path_prefix_sums + curr_lvl_size);
 
       if (h_total_paths == 0) {
         break;
@@ -1972,11 +1985,9 @@ void CpGen::report_paths(
       _h_pfxt_nodes.resize(pfxt_size);
 
       pfxt_nodes = _h_pfxt_nodes;
+      assert(pfxt_nodes.size() == pfxt_size); 
       d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
 
-      // level preparation is completed
-      // now invoke the inter-level expansion kernel
-      // use the atomic enqueue version kernel
       expand_new_pfxt_level_atomic_enq
         <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>
         (num_verts,
@@ -1990,7 +2001,6 @@ void CpGen::report_paths(
          d_lvl_offsets,
          curr_lvl,
          _d_pfxt_tail);
-      cudaDeviceSynchronize();  
 
       thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
 
@@ -2011,11 +2021,17 @@ void CpGen::report_paths(
             return a.slack < b.slack;
             }); 
 
+        
         // size down the pfxt node storage
         auto downsize = curr_lvl_size - k;
         curr_lvl_size = k;
         pfxt_size -= downsize;
         _h_pfxt_nodes.resize(pfxt_size);
+
+        // !!! pfxt tail also needs to size down
+        // because we're using tail to track the end of
+        // the pfxt queue
+        dec_kernel<<<1, 1>>>(_d_pfxt_tail, downsize);
 
         // also update the level offset
         _h_lvl_offsets[curr_lvl+1] = pfxt_size;
@@ -2025,12 +2041,11 @@ void CpGen::report_paths(
         pfxt_nodes = _h_pfxt_nodes;
         d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
       }
-
+      
       // copy the host level offset to device
       thrust::copy(_h_lvl_offsets.begin(), _h_lvl_offsets.end(),
           lvl_offsets.begin());
     }
-
   }
   end = NOW;
   expand_time = std::chrono::duration_cast<US>(end-beg).count();
