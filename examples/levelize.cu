@@ -1,4 +1,4 @@
-#include "gpucpg.hpp"
+#include "gpucpg.cuh"
 
 int main(int argc, char* argv[]) {
   

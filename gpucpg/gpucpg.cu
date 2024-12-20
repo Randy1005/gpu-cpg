@@ -1,6 +1,7 @@
-#include "gpucpg.hpp"
+#include "gpucpg.cuh"
 #include <thrust/scan.h>
 #include <thrust/device_new.h>
+#include <thrust/reduce.h>
 #include <thrust/execution_policy.h>
 #include <thrust/device_vector.h>
 #include <cub/cub.cuh>
@@ -12,8 +13,9 @@ namespace cg = cooperative_groups;
 #define BLOCKSIZE 1024 
 #define WARPS_PER_BLOCK 32
 #define WARP_SIZE 32
-#define S_FRONTIER_CAPACITY 2048
+#define S_FRONTIER_CAPACITY 1024*6 
 #define W_FRONTIER_CAPACITY 64
+#define S_PFXT_CAPACITY 1024
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -88,6 +90,7 @@ void CpGen::read_input(const std::string& filename) {
   std::getline(infile, line);
   vertex_count = std::stoi(line);
 
+
   // Initialize adjacency pointers
   _h_fanin_adjp.assign(vertex_count + 1, 0);
   _h_fanout_adjp.assign(vertex_count + 1, 0);
@@ -136,7 +139,10 @@ void CpGen::read_input(const std::string& filename) {
     _h_fanout_adjp[i + 1] = _h_fanout_adjp[i] + fanout_edges[i].size();
     
     // record out degrees for later topological sort
-    _h_out_degrees[i] = fanout_edges[i].size();     
+    _h_out_degrees[i] = fanout_edges[i].size();
+
+    // record the maximum out degree of this graph 
+    _h_max_odeg = std::max(_h_out_degrees[i], _h_max_odeg);
 
     if (fanout_edges[i].size() == 0) {
       _sinks.emplace_back(i);
@@ -447,13 +453,13 @@ __global__ void prop_distance_levelized_merged(
   }  
 }
 
-__device__ void inc_qhead(int* qhead, int n) {
-  *qhead += n;
+__device__ void inc(int* val, int n) {
+  *val += n;
 }
 
-__global__ void inc_qhead_kernel(int* qhead, int n) {
+__global__ void inc_kernel(int* val, int n) {
   if (threadIdx.x == 0) {
-    inc_qhead(qhead, n);
+    inc(val, n);
   }
 }
 
@@ -585,8 +591,6 @@ __global__ void prop_distance_bfs_single_block(
     }
     __syncthreads();
   } 
-
-
 }
 
 __global__ void prop_distance_bfs_privatized(
@@ -632,6 +636,114 @@ __global__ void prop_distance_bfs_privatized(
         // if this thread releases the last dependency
         // it should add this neighbor to the frontier queue
         
+        // we check if there's more space in the shared frontier storage
+        const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
+        if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
+          // if we have space, store to the shared frontier storage
+          s_curr_frontiers[s_curr_frontier_idx] = neighbor;
+        }
+        else {
+          // if not, we have no choice but to store directly
+          // back to glob mem
+          s_num_curr_frontiers = S_FRONTIER_CAPACITY;
+          enqueue(neighbor, glob_queue, qtail);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // calculate the index to start placing frontiers
+  // in the global queue
+  __shared__ int curr_frontier_beg;
+  if (threadIdx.x == 0) {
+    // let tid = 0 handle the calculation
+    curr_frontier_beg = atomicAdd(qtail, s_num_curr_frontiers);
+  }
+  __syncthreads();
+
+  // commit local frontiers to the global queue
+  // each thread will handle the frontiers in a strided fashion
+  // NOTE: I think this is to ensure coalesced access on glob mem?
+  // e.g., blocksize = 4, 8 local frontiers
+  // tid 0 will handle frontier idx 0 and 0 + 4
+  // tid 1 will handle frontier idx 1 and 1 + 4
+  // etc.
+  for (auto s_curr_frontier_idx = threadIdx.x; 
+      s_curr_frontier_idx < s_num_curr_frontiers; 
+      s_curr_frontier_idx += blockDim.x) {
+    auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
+    glob_queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
+  }
+} 
+
+// NOTE: to precompute spurs, we also need to decide successor
+// while doing BFS
+__global__ void prop_distance_bfs_privatized_precomp_spurs(
+    int num_verts, 
+    int num_edges,
+    int* i_verts,
+    int* o_verts,
+    int* i_edges,
+    int* o_edges,
+    float* i_wgts,
+    float* o_wgts,
+    int* distances_cache,
+    int* glob_queue,
+    int* qhead,
+    int* qtail,
+    int qsize,
+    int* deps,
+    int* o_degs,
+    int* accum_spurs,
+    int* succs) {
+  // initialize privatized frontiers
+  __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
+
+  // shared counter to count fontiers in this block
+  __shared__ int s_num_curr_frontiers;
+  if (threadIdx.x == 0) {
+    // let tid 0 initialize the counter
+    s_num_curr_frontiers = 0;
+  }
+  __syncthreads();
+
+  // perform BFS
+  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
+
+  // dequeue a vertex from the global queue
+  if (gid < qsize) {
+    const auto vid = glob_queue[*qhead+gid];
+    const auto edge_start = i_verts[vid];
+    const auto edge_end = (vid == num_verts-1) ? num_edges : i_verts[vid+1]; 
+    for (int eid = edge_start; eid < edge_end; eid++) {
+      const auto neighbor = i_edges[eid];
+      const int wgt = i_wgts[eid] * SCALE_UP;
+      const int new_distance = distances_cache[vid] + wgt;
+      atomicMin(&distances_cache[neighbor], new_distance);
+
+      // decrement the dependency counter for this neighbor
+      if (atomicSub(&deps[neighbor], 1) == 1) {
+        // I'm the last person seeing this neighbor
+        // meaning everyone has finished updating their distances
+        // we can decide the successor now
+        const auto o_edge_start = o_verts[neighbor];
+        const auto o_edge_end = (neighbor == num_verts-1) ? num_edges
+          : o_verts[neighbor+1];
+        const auto o_deg = o_edge_end - o_edge_start;
+        for (int eid = o_edge_start; eid < o_edge_end; eid++) {
+          const auto child = o_edges[eid];
+          const int wgt = o_wgts[eid] * SCALE_UP;
+          const int new_distance = distances_cache[child] + wgt;
+          if (new_distance == distances_cache[neighbor]) {
+            succs[neighbor] = child;
+            accum_spurs[neighbor] = (o_deg-1) + accum_spurs[child];
+            break;
+          }
+        }
+        
+        // if this thread releases the last dependency
+        // it should add this neighbor to the frontier queue
         // we check if there's more space in the shared frontier storage
         const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
         if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
@@ -826,8 +938,6 @@ __global__ void update_successors(
 
   for (int eid = edge_start; eid < edge_end; eid++) {
     auto neighbor = edges[eid];
-    // multiply new distance by SCALE_UP to make it a integer
-    // so we can work with atomicMin
     int wgt = wgts[eid] * SCALE_UP;
     int new_distance = distances_cache[tid] + wgt;
 
@@ -843,11 +953,10 @@ __global__ void update_successors(
 
 }
 
-
 __global__ void compute_path_counts(
     int num_verts,
     int num_edges,
-    int* vertices,
+    int* verts,
     int* succs,
     PfxtNode* pfxt_nodes,
     int* lvl_offsets,
@@ -856,16 +965,17 @@ __global__ void compute_path_counts(
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   auto lvl_start = lvl_offsets[curr_lvl];
   auto lvl_end = lvl_offsets[curr_lvl+1];
+  const auto pfxt_node_idx = tid + lvl_start;
 
-  if (tid >= lvl_end || tid < lvl_start) {
+  if (pfxt_node_idx >= lvl_end) {
     return;
   }
 
-  auto v = pfxt_nodes[tid].to;
+  auto v = pfxt_nodes[pfxt_node_idx].to;
   int path_count{0};
   while (v != -1) {
-    auto edge_start = vertices[v];
-    auto edge_end = (v == num_verts - 1) ? num_edges : vertices[v+1];
+    auto edge_start = verts[v];
+    auto edge_end = (v == num_verts - 1) ? num_edges : verts[v+1];
     // the deviation edge count at this vertex
     // is the num of fanout minus the successor edge
     auto fanout_count = edge_end - edge_start;
@@ -878,18 +988,39 @@ __global__ void compute_path_counts(
   }
 
   // record deviation path count of this pfxt node
-  pfxt_nodes[tid].num_children = path_count;
+  pfxt_nodes[pfxt_node_idx].num_children = path_count;
 
   // record path count in the prefix sum array
   // we run prefix sum outside of this kernel
   // NOTE: we are only recording per-level
-  // so we get the relative position by
-  // tid - lvl_start
-  auto lvl_idx = tid - lvl_start;
-  path_prefix_sums[lvl_idx] = path_count;
+  // so we get the relative local position
+  path_prefix_sums[tid] = path_count;
 }
 
-__global__ void expand_new_level(
+__global__ void populate_path_counts(
+    int num_verts,
+    int num_edges,
+    PfxtNode* pfxt_nodes,
+    int* lvl_offsets,
+    int curr_lvl,
+    int* path_prefix_sums,
+    int* accum_spurs) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  auto lvl_start = lvl_offsets[curr_lvl];
+  auto lvl_end = lvl_offsets[curr_lvl+1];
+
+  const auto pfxt_node_idx = tid + lvl_start;
+  if (pfxt_node_idx >= lvl_end) {
+    return;
+  }
+
+  const auto v = pfxt_nodes[pfxt_node_idx].to;
+  const auto path_count = accum_spurs[v];
+  // record deviation path count of this pfxt node
+  pfxt_nodes[pfxt_node_idx].num_children = path_prefix_sums[tid] = path_count;
+}
+
+__global__ void expand_new_pfxt_level(
     int num_verts,
     int num_edges,
     int* vertices,
@@ -904,24 +1035,21 @@ __global__ void expand_new_level(
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   auto lvl_start = lvl_offsets[curr_lvl];
   auto lvl_end = lvl_offsets[curr_lvl+1];
+  const auto pfxt_node_idx = tid + lvl_start;
 
-  if (tid >= lvl_end || tid < lvl_start) {
+  if (pfxt_node_idx >= lvl_end) {
     return;
   }
 
-  // what index am I in this level?
-  auto lvl_idx = tid - lvl_start;
-
-  auto offset = (lvl_idx == 0) ? 0 : path_prefix_sums[lvl_idx-1];
-  auto level = pfxt_nodes[tid].level;
-  auto slack = pfxt_nodes[tid].slack;
-  auto v = pfxt_nodes[tid].to;
+  auto offset = (tid == 0) ? 0 : path_prefix_sums[tid-1];
+  auto level = pfxt_nodes[pfxt_node_idx].level;
+  auto slack = pfxt_nodes[pfxt_node_idx].slack;
+  auto v = pfxt_nodes[pfxt_node_idx].to;
   while (v != -1) {
     auto edge_start = vertices[v];
-    auto edge_end = (v == num_verts - 1) ? num_edges : vertices[v+1];
+    auto edge_end = (v == num_verts-1) ? num_edges : vertices[v+1];
     for (auto eid = edge_start; eid < edge_end; eid++) {
       auto neighbor = edges[eid];
-
       if (neighbor == succs[v]) {
         continue;
       }
@@ -948,11 +1076,123 @@ __global__ void expand_new_level(
   }
 }
 
+__global__ void expand_new_pfxt_level_atomic_enq(
+    int num_verts,
+    int num_edges,
+    int* vertices,
+    int* edges,
+    float* wgts,
+    int* succs,
+    int* dists,
+    PfxtNode* pfxt_nodes,
+    int* lvl_offsets,
+    int curr_lvl,
+    int* pfxt_tail) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  auto lvl_start = lvl_offsets[curr_lvl];
+  auto lvl_end = lvl_offsets[curr_lvl+1];
+  const auto pfxt_node_idx = tid + lvl_start;
+  const auto lvl_size = lvl_end - lvl_start;
+
+  __shared__ PfxtNode s_pfxt_nodes[S_PFXT_CAPACITY];
+  __shared__ int s_num_pfxt_nodes;
+  for (auto s_pfxt_node_idx = threadIdx.x; s_pfxt_node_idx < S_PFXT_CAPACITY;
+      s_pfxt_node_idx += blockDim.x) {
+    // initialize shared mem
+    s_pfxt_nodes[s_pfxt_node_idx] = PfxtNode();
+  }
+
+  if (threadIdx.x == 0) {
+    s_num_pfxt_nodes = 0;
+  }
+  __syncthreads();
+
+
+  if (pfxt_node_idx < lvl_end) {
+    auto level = pfxt_nodes[pfxt_node_idx].level;
+    auto slack = pfxt_nodes[pfxt_node_idx].slack;
+    auto v = pfxt_nodes[pfxt_node_idx].to;
+    while (v != -1) {
+      auto edge_start = vertices[v];
+      auto edge_end = (v == num_verts-1) ? num_edges : vertices[v+1];
+      for (auto eid = edge_start; eid < edge_end; eid++) {
+        auto neighbor = edges[eid];
+        if (neighbor == succs[v]) {
+          continue;
+        }
+        auto wgt = wgts[eid];
+        
+        const auto s_curr_pfxt_node_idx = atomicAdd(&s_num_pfxt_nodes, 1);
+        if (s_curr_pfxt_node_idx < S_PFXT_CAPACITY) {
+          // place this node in smem if we have space
+          auto& new_path = s_pfxt_nodes[s_curr_pfxt_node_idx];
+          
+          // populate pfxt node info
+          new_path.level = level + 1;
+          new_path.from = v;
+          new_path.to = neighbor;
+          new_path.parent = tid;
+          new_path.num_children = 0;
+          auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
+          auto dist_v = (float)dists[v] / SCALE_UP;
+          new_path.slack = 
+            slack + dist_neighbor + wgt - dist_v;
+        }
+        else {
+          s_num_pfxt_nodes = S_PFXT_CAPACITY;
+          // write this pfxt node back to glob mem
+          // if not enough space in smem
+          const auto curr_pfxt_node_idx = atomicAdd(pfxt_tail, 1);
+          auto& new_path = pfxt_nodes[curr_pfxt_node_idx];
+        
+          // populate pfxt node info
+          new_path.level = level + 1;
+          new_path.from = v;
+          new_path.to = neighbor;
+          new_path.parent = tid;
+          new_path.num_children = 0;
+          auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
+          auto dist_v = (float)dists[v] / SCALE_UP;
+          new_path.slack = 
+            slack + dist_neighbor + wgt - dist_v;
+        }
+
+      } 
+
+      // traverse to next successor
+      v = succs[v];
+    }
+  }
+  __syncthreads();
+
+  // write the rest of the pfxt nodes in smem
+  // back to glob mem
+  __shared__ int s_pfxt_beg;
+  if (threadIdx.x == 0) {
+    s_pfxt_beg = atomicAdd(pfxt_tail, s_num_pfxt_nodes);
+  }
+  __syncthreads();
+
+  for (auto s_pfxt_node_idx = threadIdx.x; s_pfxt_node_idx < s_num_pfxt_nodes;
+      s_pfxt_node_idx += blockDim.x) {
+    // the location to write on glob mem
+    const auto g_pfxt_node_idx = s_pfxt_beg + s_pfxt_node_idx;
+    
+    // write to glob mem
+    pfxt_nodes[g_pfxt_node_idx] = s_pfxt_nodes[s_pfxt_node_idx];
+  }
+
+}
+
+
+
+
 void CpGen::report_paths(
     int k, 
     int max_dev_lvls, 
     bool enable_compress,
-    PropDistMethod method) {
+    PropDistMethod pd_method,
+    PfxtExpMethod pe_method) {
 
   auto beg_lvlize = NOW; 
   levelize();
@@ -979,6 +1219,8 @@ void CpGen::report_paths(
   h_queue.resize(num_verts);
   thrust::device_vector<int> queue(h_queue);
   thrust::device_vector<int> out_degs(_h_out_degrees);
+  thrust::device_vector<int> deps(_h_out_degrees);
+  thrust::device_vector<int> accum_spurs(num_verts, 0);
 
   checkError_t(cudaMalloc(&_d_qhead, sizeof(int)), "malloc qhead failed.");
   checkError_t(cudaMalloc(&_d_qtail, sizeof(int)), "malloc qtail failed.");
@@ -986,6 +1228,16 @@ void CpGen::report_paths(
   checkError_t(cudaMemset(_d_qtail, 0, sizeof(int)), "memset qtail failed.");
   int* d_queue = thrust::raw_pointer_cast(&queue[0]);
   int* d_out_degs = thrust::raw_pointer_cast(&out_degs[0]);
+  int* d_deps = thrust::raw_pointer_cast(&deps[0]);
+  int* d_accum_spurs = thrust::raw_pointer_cast(&accum_spurs[0]);
+
+  // initialize tail pointer for the pfxt node storage
+  checkError_t(cudaMalloc(&_d_pfxt_tail, sizeof(int)), "malloc pfxt tail failed.");
+  checkError_t(cudaMemset(_d_pfxt_tail, 0, sizeof(int)), "memset pfxt tail failed.");
+  
+  // record level of each vertex
+  thrust::device_vector<int> vert_lvls(num_verts, std::numeric_limits<int>::max());
+  int* d_vert_lvls = thrust::raw_pointer_cast(&vert_lvls[0]);
 
   // copy host csr to device
   thrust::device_vector<int> fanin_adjncy(_h_fanin_adjncy);
@@ -1045,7 +1297,7 @@ void CpGen::report_paths(
   std::cout << "deviceProp.sharedMemPerBlock=" << sharedmem_sz << " bytes.\n";
 
   auto beg = NOW;
-  if (method == PropDistMethod::BASIC) { 
+  if (pd_method == PropDistMethod::BASIC) { 
     while (!h_converged) {
       checkError_t(
           cudaMemset(_d_converged, true, sizeof(bool)), 
@@ -1073,8 +1325,17 @@ void CpGen::report_paths(
 
       iters++;
     }
+
+    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_succs);
   } 
-  else if (method == PropDistMethod::LEVELIZED) {
+  else if (pd_method == PropDistMethod::LEVELIZED) {
     thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
     int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
     
@@ -1094,9 +1355,17 @@ void CpGen::report_paths(
          d_fanin_wgts,
          d_dists_cache);
     }
-  
+
+    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_succs);
   } 
-  else if (method == PropDistMethod::LEVELIZED_SHAREDMEM) {
+  else if (pd_method == PropDistMethod::LEVELIZED_SHAREDMEM) {
     const int verts_per_block = sharedmem_sz / sizeof(int);
     std::cout << "can fit " << verts_per_block << " vertices per block.\n";
 
@@ -1154,8 +1423,17 @@ void CpGen::report_paths(
          d_fanin_wgts,
          d_dists_cache);
     }
+
+    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_succs);
   } 
-  else if (method == PropDistMethod::CUDA_GRAPH) {
+  else if (pd_method == PropDistMethod::CUDA_GRAPH) {
     cudaGraph_t cug;
     cudaGraphExec_t cug_exec;
     cudaGraphNode_t while_node;
@@ -1240,8 +1518,17 @@ void CpGen::report_paths(
         "destroy cuGraph executor failed.");
 
     checkError_t(cudaGraphDestroy(cug), "destroy cuGraph failed.");
+  
+    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_succs);
   }
-  else if (method == PropDistMethod::BFS) {
+  else if (pd_method == PropDistMethod::BFS) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
     enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
@@ -1259,17 +1546,26 @@ void CpGen::report_paths(
          _d_qhead,
          _d_qtail,
          qsize,
-         d_out_degs);
+         d_deps);
       
       // update queue head once here
-      inc_qhead_kernel<<<1, 1>>>(_d_qhead, qsize);
+      inc_kernel<<<1, 1>>>(_d_qhead, qsize);
         
       // update queue size
       qsize = _get_qsize();
       iters++;
     }
+
+    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_succs);
   }
-  else if (method == PropDistMethod::BFS_PRIVATIZED) {
+  else if (pd_method == PropDistMethod::BFS_PRIVATIZED) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
     enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
@@ -1288,17 +1584,25 @@ void CpGen::report_paths(
          _d_qhead,
          _d_qtail,
          qsize,
-         d_out_degs);
+         d_deps);
 
       // update queue head once here
-      inc_qhead_kernel<<<1, 1>>>(_d_qhead, qsize);
+      inc_kernel<<<1, 1>>>(_d_qhead, qsize);
       
       // update queue size
       qsize = _get_qsize();
       iters++;
     }
+    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_succs);
   }
-  else if (method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
+  else if (pd_method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
     enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
@@ -1322,7 +1626,7 @@ void CpGen::report_paths(
          d_queue,
          _d_qhead,
          _d_qtail,
-         d_out_degs,
+         d_deps,
          BLOCKSIZE);
       }
       else {
@@ -1338,29 +1642,60 @@ void CpGen::report_paths(
            _d_qhead,
            _d_qtail,
            qsize,
-           d_out_degs);
+           d_deps);
 
         // update queue head once here
-        inc_qhead_kernel<<<1, 1>>>(_d_qhead, qsize);
+        inc_kernel<<<1, 1>>>(_d_qhead, qsize);
       }
-      iters++; 
     }
-
+    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+      (num_verts, 
+       num_edges,
+       d_fanin_adjp,
+       d_fanin_adjncy,
+       d_fanin_wgts,
+       d_dists_cache,
+       d_succs);
   }
+  else if (pd_method == PropDistMethod::BFS_PRIVATIZED_PRECOMP_SPURS) {
+    // enqueue the sinks
+    int qsize{static_cast<int>(_sinks.size())}; 
+    enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+      (qsize, d_queue, _d_qtail);
 
-  update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
-    (num_verts, 
-     num_edges,
-     d_fanin_adjp,
-     d_fanin_adjncy,
-     d_fanin_wgts,
-     d_dists_cache,
-     d_succs);
+    while (qsize > 0) {
+      prop_distance_bfs_privatized_precomp_spurs
+        <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts,
+         num_edges,
+         d_fanin_adjp,
+         d_fanout_adjp,
+         d_fanin_adjncy,
+         d_fanout_adjncy,
+         d_fanin_wgts,
+         d_fanout_wgts,
+         d_dists_cache,
+         d_queue,
+         _d_qhead,
+         _d_qtail,
+         qsize,
+         d_deps,
+         d_out_degs,
+         d_accum_spurs,
+         d_succs);
+
+      // update queue head once here
+      inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+      
+      // update queue size
+      qsize = _get_qsize();
+      iters++;
+    }
+  }
 
   // copy distance vector back to host
   std::vector<int> h_dists(num_verts);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
-  
   auto end = NOW;
   prop_time = std::chrono::duration_cast<US>(end-beg).count();
   std::cout << "prop_distance converged with " << iters << " iters.\n";
@@ -1396,116 +1731,316 @@ void CpGen::report_paths(
   int pfxt_size{curr_lvl_size};
 
   beg = NOW;
-  while (curr_lvl < max_dev_lvls) {
-    // variable to record path counts in the same level
-    int h_total_paths;
+  if (pe_method == PfxtExpMethod::BASIC) {
+    while (curr_lvl < max_dev_lvls) {
+      // variable to record path counts in the same level
+      int h_total_paths;
 
-    // record the prefix sum of path counts
-    // so we can obtain the correct output location
-    // of each child path
-    thrust::device_vector<int> path_prefix_sums(curr_lvl_size, 0);
-    int* d_path_prefix_sums = thrust::raw_pointer_cast(&path_prefix_sums[0]);
+      // record the prefix sum of path counts
+      // so we can obtain the correct output location
+      // of each child path
+      thrust::device_vector<int> path_prefix_sums(curr_lvl_size, 0);
+      int* d_path_prefix_sums = thrust::raw_pointer_cast(&path_prefix_sums[0]);
 
-    compute_path_counts
-      <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
+      compute_path_counts
+        <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
+            num_verts,
+            num_edges,
+            d_fanout_adjp,
+            d_succs,
+            d_pfxt_nodes,
+            d_lvl_offsets,
+            curr_lvl, 
+            d_path_prefix_sums); 
+
+
+      // prefix sum
+      thrust::inclusive_scan(
+          thrust::device,
+          d_path_prefix_sums,
+          d_path_prefix_sums + curr_lvl_size,
+          d_path_prefix_sums);
+
+      checkError_t(
+          cudaMemcpy(
+            &h_total_paths, 
+            &d_path_prefix_sums[curr_lvl_size-1], sizeof(int),
+            cudaMemcpyDeviceToHost),
+          "total_paths memcpy to host failed.");
+
+      if (h_total_paths == 0) {
+        break;
+      }    
+
+      // allocate new space for new level
+      pfxt_size += h_total_paths;
+      _h_pfxt_nodes.resize(pfxt_size);
+
+      pfxt_nodes = _h_pfxt_nodes;
+      assert(pfxt_nodes.size() == pfxt_size); 
+      d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
+
+      // level preparation is completed
+      // now invoke the inter-level expansion kernel
+      expand_new_pfxt_level<<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
           num_verts,
           num_edges,
           d_fanout_adjp,
+          d_fanout_adjncy,
+          d_fanout_wgts,
           d_succs,
+          d_dists_cache,
           d_pfxt_nodes,
           d_lvl_offsets,
-          curr_lvl, 
-          d_path_prefix_sums); 
+          curr_lvl,
+          d_path_prefix_sums);
 
+      thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
 
-    // prefix sum
-    thrust::inclusive_scan(
-        thrust::device,
-        d_path_prefix_sums,
-        d_path_prefix_sums + curr_lvl_size,
-        d_path_prefix_sums);
+      // increment level counter
+      curr_lvl++;
+      curr_lvl_size = h_total_paths;
 
-    checkError_t(
-        cudaMemcpy(
-          &h_total_paths, 
-          &d_path_prefix_sums[curr_lvl_size-1], sizeof(int),
-          cudaMemcpyDeviceToHost),
-        "total_paths memcpy to host failed.");
+      // update the level offset info
+      _h_lvl_offsets[curr_lvl+1] = pfxt_size; 
 
-    if (h_total_paths == 0) {
-      break;
-    }    
+      // compress pfxt nodes on host if level size is bigger than k
+      if (curr_lvl_size > k && enable_compress) {
+        auto lvl_start = _h_lvl_offsets[curr_lvl];  
+        std::ranges::sort(
+            _h_pfxt_nodes.begin() + lvl_start,
+            _h_pfxt_nodes.end(),
+            [](const auto& a, const auto& b) {
+            return a.slack < b.slack;
+            }); 
 
-    // allocate new space for new level
-    pfxt_size += h_total_paths;
-    _h_pfxt_nodes.resize(pfxt_size);
+        // size down the pfxt node storage
+        auto downsize = curr_lvl_size - k;
+        curr_lvl_size = k;
+        pfxt_size -= downsize;
+        _h_pfxt_nodes.resize(pfxt_size);
 
-    pfxt_nodes = _h_pfxt_nodes;
-    assert(pfxt_nodes.size() == pfxt_size); 
-    d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
+        // also update the level offset
+        _h_lvl_offsets[curr_lvl+1] = pfxt_size;
 
-    // level preparation is completed
-    // now invoke the inter-level expansion kernel
-    expand_new_level<<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
-        num_verts,
-        num_edges,
-        d_fanout_adjp,
-        d_fanout_adjncy,
-        d_fanout_wgts,
-        d_succs,
-        d_dists_cache,
-        d_pfxt_nodes,
-        d_lvl_offsets,
-        curr_lvl,
-        d_path_prefix_sums);
+        // copy pfxt nodes back to device
+        pfxt_nodes.resize(pfxt_size);
+        pfxt_nodes = _h_pfxt_nodes;
+        d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
+      }
 
-    thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
+      // copy the host level offset to device
+      thrust::copy(_h_lvl_offsets.begin(), _h_lvl_offsets.end(),
+          lvl_offsets.begin());
+    }
+  }
+  else if (pe_method == PfxtExpMethod::PRECOMP_SPURS) {
+    while (curr_lvl < max_dev_lvls) {
+      // variable to record path counts in the same level
+      int h_total_paths;
 
-    // increment level counter
-    curr_lvl++;
-    curr_lvl_size = h_total_paths;
+      // record the prefix sum of path counts
+      // so we can obtain the correct output location
+      // of each child path
+      thrust::device_vector<int> path_prefix_sums(curr_lvl_size, 0);
+      int* d_path_prefix_sums = thrust::raw_pointer_cast(&path_prefix_sums[0]);
+ 
+      populate_path_counts
+        <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
+            num_verts,
+            num_edges,
+            d_pfxt_nodes,
+            d_lvl_offsets,
+            curr_lvl, 
+            d_path_prefix_sums,
+            d_accum_spurs); 
 
-    // update the level offset info
-    _h_lvl_offsets[curr_lvl+1] = pfxt_size; 
+      // prefix sum
+      thrust::inclusive_scan(
+          thrust::device,
+          d_path_prefix_sums,
+          d_path_prefix_sums + curr_lvl_size,
+          d_path_prefix_sums);
 
-    // compress pfxt nodes on host if level size is bigger than k
-    if (curr_lvl_size > k && enable_compress) {
-      auto lvl_start = _h_lvl_offsets[curr_lvl];  
-      std::ranges::sort(
-          _h_pfxt_nodes.begin() + lvl_start,
-          _h_pfxt_nodes.end(),
-          [](const auto& a, const auto& b) {
-          return a.slack < b.slack;
-          }); 
+      checkError_t(
+          cudaMemcpy(
+            &h_total_paths, 
+            &d_path_prefix_sums[curr_lvl_size-1], sizeof(int),
+            cudaMemcpyDeviceToHost),
+          "total_paths memcpy to host failed.");
 
-      // size down the pfxt node storage
-      auto downsize = curr_lvl_size - k;
-      curr_lvl_size = k;
-      pfxt_size -= downsize;
+      if (h_total_paths == 0) {
+        break;
+      }    
+
+      // allocate new space for new level
+      pfxt_size += h_total_paths;
       _h_pfxt_nodes.resize(pfxt_size);
 
-      // also update the level offset
-      _h_lvl_offsets[curr_lvl+1] = pfxt_size;
+      pfxt_nodes = _h_pfxt_nodes;
+      assert(pfxt_nodes.size() == pfxt_size); 
+      d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
 
-      // copy pfxt nodes back to device
-      pfxt_nodes.resize(pfxt_size);
+      // level preparation is completed
+      // now invoke the inter-level expansion kernel
+      expand_new_pfxt_level<<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
+          num_verts,
+          num_edges,
+          d_fanout_adjp,
+          d_fanout_adjncy,
+          d_fanout_wgts,
+          d_succs,
+          d_dists_cache,
+          d_pfxt_nodes,
+          d_lvl_offsets,
+          curr_lvl,
+          d_path_prefix_sums);
+
+      thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
+
+      // increment level counter
+      curr_lvl++;
+      curr_lvl_size = h_total_paths;
+
+      // update the level offset info
+      _h_lvl_offsets[curr_lvl+1] = pfxt_size; 
+
+      // compress pfxt nodes on host if level size is bigger than k
+      if (curr_lvl_size > k && enable_compress) {
+        auto lvl_start = _h_lvl_offsets[curr_lvl];  
+        std::ranges::sort(
+            _h_pfxt_nodes.begin() + lvl_start,
+            _h_pfxt_nodes.end(),
+            [](const auto& a, const auto& b) {
+            return a.slack < b.slack;
+            }); 
+
+        // size down the pfxt node storage
+        auto downsize = curr_lvl_size - k;
+        curr_lvl_size = k;
+        pfxt_size -= downsize;
+        _h_pfxt_nodes.resize(pfxt_size);
+
+        // also update the level offset
+        _h_lvl_offsets[curr_lvl+1] = pfxt_size;
+
+        // copy pfxt nodes back to device
+        pfxt_nodes.resize(pfxt_size);
+        pfxt_nodes = _h_pfxt_nodes;
+        d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
+      }
+
+      // copy the host level offset to device
+      thrust::copy(_h_lvl_offsets.begin(), _h_lvl_offsets.end(),
+          lvl_offsets.begin());
+    }
+  }
+  else if (pe_method == PfxtExpMethod::ATOMIC_ENQ) {
+    // increment tail pointer to the current pfxt level size
+    inc_kernel<<<1, 1>>>(_d_pfxt_tail, curr_lvl_size); 
+    while (curr_lvl < max_dev_lvls) {
+      // variable to record path counts in the same level
+      int h_total_paths;
+      thrust::device_vector<int> path_prefix_sums(curr_lvl_size, 0);
+      int* d_path_prefix_sums = thrust::raw_pointer_cast(&path_prefix_sums[0]);
+
+      compute_path_counts
+        <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
+            num_verts,
+            num_edges,
+            d_fanout_adjp,
+            d_succs,
+            d_pfxt_nodes,
+            d_lvl_offsets,
+            curr_lvl, 
+            d_path_prefix_sums); 
+     
+      // we only need a sum of all the children paths
+      // so use reduction here
+      h_total_paths = thrust::reduce(
+          thrust::device,
+          d_path_prefix_sums,
+          d_path_prefix_sums + curr_lvl_size,
+          0);
+
+      if (h_total_paths == 0) {
+        break;
+      }    
+
+      // allocate new space for new level
+      pfxt_size += h_total_paths;
+      _h_pfxt_nodes.resize(pfxt_size);
+
       pfxt_nodes = _h_pfxt_nodes;
       d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
+
+      // level preparation is completed
+      // now invoke the inter-level expansion kernel
+      // use the atomic enqueue version kernel
+      expand_new_pfxt_level_atomic_enq
+        <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts,
+         num_edges,
+         d_fanout_adjp,
+         d_fanout_adjncy,
+         d_fanout_wgts,
+         d_succs,
+         d_dists_cache,
+         d_pfxt_nodes,
+         d_lvl_offsets,
+         curr_lvl,
+         _d_pfxt_tail);
+      cudaDeviceSynchronize();  
+
+      thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
+
+      // increment level counter
+      curr_lvl++;
+      curr_lvl_size = h_total_paths;
+
+      // update the level offset info
+      _h_lvl_offsets[curr_lvl+1] = pfxt_size; 
+
+      // compress pfxt nodes on host if level size is bigger than k
+      if (curr_lvl_size > k && enable_compress) {
+        auto lvl_start = _h_lvl_offsets[curr_lvl];  
+        std::ranges::sort(
+            _h_pfxt_nodes.begin() + lvl_start,
+            _h_pfxt_nodes.end(),
+            [](const auto& a, const auto& b) {
+            return a.slack < b.slack;
+            }); 
+
+        // size down the pfxt node storage
+        auto downsize = curr_lvl_size - k;
+        curr_lvl_size = k;
+        pfxt_size -= downsize;
+        _h_pfxt_nodes.resize(pfxt_size);
+
+        // also update the level offset
+        _h_lvl_offsets[curr_lvl+1] = pfxt_size;
+
+        // copy pfxt nodes back to device
+        pfxt_nodes.resize(pfxt_size);
+        pfxt_nodes = _h_pfxt_nodes;
+        d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
+      }
+
+      // copy the host level offset to device
+      thrust::copy(_h_lvl_offsets.begin(), _h_lvl_offsets.end(),
+          lvl_offsets.begin());
     }
 
-    // copy the host level offset to device
-    thrust::copy(_h_lvl_offsets.begin(), _h_lvl_offsets.end(),
-        lvl_offsets.begin());
   }
   end = NOW;
   expand_time = std::chrono::duration_cast<US>(end-beg).count();
-  std::cout << "level expansion runtime: " << expand_time << " us.\n";
+  std::cout << "pfxt level expansion runtime: " << expand_time << " us.\n";
 
   for (int i = 0; i < max_dev_lvls; i++) {
     auto beg = _h_lvl_offsets[i];
     auto end = _h_lvl_offsets[i+1];
     auto lvl_size = (beg > end) ? 0 : end-beg;
-    std::cout << "level " << i << " size=" << lvl_size << '\n';
+    std::cout << "pfxt level " << i << " size=" << lvl_size << '\n';
   }
   std::cout << "total pfxt nodes=" << _h_pfxt_nodes.size() << '\n';
 
@@ -1721,6 +2256,7 @@ void CpGen::_free() {
   cudaFree(_d_converged);
   cudaFree(_d_qhead);
   cudaFree(_d_qtail);
+  cudaFree(_d_pfxt_tail);
 } 
 
 int CpGen::_get_qsize() {

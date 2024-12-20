@@ -1,8 +1,8 @@
-#include "gpucpg.hpp"
+#include "gpucpg.cuh"
 
 int main(int argc, char* argv[]) {
-  if (argc != 6) {
-    std::cerr << "usage: ./a.out [benchmark] [#paths] [max_dev_lvls] [enable_compress] [prop_dist_method]\n";
+  if (argc != 7) {
+    std::cerr << "usage: ./a.out [benchmark] [#paths] [max_dev_lvls] [enable_compress] [prop_dist_method] [pfxt_expand_method]\n";
     std::cout << "method 0: baseline\n";
     std::cout << "method 1: baseline + cuda graph\n";
     std::cout << "method 2: levelized (need to include levelize time)\n";
@@ -17,17 +17,16 @@ int main(int argc, char* argv[]) {
   auto num_paths = std::stoi(argv[2]);
   auto max_dev_lvls = std::stoi(argv[3]);
   bool enable_compress = std::stoi(argv[4]);
-  auto method = static_cast<gpucpg::PropDistMethod>(std::stoi(argv[5]));
+  auto pd_method = static_cast<gpucpg::PropDistMethod>(std::stoi(argv[5]));
+  auto pe_method = static_cast<gpucpg::PfxtExpMethod>(std::stoi(argv[6]));
   gpucpg::CpGen cpgen;
   cpgen.read_input(filename);
   
   std::cout << "num_verts=" << cpgen.num_verts() << '\n';
   std::cout << "num_edges=" << cpgen.num_edges() << '\n';
-  std::cout << "method=" << static_cast<int>(method) << '\n';
-  cpgen.report_paths(num_paths, max_dev_lvls, enable_compress, method);
-  
-  std::ofstream ofs("lvls.txt");
-  cpgen.dump_lvls(ofs);
+  std::cout << "pd_method=" << static_cast<int>(pd_method) << '\n';
+  std::cout << "pe_method=" << static_cast<int>(pe_method) << '\n';
+  cpgen.report_paths(num_paths, max_dev_lvls, enable_compress, pd_method, pe_method);
   
   //std::ofstream os("paths.txt");
   //auto slacks = cpgen.get_slacks(num_paths);

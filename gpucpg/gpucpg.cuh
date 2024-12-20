@@ -10,8 +10,6 @@
 #include <numeric>
 
 namespace gpucpg {
-
-
 struct PfxtNode;
 class CpGen;
 
@@ -22,7 +20,47 @@ enum class PropDistMethod {
   LEVELIZED_SHAREDMEM,
   BFS,
   BFS_PRIVATIZED,
-  BFS_PRIVATIZED_MERGED
+  BFS_PRIVATIZED_MERGED,
+  BFS_PRIVATIZED_PRECOMP_SPURS
+};
+
+enum class PfxtExpMethod {
+  BASIC = 0,
+  PRECOMP_SPURS,
+  ATOMIC_ENQ
+};
+
+struct PfxtNode {
+  __host__ __device__ PfxtNode(
+    int level = -1,
+    int from = -1,
+    int to = -1,
+    int parent = -1,
+    int num_children = 0,
+    float slack = 0.0f) :
+    level(level), from(from), to(to),
+    parent(parent), num_children(num_children),
+    slack(slack) 
+  {  
+  }
+ 
+  ~PfxtNode() = default;
+  
+  __host__ void dump_info(std::ostream& os) const {
+    os << "lvl=" << level << '\n';
+    os << "from=" << from << '\n';
+    os << "to=" << to << '\n';
+    os << "parent=" << parent << '\n';
+    os << "num_children=" << num_children << '\n';
+    os << "slack=" << slack << '\n';
+  }
+
+  int level;
+  int from;
+  int to;
+  int parent;
+  int num_children;
+  float slack;
 };
 
 class CpGen {  
@@ -34,7 +72,8 @@ public:
     int k, 
     int max_dev_lvls, 
     bool enable_compress, 
-    PropDistMethod method);
+    PropDistMethod pd_method,
+    PfxtExpMethod pe_method);
   std::vector<float> get_slacks(int k);
  
   void dump_csrs(std::ostream& os) const;
@@ -89,41 +128,18 @@ private:
   // queue head and tail
   int* _d_qhead;
   int* _d_qtail;
+
+  // max out degree
+  int _h_max_odeg{0};
+
+  // estimated path count in 
+  // a pfxt level
+  int* _d_approx_path_count;
+
+  // pfxt nodes tail
+  int* _d_pfxt_tail;
 };
 
 
-struct PfxtNode {
-
-  PfxtNode(
-    int level = -1,
-    int from = -1,
-    int to = -1,
-    int parent = -1,
-    int num_children = 0,
-    float slack = 0.0f) :
-    level(level), from(from), to(to),
-    parent(parent), num_children(num_children),
-    slack(slack) 
-  {  
-  }
- 
-  ~PfxtNode() = default;
-  
-  void dump_info(std::ostream& os) const {
-    os << "lvl=" << level << '\n';
-    os << "from=" << from << '\n';
-    os << "to=" << to << '\n';
-    os << "parent=" << parent << '\n';
-    os << "num_children=" << num_children << '\n';
-    os << "slack=" << slack << '\n';
-  }
-
-  int level;
-  int from;
-  int to;
-  int parent;
-  int num_children;
-  float slack;
-};
 
 } // namespace gpucpg

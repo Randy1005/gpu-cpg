@@ -1,6 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest.h>
-#include <gpucpg/gpucpg.hpp>
+#include <gpucpg/gpucpg.cuh>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 

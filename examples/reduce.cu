@@ -1,4 +1,4 @@
-#include "gpucpg.hpp"
+#include "gpucpg.cuh"
 
 int main() {
   gpucpg::CpGen c;
