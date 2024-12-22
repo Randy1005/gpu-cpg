@@ -15,7 +15,7 @@ namespace cg = cooperative_groups;
 #define WARP_SIZE 32
 #define S_FRONTIER_CAPACITY 1024*6 
 #define W_FRONTIER_CAPACITY 64
-#define S_PFXT_CAPACITY 1024
+#define S_PFXT_CAPACITY 1024*2
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -50,12 +50,8 @@ struct printf_functor
 template <typename Iterator>
 void print_range(const std::string& name, Iterator first, Iterator last)
 {
-  // Print Vector Name
   std::cout << name << ": ";
-
-  // Print Each Element
   thrust::for_each(thrust::device, first, last, printf_functor());
-
   std::cout << '\n';
 }
 
@@ -473,7 +469,6 @@ __global__ void dec_kernel(int* val, int n) {
     dec(val, n);
   }
 }
-
 
 __global__ void prop_distance_bfs(
     int num_verts, 
@@ -2051,18 +2046,19 @@ void CpGen::report_paths(
   expand_time = std::chrono::duration_cast<US>(end-beg).count();
   std::cout << "pfxt level expansion runtime: " << expand_time << " us.\n";
 
+  int total_paths{0};
   for (int i = 0; i < max_dev_lvls; i++) {
     auto beg = _h_lvl_offsets[i];
     auto end = _h_lvl_offsets[i+1];
     auto lvl_size = (beg > end) ? 0 : end-beg;
+    total_paths += lvl_size;
     std::cout << "pfxt level " << i << " size=" << lvl_size << '\n';
   }
-  std::cout << "total pfxt nodes=" << _h_pfxt_nodes.size() << '\n';
+  std::cout << "total pfxt nodes=" << total_paths << '\n';
 
   // free gpu memory
   _free();
 }
-
 
 void CpGen::levelize() {
   // note this levelization is reversed
