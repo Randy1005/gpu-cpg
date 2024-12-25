@@ -15,7 +15,8 @@ namespace cg = cooperative_groups;
 #define WARP_SIZE 32
 #define S_FRONTIER_CAPACITY 1024*6 
 #define W_FRONTIER_CAPACITY 64
-#define S_PFXT_CAPACITY 1024*2
+#define S_PFXT_CAPACITY 2000 // NOTE: somehow the expand kernel doesn't even
+                             // run with 2048, is it due to not enough smem?  
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -37,6 +38,11 @@ namespace cg = cooperative_groups;
       exit(1); \
     } \
   } while (0)
+
+
+
+
+
 
 struct printf_functor
 {
@@ -1108,6 +1114,7 @@ __global__ void expand_new_pfxt_level_atomic_enq(
     s_num_pfxt_nodes = 0;
   }
   __syncthreads();
+
 
   if (pfxt_node_idx < lvl_end) {
     auto level = pfxt_nodes[pfxt_node_idx].level;

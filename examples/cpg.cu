@@ -10,6 +10,7 @@ int main(int argc, char* argv[]) {
     std::cout << "method 4: bfs\n";
     std::cout << "method 5: bfs + frontier privatization\n";
     std::cout << "method 6: bfs + frontier privatization + use single block when qsize < BLOCKSIZE\n";
+    std::cout << "method 7: bfs + frontier privatization + precompute spur options (to save pfxt expansion time)\n";
     std::exit(1);
   }
 
