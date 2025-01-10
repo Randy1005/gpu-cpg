@@ -7,6 +7,10 @@ namespace cg = cooperative_groups;
 #define CHUNK_SZ 32 
 #define BLOCK_SZ 1024
 #define WARPS_PER_BLOCK 32
+
+
+
+
 struct warpmem_t {
   int data[CHUNK_SZ];
 };

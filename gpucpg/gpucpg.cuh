@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <queue>
 #include <numeric>
+#include <random>
 
 namespace gpucpg {
 struct PfxtNode;
@@ -27,8 +28,10 @@ enum class PropDistMethod {
 enum class PfxtExpMethod {
   BASIC = 0,
   PRECOMP_SPURS,
-  ATOMIC_ENQ
+  ATOMIC_ENQ,
+  SHORT_LONG
 };
+
 
 struct PfxtNode {
   __host__ __device__ PfxtNode(
@@ -47,12 +50,14 @@ struct PfxtNode {
   ~PfxtNode() = default;
   
   __host__ void dump_info(std::ostream& os) const {
+    os << "---- PfxtNode ----\n";
     os << "lvl=" << level << '\n';
     os << "from=" << from << '\n';
     os << "to=" << to << '\n';
     os << "parent=" << parent << '\n';
     os << "num_children=" << num_children << '\n';
     os << "slack=" << slack << '\n';
+    os << "------------------\n";
   }
 
   int level;
@@ -61,6 +66,20 @@ struct PfxtNode {
   int parent;
   int num_children;
   float slack;
+};
+
+struct is_kept {
+  __host__ __device__
+  bool operator() (const PfxtNode& n) {
+    return n.num_children != -1;
+  }
+};
+
+struct pfxt_node_comp {
+  __host__ __device__
+  bool operator() (const PfxtNode& a, const PfxtNode& b) {
+    return a.slack < b.slack;
+  }
 };
 
 class CpGen {  
@@ -73,9 +92,13 @@ public:
     int max_dev_lvls, 
     bool enable_compress, 
     PropDistMethod pd_method,
-    PfxtExpMethod pe_method);
+    PfxtExpMethod pe_method,
+    float init_split_perc = 0.005f,
+    int max_short_long_exp_iters = 100);
   std::vector<float> get_slacks(int k);
- 
+  std::vector<PfxtNode> get_pfxt_nodes(int k);
+
+  void dump_benchmark_with_wgts(const std::string& filename, std::ostream& os) const; 
   void dump_csrs(std::ostream& os) const;
   void dump_lvls(std::ostream& os) const;
   
@@ -92,6 +115,8 @@ private:
   void _free();
   
   int _get_qsize();
+
+  int _get_expansion_window_size(int* p_start, int* p_end);
 
   // convergence condition
   bool* _d_converged;
@@ -132,12 +157,9 @@ private:
   // max out degree
   int _h_max_odeg{0};
 
-  // estimated path count in 
-  // a pfxt level
-  int* _d_approx_path_count;
-
   // pfxt nodes tail
   int* _d_pfxt_tail;
+
 };
 
 
