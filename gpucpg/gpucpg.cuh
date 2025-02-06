@@ -9,6 +9,8 @@
 #include <queue>
 #include <numeric>
 #include <random>
+#include <queue>
+#include <functional>
 
 namespace gpucpg {
 struct PfxtNode;
@@ -29,7 +31,8 @@ enum class PfxtExpMethod {
   BASIC = 0,
   PRECOMP_SPURS,
   ATOMIC_ENQ,
-  SHORT_LONG
+  SHORT_LONG,
+  SEQUENTIAL
 };
 
 
@@ -68,13 +71,6 @@ struct PfxtNode {
   float slack;
 };
 
-struct is_kept {
-  __host__ __device__
-  bool operator() (const PfxtNode& n) {
-    return n.num_children != -1;
-  }
-};
-
 struct pfxt_node_comp {
   __host__ __device__
   bool operator() (const PfxtNode& a, const PfxtNode& b) {
@@ -87,6 +83,7 @@ public:
   CpGen() = default;
   void read_input(const std::string& filename);
   void levelize();
+  
   void report_paths(
     int k, 
     int max_dev_lvls, 
@@ -99,6 +96,10 @@ public:
   std::vector<PfxtNode> get_pfxt_nodes(int k);
 
   void dump_benchmark_with_wgts(const std::string& filename, std::ostream& os) const; 
+  void sizeup_benchmark(
+      const std::string& filename,
+      std::ostream& os, 
+      int multiplier) const;
   void dump_csrs(std::ostream& os) const;
   void dump_lvls(std::ostream& os) const;
   
@@ -111,6 +112,8 @@ public:
   size_t num_verts() const;
   size_t num_edges() const;
 
+  size_t prop_time{0};
+  size_t expand_time{0};
 private:
   void _free();
   
@@ -161,7 +164,6 @@ private:
   int* _d_pfxt_tail;
 
 };
-
 
 
 } // namespace gpucpg

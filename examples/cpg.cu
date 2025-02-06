@@ -3,6 +3,7 @@
 int main(int argc, char* argv[]) {
   if (argc != 8) {
     std::cerr << "usage: ./a.out [benchmark] [#paths] [max_dev_lvls] [enable_compress] [prop_dist_method] [pfxt_expand_method] [slack_output_file]\n";
+    std::cout << "==== pd_method ====\n";
     std::cout << "pd_method 0: baseline\n";
     std::cout << "pd_method 1: baseline + cuda graph\n";
     std::cout << "pd_method 2: levelized (need to include levelize time)\n";
@@ -11,6 +12,12 @@ int main(int argc, char* argv[]) {
     std::cout << "pd_method 5: bfs + frontier privatization\n";
     std::cout << "pd_method 6: bfs + frontier privatization + use single block when qsize < BLOCKSIZE\n";
     std::cout << "pd_method 7: bfs + frontier privatization + precompute spur options (to save pfxt expansion time)\n";
+    std::cout << "==== pe_method ====\n";
+    std::cout << "pe_method 0: level by level, prefix sum-based\n";
+    std::cout << "pe_method 1: level by level, prefix sum-based + precompute spur counts\n";
+    std::cout << "pe_method 2: level by level, atomic enqueue-based\n";
+    std::cout << "pe_method 3: short-long expansion, atomic enqueue-based\n";
+    std::cout << "pe_method 4: cpu sequential expansion (for verifying solution)\n";
     std::exit(1);
   }
 

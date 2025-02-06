@@ -5,6 +5,7 @@
 #include <thrust/reduce.h>
 #include <thrust/execution_policy.h>
 #include <thrust/device_vector.h>
+#include <thrust/remove.h>
 #include <cub/cub.cuh>
 #include <cuda_runtime_api.h>
 #include <cooperative_groups.h>
@@ -41,8 +42,17 @@ namespace cg = cooperative_groups;
   } while (0)
 
 
-struct printf_functor
-{
+namespace gpucpg {
+
+struct printf_functor_pfxtnode {
+  __host__ __device__
+  void operator() (PfxtNode& x)
+  {
+      printf("%4f ", x.slack);
+  }
+};
+
+struct printf_functor {
   __host__ __device__
   void operator() (int x)
   {
@@ -51,15 +61,18 @@ struct printf_functor
 };
 
 template <typename Iterator>
-void print_range(const std::string& name, Iterator first, Iterator last)
-{
+void print_range(const std::string& name, Iterator first, Iterator last) {
   std::cout << name << ": ";
   thrust::for_each(thrust::device, first, last, printf_functor());
   std::cout << '\n';
 }
 
-
-namespace gpucpg {
+template <typename Iterator>
+void print_range_pfxt(const std::string& name, Iterator first, Iterator last) {
+  std::cout << name << ": ";
+  thrust::for_each(thrust::device, first, last, printf_functor_pfxtnode());
+  std::cout << '\n';
+}
 
 void checkError_t(cudaError_t error, std::string msg) {
   if (error != cudaSuccess) {
@@ -74,6 +87,74 @@ size_t CpGen::num_verts() const {
 
 size_t CpGen::num_edges() const {
   return _h_fanout_wgts.size();
+}
+
+void CpGen::sizeup_benchmark(
+    const std::string& filename,
+    std::ostream& os,
+    int multiplier) const {
+  std::ifstream infile(filename);
+  
+  if (!infile) {
+    throw std::runtime_error("Unable to open file");
+  }
+
+  std::string line;
+  int vertex_count;
+
+  // Read vertex count
+  std::getline(infile, line);
+  vertex_count = std::stoi(line);
+  os << vertex_count * multiplier << '\n';
+
+  // skip vertex IDs
+  for (int i = 0; i < vertex_count; i++) {
+    std::getline(infile, line);
+  }
+    
+  // write placeholder vertex IDs to the output file
+  for (int i = 0; i < vertex_count * multiplier; ++i) {
+    os << "\"Placeholder\"\n";
+  }
+ 
+  // Parse edges
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_real_distribution<float> dis(1.0, 50.0);
+  float weight;
+  while (std::getline(infile, line)) {
+    std::istringstream iss(line);
+    std::string from_str, to_str;
+    
+    // Parse edge format "from" -> "to", [weight];
+    std::getline(iss, from_str, '"');
+    std::getline(iss, from_str, '"');  // skip initial "
+    std::getline(iss, to_str, '"');    // skip till "
+    std::getline(iss, to_str, '"');    // extract to vertex
+
+    if (line.find(",") != std::string::npos) { // Check for optional weight
+      std::string weight_str;
+      std::getline(iss, weight_str, ',');
+      std::getline(iss, weight_str, ';');
+      weight = std::stof(weight_str);
+    }
+    
+    auto from_vid = std::stoi(from_str);
+    auto to_vid = std::stoi(to_str);
+
+    // write the original edge description
+    os << "\"" << from_vid << "\"" << " -> " << "\"" << to_vid << "\", " << weight << ";\n"; 
+
+    // write the duplicated edges
+    for (int i = 1; i < multiplier; i++) {
+      auto new_from = i*vertex_count+from_vid;
+      auto new_to = i*vertex_count+to_vid;
+    
+      os << "\"" << new_from << "\"" << " -> " << "\"" << new_to << "\", " <<
+        weight << ";\n"; 
+    }
+
+  }
 }
 
 void CpGen::dump_benchmark_with_wgts(const std::string& filename, std::ostream& os) const {
@@ -123,7 +204,7 @@ void CpGen::dump_benchmark_with_wgts(const std::string& filename, std::ostream& 
 void CpGen::read_input(const std::string& filename) {
   std::ifstream infile(filename);
   if (!infile) {
-    throw std::runtime_error("Unable to open file");
+    throw std::runtime_error("Unable to open file: " + filename);
   }
 
   std::string line;
@@ -242,6 +323,7 @@ __global__ void enqueue_sinks(
   }
 } 
 
+ 
 
 __global__ void check_if_no_dists_updated(
     int num_verts, 
@@ -548,7 +630,7 @@ __global__ void prop_distance_bfs(
   const auto vid = queue[*qhead+tid];
   const auto edge_start = verts[vid];
   const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
-
+  
   for (int eid = edge_start; eid < edge_end; eid++) {
     const auto neighbor = edges[eid];
     int wgt = wgts[eid] * SCALE_UP;
@@ -953,9 +1035,6 @@ __global__ void prop_distance_bfs_warp_centric(
 } 
 
 
-
-
-
 // the conditional graph node kernel
 // uses the convergence boolean as condition check
 __global__ void condition_converged(
@@ -1064,7 +1143,7 @@ __global__ void compute_long_path_counts(
         auto new_path_slack = 
           slack + dist_neighbor + wgt - dist_v;
 
-        if (new_path_slack >= *split) {
+        if (new_path_slack > *split) {
           //printf("slack=%f, > split=%f\n", new_path_slack, *split);
           atomicAdd(&s_num_long_paths, 1);
         }
@@ -1469,7 +1548,7 @@ __global__ void expand_short_pile(
         auto new_slack = 
           slack + dist_neighbor + wgt - dist_v;
 
-        if (new_slack < *split) {
+        if (new_slack <= *split) {
           // this path belongs to the short pile
           auto new_node_idx = atomicAdd(curr_tail_short, 1);
           //printf("new idx (short)=%d\n", new_node_idx);
@@ -1541,50 +1620,15 @@ __global__ void count_long_paths(
 
 }
 
-__global__ void promote_paths(
-    PfxtNode* short_pile,
-    PfxtNode* long_pile,
-    int long_pile_size,
-    int* tail_short,
-    float* split) {
-
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid < long_pile_size) {
-    if (long_pile[tid].slack < *split) {
-      // add this path to the short pile
-      auto new_path_idx = atomicAdd(tail_short, 1);
-      short_pile[new_path_idx] = long_pile[tid];
-      
-      // mark this path as removed in the long pile
-      // just use the num_children member
-      // and set to -1
-      // run stream compaction later
-      long_pile[tid].num_children = -1;
-    }
-  }
-}
 
 __global__ void pick_init_split(PfxtNode* short_pile, float* split, 
     int short_pile_size, float percentile) {
   if (threadIdx.x == 0) {
     int idx = short_pile_size * percentile;
     *split = short_pile[idx].slack;
+    //printf("the init split is at short_pile[%d]=%f\n", idx, *split);
   }
 }
-
-__global__ void use_slack_avg_as_split(float* slk_sum, float* split, int num_paths) {
-  if (threadIdx.x == 0) {
-    *split = *slk_sum / num_paths;
-  }
-}
-
-__global__ void save_tail(int* prev_tail, int* curr_tail) {
-  if (threadIdx.x == 0) {
-    *prev_tail = *curr_tail;
-  }
-
-}
-
 
 void CpGen::report_paths(
     int k, 
@@ -1595,22 +1639,6 @@ void CpGen::report_paths(
     float init_split_perc,
     int max_short_long_exp_iters) {
 
-  auto beg_lvlize = NOW; 
-  levelize();
-  auto end_lvlize = NOW;
-  auto beg_reindex = NOW;
-  reindex_verts();
-  auto end_reindex = NOW;
-  std::cout << "levelize time=" <<
-    std::chrono::duration_cast<US>(end_lvlize-beg_lvlize).count()
-    << " us.\n";
-  std::cout << "reindex time=" <<
-    std::chrono::duration_cast<US>(end_reindex-beg_reindex).count()
-    << " us.\n";
- 
-  const auto total_lvls = _h_verts_lvlp.size() - 1; 
-  std::cout << "total " << total_lvls << " levels.\n"; 
-
   const auto num_edges = _h_fanout_adjncy.size();
   const auto num_verts = _h_fanin_adjp.size() - 1;
  
@@ -1619,6 +1647,7 @@ void CpGen::report_paths(
   std::vector<int> h_queue(_sinks);
   h_queue.resize(num_verts);
   thrust::device_vector<int> queue(h_queue);
+  
   thrust::device_vector<int> out_degs(_h_out_degrees);
   thrust::device_vector<int> deps(_h_out_degrees);
   thrust::device_vector<int> accum_spurs(num_verts, 0);
@@ -1632,6 +1661,9 @@ void CpGen::report_paths(
   int* d_deps = thrust::raw_pointer_cast(&deps[0]);
   int* d_accum_spurs = thrust::raw_pointer_cast(&accum_spurs[0]);
 
+  // update queue tail pointer
+  inc_kernel<<<1, 1>>>(_d_qtail, static_cast<int>(_sinks.size()));
+    
   // initialize tail pointer for the pfxt node storage
   checkError_t(cudaMalloc(&_d_pfxt_tail, sizeof(int)), "malloc pfxt tail failed.");
   checkError_t(cudaMemset(_d_pfxt_tail, 0, sizeof(int)), "memset pfxt tail failed.");
@@ -1682,8 +1714,6 @@ void CpGen::report_paths(
       "_d_converged allocation failed.");
 
   int iters{0};
-  size_t prop_time{0};
-  size_t expand_time{0};
   // set the distance of the sink vertices to 0
   // and they are ready to be propagated
   for (const auto sink : _sinks) {
@@ -1695,7 +1725,7 @@ void CpGen::report_paths(
   cudaGetDeviceProperties(&dev_prop, 0);
   // get shared memory size on this GPU
   const auto sharedmem_sz = dev_prop.sharedMemPerBlock;
-  std::cout << "deviceProp.sharedMemPerBlock=" << sharedmem_sz << " bytes.\n";
+  // std::cout << "deviceProp.sharedMemPerBlock=" << sharedmem_sz << " bytes.\n";
 
   auto beg = NOW;
   if (pd_method == PropDistMethod::BASIC) { 
@@ -1737,102 +1767,102 @@ void CpGen::report_paths(
        d_succs);
   } 
   else if (pd_method == PropDistMethod::LEVELIZED) {
-    thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
-    int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
-    
-    for (size_t l = 0; l < total_lvls; l++) {
-      // get level size to determine how many blocks to launch
-      const auto v_beg = _h_verts_lvlp[l];
-      const auto v_end = _h_verts_lvlp[l+1];
-      const auto lvl_size = v_end - v_beg;
-       
-      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
-        (v_beg,
-         v_end,
-         num_verts,
-         num_edges,
-         d_fanin_adjp,
-         d_fanin_adjncy,
-         d_fanin_wgts,
-         d_dists_cache);
-    }
+    //thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
+    //int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
+    //
+    //for (size_t l = 0; l < total_lvls; l++) {
+    //  // get level size to determine how many blocks to launch
+    //  const auto v_beg = _h_verts_lvlp[l];
+    //  const auto v_end = _h_verts_lvlp[l+1];
+    //  const auto lvl_size = v_end - v_beg;
+    //   
+    //  prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
+    //    (v_beg,
+    //     v_end,
+    //     num_verts,
+    //     num_edges,
+    //     d_fanin_adjp,
+    //     d_fanin_adjncy,
+    //     d_fanin_wgts,
+    //     d_dists_cache);
+    //}
 
-    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
-      (num_verts, 
-       num_edges,
-       d_fanin_adjp,
-       d_fanin_adjncy,
-       d_fanin_wgts,
-       d_dists_cache,
-       d_succs);
+    //update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+    //  (num_verts, 
+    //   num_edges,
+    //   d_fanin_adjp,
+    //   d_fanin_adjncy,
+    //   d_fanin_wgts,
+    //   d_dists_cache,
+    //   d_succs);
   } 
   else if (pd_method == PropDistMethod::LEVELIZED_SHAREDMEM) {
-    const int verts_per_block = sharedmem_sz / sizeof(int);
-    std::cout << "can fit " << verts_per_block << " vertices per block.\n";
+    //const int verts_per_block = sharedmem_sz / sizeof(int);
+    //std::cout << "can fit " << verts_per_block << " vertices per block.\n";
 
-    int total_lvls_to_fit_in_smem{0};
-    int total_verts_to_fit_in_smem{0};
-    
-    for (size_t i = 0; i < total_lvls; i++) {
-      const auto v_beg = _h_verts_lvlp[i];
-      const auto v_end = _h_verts_lvlp[i+1];
-      const auto lvl_size = v_end - v_beg;
-      if (total_verts_to_fit_in_smem + lvl_size > verts_per_block) {
-        break;
-      }
-      else {
-        total_verts_to_fit_in_smem += lvl_size;
-        total_lvls_to_fit_in_smem++;
-      }
-    }
-    
-    std::cout << "can fit " << total_lvls_to_fit_in_smem << " lvls.\n";
-    std::cout << "can fit total of " << total_verts_to_fit_in_smem << " verts.\n"; 
+    //int total_lvls_to_fit_in_smem{0};
+    //int total_verts_to_fit_in_smem{0};
+    //
+    //for (size_t i = 0; i < total_lvls; i++) {
+    //  const auto v_beg = _h_verts_lvlp[i];
+    //  const auto v_end = _h_verts_lvlp[i+1];
+    //  const auto lvl_size = v_end - v_beg;
+    //  if (total_verts_to_fit_in_smem + lvl_size > verts_per_block) {
+    //    break;
+    //  }
+    //  else {
+    //    total_verts_to_fit_in_smem += lvl_size;
+    //    total_lvls_to_fit_in_smem++;
+    //  }
+    //}
+    //
+    //std::cout << "can fit " << total_lvls_to_fit_in_smem << " lvls.\n";
+    //std::cout << "can fit total of " << total_verts_to_fit_in_smem << " verts.\n"; 
 
-    thrust::device_vector<int> t_verts_by_lvl(_h_verts_by_lvl);
-    thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
-    int* d_verts_by_lvl = thrust::raw_pointer_cast(&t_verts_by_lvl[0]);
-    int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
+    //thrust::device_vector<int> t_verts_by_lvl(_h_verts_by_lvl);
+    //thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
+    //int* d_verts_by_lvl = thrust::raw_pointer_cast(&t_verts_by_lvl[0]);
+    //int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
 
-    prop_distance_levelized_sharedmem<<<1, BLOCKSIZE>>>(
-      0,
-      total_lvls_to_fit_in_smem,
-      d_verts_by_lvl,
-      d_verts_lvlp,
-      total_verts_to_fit_in_smem,
-      d_dists_cache,
-      num_verts,
-      num_edges,
-      d_fanin_adjp,
-      d_fanin_adjncy,
-      d_fanin_wgts);
+    //prop_distance_levelized_sharedmem<<<1, BLOCKSIZE>>>(
+    //  0,
+    //  total_lvls_to_fit_in_smem,
+    //  d_verts_by_lvl,
+    //  d_verts_lvlp,
+    //  total_verts_to_fit_in_smem,
+    //  d_dists_cache,
+    //  num_verts,
+    //  num_edges,
+    //  d_fanin_adjp,
+    //  d_fanin_adjncy,
+    //  d_fanin_wgts);
 
-    // finish relaxing the rest of the levels here
-    for (size_t l = total_lvls_to_fit_in_smem; l < total_lvls; l++) {
-      // get level size to determine how many blocks to launch
-      const auto v_beg = _h_verts_lvlp[l];
-      const auto v_end = _h_verts_lvlp[l+1];
-      const auto lvl_size = v_end - v_beg;
-       
-      prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
-        (v_beg,
-         v_end,
-         num_verts,
-         num_edges,
-         d_fanin_adjp,
-         d_fanin_adjncy,
-         d_fanin_wgts,
-         d_dists_cache);
-    }
+    //// finish relaxing the rest of the levels here
+    //for (size_t l = total_lvls_to_fit_in_smem; l < total_lvls; l++) {
+    //  // get level size to determine how many blocks to launch
+    //  const auto v_beg = _h_verts_lvlp[l];
+    //  const auto v_end = _h_verts_lvlp[l+1];
+    //  const auto lvl_size = v_end - v_beg;
+    //   
+    //  prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
+    //    (v_beg,
+    //     v_end,
+    //     num_verts,
+    //     num_edges,
+    //     d_fanin_adjp,
+    //     d_fanin_adjncy,
+    //     d_fanin_wgts,
+    //     d_dists_cache);
+    //}
 
-    update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
-      (num_verts, 
-       num_edges,
-       d_fanin_adjp,
-       d_fanin_adjncy,
-       d_fanin_wgts,
-       d_dists_cache,
-       d_succs);
+    //update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
+    //  (num_verts, 
+    //   num_edges,
+    //   d_fanin_adjp,
+    //   d_fanin_adjncy,
+    //   d_fanin_wgts,
+    //   d_dists_cache,
+    //   d_succs);
   } 
   else if (pd_method == PropDistMethod::CUDA_GRAPH) {
     cudaGraph_t cug;
@@ -1932,9 +1962,6 @@ void CpGen::report_paths(
   else if (pd_method == PropDistMethod::BFS) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
-    enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-      (qsize, d_queue, _d_qtail);
-
     while (qsize > 0) {
       prop_distance_bfs<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
         (num_verts,
@@ -1969,8 +1996,6 @@ void CpGen::report_paths(
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
-    enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-      (qsize, d_queue, _d_qtail);
 
     while (qsize > 0) {
       prop_distance_bfs_privatized
@@ -2006,8 +2031,6 @@ void CpGen::report_paths(
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
-    enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-      (qsize, d_queue, _d_qtail);
 
     while (true) {
       qsize = _get_qsize();
@@ -2061,8 +2084,6 @@ void CpGen::report_paths(
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_PRECOMP_SPURS) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
-    enqueue_sinks<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-      (qsize, d_queue, _d_qtail);
 
     while (qsize > 0) {
       prop_distance_bfs_privatized_precomp_spurs
@@ -2099,9 +2120,9 @@ void CpGen::report_paths(
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
   auto end = NOW;
   prop_time = std::chrono::duration_cast<US>(end-beg).count();
-  std::cout << "prop_distance converged with " << iters << " iters.\n";
-  std::cout << "prop_distance runtime: " << prop_time << " us.\n";
-
+  //std::cout << "prop_distance converged with " << iters << " iters.\n";
+  //std::cout << "prop_distance runtime: " << prop_time << " us.\n";
+  
   // host level offsets
   std::vector<int> _h_lvl_offsets(max_dev_lvls+1, 0);
 
@@ -2154,9 +2175,6 @@ void CpGen::report_paths(
 
   auto prev_tail_short = thrust::device_new<int>();
   thrust::fill(prev_tail_short, prev_tail_short+1, 0);
-
-  std::cout << "init_split_perc=" << init_split_perc << '\n';
-  std::cout << "max_short_long_exp_iters=" << max_short_long_exp_iters << '\n';
 
   beg = NOW;
   if (pe_method == PfxtExpMethod::BASIC) {
@@ -2471,88 +2489,80 @@ void CpGen::report_paths(
     // host variable to store the split value
     float h_split;
     
-    // update current tail of the short pile
-    auto d_tail_short = tail_short.get();
-    inc_kernel<<<1, 1>>>(d_tail_short, curr_expansion_window_size);
-   
     // initialize current tail of the long pile (zero)
-    auto d_tail_long = tail_long.get();
     thrust::fill(tail_long, tail_long+1, 0);
 
-    // variable to record path counts in the same level
-    int h_total_paths;
-
-    // record the prefix sum of path counts
-    thrust::device_vector<int> path_prefix_sums(curr_expansion_window_size, 0);
-    int* d_path_prefix_sums = thrust::raw_pointer_cast(&path_prefix_sums[0]);
-
-    compute_path_counts
-      <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>(
-          num_verts,
-          num_edges,
-          d_fanout_adjp,
-          d_succs,
-          d_short_pile,
-          d_lvl_offsets,
-          curr_lvl, 
-          d_path_prefix_sums); 
-
-    // reduction to get path count
-    h_total_paths = thrust::reduce(
-        thrust::device,
-        d_path_prefix_sums,
-        d_path_prefix_sums + curr_expansion_window_size);
-
-    // allocate new space
-    short_pile_size += h_total_paths;
-    short_pile.resize(short_pile_size);
-    // !!! MUST re-obtain the raw pointer after every resize !!!
-    d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
-
-
-    expand_new_pfxt_level_atomic_enq
-        <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>
-        (num_verts,
-         num_edges,
-         d_fanout_adjp,
-         d_fanout_adjncy,
-         d_fanout_wgts,
-         d_succs,
-         d_dists_cache,
-         d_short_pile,
-         d_lvl_offsets,
-         curr_lvl,
-         d_tail_short);
-   
-    // update expansion window
-    int h_window_start{0}, h_window_end{curr_expansion_window_size};
-    h_window_start += curr_expansion_window_size;
-    h_window_end += h_total_paths;
-
-    // sort by slack (use a tmp storage, don't affect the original short pile)
-    thrust::device_vector<PfxtNode> tmp_short_pile(short_pile); 
-    thrust::sort(tmp_short_pile.begin(), tmp_short_pile.end(), pfxt_node_comp());
-    auto d_tmp_short_pile = thrust::raw_pointer_cast(&tmp_short_pile[0]);
-    pick_init_split<<<1, 1>>>(d_tmp_short_pile, split.get(), short_pile_size,
+    // sort the initial paths by slack (use a tmp storage, don't affect the original path storage)
+    thrust::device_vector<PfxtNode> tmp_paths(short_pile); 
+    thrust::sort(tmp_paths.begin(), tmp_paths.end(), pfxt_node_comp());
+    auto d_tmp_paths = thrust::raw_pointer_cast(&tmp_paths[0]);
+    
+    // determine the initial split by picking the slack at the top N percentile
+    // (default=0.005 --> top 0.5%)
+    pick_init_split<<<1, 1>>>(d_tmp_paths, split.get(), short_pile_size,
         init_split_perc);
     cudaMemcpy(&h_split, split.get(), sizeof(float),
         cudaMemcpyDeviceToHost);
-    std::cout << "split=" << h_split << '\n';
-        
-     
+    std::cout << "init_split=" << h_split << '\n';
+    
+    // count the slacks that are greater/less equal to the split value
+    int h_num_short_paths = short_pile_size * init_split_perc + 1;
+    int h_num_long_paths = short_pile_size - h_num_short_paths;
+
+    // !!!! note that the short pile still has a mix of long/short paths
+    // at this point, so we split the paths into short and long piles now
+    // we can use stream compaction to move the long paths to the 
+    // long pile 
+    auto is_long_path = [h_split] __host__ __device__ (const PfxtNode& n) {
+      return n.slack > h_split;
+    };
+
+    // up-size long pile
+    long_pile_size = h_num_long_paths;
+    long_pile.resize(long_pile_size);
+    d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
+
+    // update the tail of the long pile
+    set_kernel<<<1, 1>>>(tail_long.get(), long_pile_size);
+
+    // copy the long paths from the short pile to the long pile
+    thrust::copy_if(short_pile.begin(), short_pile.end(), long_pile.begin(),
+        is_long_path);
+    
+    // remove the long paths from the short pile
+    thrust::remove_if(short_pile.begin(), short_pile.end(), is_long_path);
+
+    // down-size short pile
+    short_pile_size = h_num_short_paths;
+    short_pile.resize(short_pile_size);
+    d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
+
+    // update the tail of the short pile
+    set_kernel<<<1, 1>>>(tail_short.get(), short_pile_size);
+   
+    // initialize the expansion window
+    int h_window_start{0}, h_window_end{short_pile_size};
+
+    // to count how many steps we took to generate enough paths
+    int steps{0};
+
+    // initialize short/long path counts (host and device)
+    h_num_short_paths = h_num_long_paths = 0;
     auto num_long_paths = thrust::device_new<int>();
     auto num_short_paths = thrust::device_new<int>();
-    int h_num_long_paths{0};
-    int h_num_short_paths{0};
    
-    int iters{0};
-    while (iters < max_short_long_exp_iters) {
+    while (true) {
+      // get current expansion window size
       curr_expansion_window_size = h_window_end - h_window_start;
-      //std::cout << "window_size=" << curr_expansion_window_size << '\n';
+      
+      // if expansion window size > 0, we have short paths to expand
       if (curr_expansion_window_size > 0) {
+        // initialize number of long and short paths to 0
         thrust::fill(num_long_paths, num_long_paths+1, 0);
         thrust::fill(num_short_paths, num_short_paths+1, 0);
         
+        // count the long paths and short paths that we are about to
+        // generate
         compute_long_path_counts
           <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>
           (num_verts,
@@ -2569,18 +2579,12 @@ void CpGen::report_paths(
            num_short_paths.get(),
            split.get());
         
-        // now we have the num of long paths and short paths
         // resize the long pile and short pile
         cudaMemcpy(&h_num_long_paths, num_long_paths.get(), sizeof(int),
             cudaMemcpyDeviceToHost);
      
         cudaMemcpy(&h_num_short_paths, num_short_paths.get(), sizeof(int),
             cudaMemcpyDeviceToHost);
-       
-        //std::cout << "window: short_paths=" << h_num_short_paths << '\n';
-        //std::cout << "window: long_paths=" << h_num_long_paths << '\n';
-        //std::cout << "before up-size: long_pile_size=" << long_pile_size << '\n';
-        //std::cout << "before up-size: short_pile_size=" << short_pile_size << '\n';
 
         // up-size long pile
         long_pile_size += h_num_long_paths;
@@ -2593,9 +2597,8 @@ void CpGen::report_paths(
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
 
-        // run expansion on the short pile
+        // run the actual  expansion on the short pile
         // assign paths to the short pile and long pile
-        // based on their slacks
         expand_short_pile
           <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>
           (num_verts,
@@ -2621,23 +2624,31 @@ void CpGen::report_paths(
         // there's no more paths from the short pile
         // to expand, we have to update the split value
         // and move paths from the long pile to the short pile
-        
+
         // if there's no more paths in the long pile
         // we can terminate the loop
         if (long_pile_size == 0) {
           break;
         }
+
+        // if we already have enough paths in the short pile
+        // we can terminate
+        if (short_pile_size >= k) {
+          break;
+        }
         
-        while (h_num_short_paths == 0) {
+        while (h_num_short_paths < BLOCKSIZE) {
           // update the split value on gpu
-          update_split_mult<<<1, 1>>>(split.get(), 1.05f);
-          //update_split_add<<<1, 1>>>(split.get(), 1.0f);
+          update_split_mult<<<1, 1>>>(split.get(), 1.1f);
+          
+          cudaMemcpy(&h_split, split.get(), sizeof(float),
+              cudaMemcpyDeviceToHost);
+          // std::cout << "updated_split=" << h_split << '\n';
           
           // now some paths in the long pile
-          // might be transferred to the short pile
+          // must be transferred to the short pile
           // we calculate the long path count
-          // (the path count to be transferred can be
-          // calculated too)
+          // (the path count to be transferred can be calculated too)
           thrust::fill(num_long_paths, num_long_paths+1, 0);
           count_long_paths
             <<<ROUNDUPBLOCKS(long_pile_size, BLOCKSIZE), BLOCKSIZE>>>
@@ -2649,61 +2660,110 @@ void CpGen::report_paths(
           // copy the long path count back to host
           cudaMemcpy(&h_num_long_paths, num_long_paths.get(), sizeof(int),
               cudaMemcpyDeviceToHost);
-          //std::cout << "long_pile has " << h_num_long_paths << " long paths\n";
           h_num_short_paths = long_pile_size - h_num_long_paths;
-          //std::cout << "long_pile has " << h_num_short_paths << " short paths\n";
         }
 
-        // now we have the short path count
-        // we can up-size the short pile
+        // up-size the short pile
         short_pile_size += h_num_short_paths;
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
+        
+        auto is_short_path = [h_split] __host__ __device__ (const PfxtNode& n) {
+          return n.slack <= h_split;
+        };
 
         // add the short paths in the long pile to the short pile
         // and mark them as removed in the long pile
-        promote_paths
-          <<<ROUNDUPBLOCKS(long_pile_size, BLOCKSIZE), BLOCKSIZE>>>
-          (d_short_pile,
-           d_long_pile,
-           long_pile_size,
-           tail_short.get(),
-           split.get());
+        thrust::copy_if(long_pile.begin(), long_pile.end(),
+            short_pile.begin()+h_window_end, is_short_path);
 
         // update the expansion window end
         // (window start stays the same)
         h_window_end += h_num_short_paths;
         
+        // update the tail of the short pile
+        set_kernel<<<1, 1>>>(tail_short.get(), short_pile_size);
+
         // run stream compaction to remove the short paths
         // in the long pile
-        long_pile_size = h_num_long_paths;
-        if (long_pile_size > 0) {
-          auto tmp_long_pile = thrust::device_vector<PfxtNode>(long_pile_size);
-          thrust::copy_if(long_pile.begin(), long_pile.end(),
-              tmp_long_pile.begin(), is_kept());
-          
-          // copy from the temp long pile storage
-          long_pile.resize(long_pile_size);
-          long_pile = tmp_long_pile;
-
-          // update the tail of the long pile
-          set_kernel<<<1, 1>>>(tail_long.get(), long_pile_size);
-          d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
-        }
-        else {
-          long_pile.resize(0);
-          set_kernel<<<1, 1>>>(tail_long.get(), 0);
-        }
+        thrust::remove_if(long_pile.begin(), long_pile.end(), is_short_path);
         
-        h_num_short_paths = 0;
+        // down-size the long pile
+        long_pile_size = h_num_long_paths;
+        long_pile.resize(long_pile_size);
+        d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
+
+        // update the tail of the long pile
+        set_kernel<<<1, 1>>>(tail_long.get(), long_pile_size);
       }
-      iters++;
+      steps++;
     }
+
+    std::cout << "short-long expansion executed " << steps << " steps.\n";
+  }
+  else if (pe_method == PfxtExpMethod::SEQUENTIAL) {
+    // initialize a priority queue of src nodes
+    auto cmp = [](const PfxtNode& a, const PfxtNode& b) {
+      return a.slack > b.slack;
+    };
+    std::priority_queue<PfxtNode, std::vector<PfxtNode>, decltype(cmp)>
+     pfxt_pq(cmp); 
+   
+    for (const auto& src : _srcs) {
+      float dist = (float)h_dists[src] / SCALE_UP;
+      pfxt_pq.emplace(0, -1, src, -1, 0, dist);
+    }
+
     
+    // run sequential pfxt expansion
+    // just to validate the generated slacks
+    std::vector<PfxtNode> paths;
+    std::vector<int> h_succs;
+    h_succs.resize(num_verts);
+    thrust::copy(successors.begin(), successors.end(), h_succs.begin());
+    for (int i = 0; i < k; i++) {
+      const auto& node = pfxt_pq.top();
+      // record the top node in another container
+      paths.emplace_back(node.level, node.from, node.to, node.parent,
+          node.num_children, node.slack);
+      
+      // spur
+      auto v = node.to;
+      auto level = node.level;
+      auto slack = node.slack;
+      while (v != -1) {
+        auto edge_start = _h_fanout_adjp[v];
+        auto edge_end = (v == num_verts-1) ? num_edges : _h_fanout_adjp[v+1];
+        for (auto eid = edge_start; eid < edge_end; eid++) {
+          auto neighbor = _h_fanout_adjncy[eid];
+          if (neighbor == h_succs[v]) {
+            continue;
+          }
+
+          auto wgt = _h_fanout_wgts[eid];
+          auto dist_neighbor = (float)h_dists[neighbor] / SCALE_UP;
+          auto dist_v = (float)h_dists[v] / SCALE_UP;
+          auto new_slack = slack + dist_neighbor + wgt - dist_v;
+
+
+          // populate child path info
+          pfxt_pq.emplace(level+1, v, neighbor, -1, 0, new_slack);
+        } 
+
+        // traverse to next successor
+        v = h_succs[v];
+      }
+
+      // pop the top node
+      pfxt_pq.pop(); 
+    }
+ 
+    // copy paths to host pfxt nodes
+    _h_pfxt_nodes.clear();
+    _h_pfxt_nodes = std::move(paths);
   }
   end = NOW;
   expand_time = std::chrono::duration_cast<US>(end-beg).count();
-  std::cout << "pfxt level expansion runtime: " << expand_time << " us.\n";
 
   std::string slk_output_file;
   if (pe_method == PfxtExpMethod::BASIC ||
@@ -2822,8 +2882,6 @@ std::vector<PfxtNode> CpGen::get_pfxt_nodes(int k) {
   }
   return nodes;
 }  
-
-
 
 
 void CpGen::dump_csrs(std::ostream& os) const {
@@ -2956,18 +3014,6 @@ void CpGen::reindex_verts() {
   _h_verts_by_lvl.clear();
   _h_verts_by_lvl.resize(vs);
   std::iota(_h_verts_by_lvl.begin(), _h_verts_by_lvl.end(), 0);
-
-  // also record which vertex
-  // is in which level
-  //_h_lvl_of.resize(vs);
-  //for (size_t i = 0; i < _h_verts_lvlp.size()-1; i++) {
-  //  const auto lvl_start = _h_verts_lvlp[i];
-  //  const auto lvl_end = _h_verts_lvlp[i+1];
-  //  for (auto l = lvl_start; l < lvl_end; l++) {
-  //    const auto v = _h_verts_by_lvl[l];
-  //    _h_lvl_of[v] = i;
-  //  }
-  //}
 }
 
 void CpGen::_free() {
@@ -2993,6 +3039,5 @@ int CpGen::_get_expansion_window_size(int* p_start, int* p_end) {
   int size = end - start;
   return size;
 }
-
 
 } // namespace gpucpg
