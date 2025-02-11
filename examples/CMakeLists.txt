@@ -8,6 +8,7 @@ add_executable(get_node_by_idx ${GPUCPG_EXAMPLE_DIR}/get_node_by_idx.cu)
 add_executable(cpg-compare ${GPUCPG_EXAMPLE_DIR}/cpg-compare.cu)
 add_executable(cpg-slack-error ${GPUCPG_EXAMPLE_DIR}/cpg-slack-error.cu)
 add_executable(cpg-mteps ${GPUCPG_EXAMPLE_DIR}/cpg-mteps.cu)
+add_executable(bfs_hybrid ${GPUCPG_EXAMPLE_DIR}/bfs_hybrid.cu)
 
 list(APPEND GPUCPG_EXAMPLES
   reduce
@@ -20,6 +21,7 @@ list(APPEND GPUCPG_EXAMPLES
   gen_benchmark
   gen_sizedup_benchmark
   get_node_by_idx
+  bfs_hybrid
 )
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)

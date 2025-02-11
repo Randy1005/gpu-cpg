@@ -24,7 +24,8 @@ enum class PropDistMethod {
   BFS,
   BFS_PRIVATIZED,
   BFS_PRIVATIZED_MERGED,
-  BFS_PRIVATIZED_PRECOMP_SPURS
+  BFS_PRIVATIZED_PRECOMP_SPURS,
+  BFS_HYBRID
 };
 
 enum class PfxtExpMethod {
@@ -84,6 +85,19 @@ public:
   void read_input(const std::string& filename);
   void levelize();
   
+  void bfs_hybrid(
+    float traversal_completion_rate, 
+    int* iverts,
+    int* iedges,
+    float* iwgts,
+    int* overts,
+    int* oedges,
+    float* owgts,
+    int* dists, 
+    int* queue,
+    int* deps,
+    bool* touched);
+
   void report_paths(
     int k, 
     int max_dev_lvls, 
@@ -91,7 +105,7 @@ public:
     PropDistMethod pd_method,
     PfxtExpMethod pe_method,
     float init_split_perc = 0.005f,
-    int max_short_long_exp_iters = 100);
+    float traversal_completion_rate = 0.9f);
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
 
@@ -113,10 +127,12 @@ public:
   size_t num_edges() const;
 
   size_t prop_time{0};
+  size_t prop_td_time{0};
+  size_t prop_bu_time{0};
   size_t expand_time{0};
 private:
   void _free();
-  
+ 
   int _get_qsize();
 
   int _get_expansion_window_size(int* p_start, int* p_end);
@@ -162,8 +178,6 @@ private:
 
   // pfxt nodes tail
   int* _d_pfxt_tail;
-
 };
-
 
 } // namespace gpucpg
