@@ -9,7 +9,6 @@ target_link_libraries(gpucpg
 )
 
 target_compile_options(gpucpg PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-                       --generate-line-info
                        --use_fast_math
                        --relocatable-device-code=true
                        >)

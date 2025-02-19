@@ -11,6 +11,7 @@
 #include <random>
 #include <queue>
 #include <functional>
+#include "timer.hpp"
 
 namespace gpucpg {
 struct PfxtNode;
@@ -25,7 +26,8 @@ enum class PropDistMethod {
   BFS_PRIVATIZED,
   BFS_PRIVATIZED_MERGED,
   BFS_PRIVATIZED_PRECOMP_SPURS,
-  BFS_HYBRID
+  BFS_HYBRID,
+  BFS_BOTTOM_UP
 };
 
 enum class PfxtExpMethod {
@@ -35,7 +37,6 @@ enum class PfxtExpMethod {
   SHORT_LONG,
   SEQUENTIAL
 };
-
 
 struct PfxtNode {
   __host__ __device__ PfxtNode(
@@ -85,18 +86,20 @@ public:
   void read_input(const std::string& filename);
   void levelize();
   
-  void bfs_hybrid(
-    float traversal_completion_rate, 
+ 
+  void bfs_adaptive(
+    const float alpha,
     int* iverts,
     int* iedges,
     float* iwgts,
     int* overts,
     int* oedges,
     float* owgts,
-    int* dists, 
+    int* dists,
     int* queue,
     int* deps,
-    bool* touched);
+    bool* touched
+  );
 
   void report_paths(
     int k, 
@@ -105,7 +108,7 @@ public:
     PropDistMethod pd_method,
     PfxtExpMethod pe_method,
     float init_split_perc = 0.005f,
-    float traversal_completion_rate = 0.9f);
+    const float alpha = 10.0f);
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
 
@@ -116,7 +119,7 @@ public:
       int multiplier) const;
   void dump_csrs(std::ostream& os) const;
   void dump_lvls(std::ostream& os) const;
-  
+ 
   // re-assign index after levelization
   // this is to save the trouble of
   // maintaining messy mapping on GPU
@@ -126,10 +129,8 @@ public:
   size_t num_verts() const;
   size_t num_edges() const;
 
-  size_t prop_time{0};
-  size_t prop_td_time{0};
-  size_t prop_bu_time{0};
-  size_t expand_time{0};
+  std::chrono::duration<double, std::micro> prop_time;
+  std::chrono::duration<double, std::micro> expand_time;
 private:
   void _free();
  

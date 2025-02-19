@@ -26,10 +26,6 @@ namespace cg = cooperative_groups;
   (((DATALEN) + (NTHREADS) - 1) / (NTHREADS))
 
 #define SCALE_UP 10000
-#define NOW std::chrono::steady_clock::now()
-#define US std::chrono::microseconds
-#define MS std::chrono::milliseconds
-
 #define cudaCheckErrors(msg) \
   do { \
     cudaError_t __err = cudaGetLastError(); \
@@ -756,37 +752,31 @@ __global__ void prop_distance_bfs_bu(
     int* distances_cache,
     int* untouched_verts,
     int num_untouched,
-    bool* touched,
-    int* deps) {
+    bool* touched) {
     
   int gid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (gid < num_untouched) {
     const auto v = untouched_verts[gid];
     const auto edge_beg = overts[v];
     const auto edge_end = (v == num_verts-1) ? num_edges : overts[v+1]; 
-    const auto odeg = edge_end - edge_beg;
-    int touched_oedges{0};
-    for (auto eid = edge_beg; eid < edge_end; eid++) {
+    
+		int min_dist{::cuda::std::numeric_limits<int>::max()};
+		for (auto eid = edge_beg; eid < edge_end; eid++) {
       // in the bottom-up step, we let v find its parent
       const auto neighbor = oedges[eid];
       if (touched[neighbor]) {
         // this is a valid parent for v  
         int wgt = owgts[eid] * SCALE_UP;
-        int new_distance = distances_cache[neighbor] + wgt;
-
-        // update v's distance if new_distance is smaller
-        if (new_distance < distances_cache[v]) {
-          distances_cache[v] = new_distance;
-        }
-
-        touched_oedges++;
+				min_dist = min(min_dist, distances_cache[neighbor]+wgt);
       }
+			else {
+				return;
+			}
     }
 
-    if (touched_oedges == odeg) {
-      touched[v] = true;
-    }
-  }
+    touched[v] = true;
+		distances_cache[v] = min_dist;
+	}
 
 }
 
@@ -1780,8 +1770,8 @@ void CpGen::report_paths(
     bool enable_compress,
     PropDistMethod pd_method,
     PfxtExpMethod pe_method,
-    float init_split_perc,
-    float traversal_completion_rate) {
+    const float init_split_perc,
+    const float alpha) {
 
   const auto num_edges = _h_fanout_adjncy.size();
   const auto num_verts = _h_fanin_adjp.size() - 1;
@@ -1864,9 +1854,13 @@ void CpGen::report_paths(
   for (const auto sink : _sinks) {
     dists_cache[sink] = 0;
     dists_updated[sink] = true;
-  }
+		touched[sink]	= true;
+	}
 
-  auto beg = NOW;
+	Timer timer_cpg;
+
+
+	timer_cpg.start();
   if (pd_method == PropDistMethod::BASIC) { 
     while (!h_converged) {
       checkError_t(
@@ -1920,8 +1914,8 @@ void CpGen::report_paths(
 
   } 
   else if (pd_method == PropDistMethod::BFS_HYBRID) {
-    bfs_hybrid
-      (traversal_completion_rate,
+    bfs_adaptive
+      (alpha,
        d_fanin_adjp, 
        d_fanin_adjncy,
        d_fanin_wgts,
@@ -2152,9 +2146,10 @@ void CpGen::report_paths(
   // copy distance vector back to host
   std::vector<int> h_dists(num_verts);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
-  auto end = NOW;
-  prop_time = std::chrono::duration_cast<US>(end-beg).count();
- 
+
+	timer_cpg.stop();
+	prop_time = timer_cpg.get_elapsed_time();
+
   // get successors of each vertex (the next hop on the shortest path) 
   update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
       (num_verts, 
@@ -2218,7 +2213,7 @@ void CpGen::report_paths(
   auto prev_tail_short = thrust::device_new<int>();
   thrust::fill(prev_tail_short, prev_tail_short+1, 0);
 
-  beg = NOW;
+	timer_cpg.start();
   if (pe_method == PfxtExpMethod::BASIC) {
     while (curr_lvl < max_dev_lvls) {
       // variable to record path counts in the same level
@@ -2804,8 +2799,9 @@ void CpGen::report_paths(
     _h_pfxt_nodes.clear();
     _h_pfxt_nodes = std::move(paths);
   }
-  end = NOW;
-  expand_time = std::chrono::duration_cast<US>(end-beg).count();
+
+	timer_cpg.stop();
+	expand_time = timer_cpg.get_elapsed_time();
 
   std::string slk_output_file;
   if (pe_method == PfxtExpMethod::BASIC ||
@@ -3065,8 +3061,48 @@ int CpGen::_get_expansion_window_size(int* p_start, int* p_end) {
   return size;
 }
 
-void CpGen::bfs_hybrid(
-    float traversal_completion_rate, 
+
+__global__ void get_remaining_verts(
+	int num_verts, 
+	bool* touched, 
+	int* remaining_verts,
+	int* tail) {
+	int tid = threadIdx.x + blockIdx.x * blockDim.x;
+	
+	__shared__ int s_remaining_verts[BLOCKSIZE];
+	__shared__ int s_tail;
+	
+	if (threadIdx.x == 0) {
+		s_tail = 0;
+	}
+	__syncthreads();
+	
+	if (tid < num_verts) {
+		if (!touched[tid]) {
+			const int idx = atomicAdd(&s_tail, 1);
+			s_remaining_verts[idx] = tid;
+		}
+	}
+
+	__syncthreads();
+
+	// compute the index of the global array to start
+	// copying the remaining vertices
+	__shared__ int s_start;
+	if (threadIdx.x == 0) {
+		s_start = atomicAdd(tail, s_tail);
+	}
+	__syncthreads();
+
+	// commit the remaining vertices to the global array
+	for (auto i = threadIdx.x; i < s_tail; i += blockDim.x) {
+		remaining_verts[s_start + i] = s_remaining_verts[i];
+	}
+
+}
+
+void CpGen::bfs_adaptive(
+    const float alpha, 
     int* iverts,
     int* iedges,
     float* iwgts,
@@ -3077,129 +3113,178 @@ void CpGen::bfs_hybrid(
     int* queue,
     int* deps,
     bool* touched) {
-  // mf: #edges that will be touched by the frontiers
-  // mu: #edges that are untouched
-  // qsize: # of current frontiers
-  auto mf = thrust::device_new<int>(); 
-  auto mu = thrust::device_new<int>();
+		const int M{static_cast<int>(num_edges())};
+		const int N{static_cast<int>(num_verts())};
+		const int num_sinks{static_cast<int>(_sinks.size())};
 
-  int M = num_edges();
-  int N = num_verts();
-  auto num_sinks = static_cast<int>(_sinks.size());
-  
-  // initialize host mu, mf
-  int h_mf{0}, h_mu{M-num_sinks};
-  int qsize{num_sinks}, steps{0}; 
-  auto tbeg = NOW;  
-  // initialize device mu
-  //thrust::fill(mu, mu+1, h_mu); 
-  //
-  //while (h_mf < h_mu/alpha) {
-  //  // reset mf
-  //  thrust::fill(mf, mf+1, 0); 
-  //  
-  //  // run top-down step
-  //  prop_distance_bfs_td<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-  //    (N,
-  //     M,
-  //     iverts,
-  //     iedges,
-  //     iwgts,
-  //     overts,
-  //     oedges,
-  //     dists,
-  //     queue,
-  //     _d_qhead,
-  //     _d_qtail,
-  //     qsize,
-  //     deps,
-  //     touched,
-  //     mf.get(),
-  //     mu.get());
-  //  
-  //  // copy mu, mf from device 
-  //  thrust::copy(mu, mu+1, &h_mu);
-  //  thrust::copy(mf, mf+1, &h_mf);
-  //
-  //  // update queue head once here
-  //  inc_kernel<<<1, 1>>>(_d_qhead, qsize);
-  //
-  //  // update queue size
-  //  qsize = _get_qsize();
-  //  iters++;
-  //}
-  
-  int touched_vs{0};
-  while (touched_vs < traversal_completion_rate*N) {
-    prop_distance_bfs_td<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-        (N,
-         M,
-         iverts,
-         iedges,
-         iwgts,
-         dists,
-         queue,
-         _d_qhead,
-         _d_qtail,
-         qsize,
-         deps,
-         touched);
-      
-    // update queue head once here
-    inc_kernel<<<1, 1>>>(_d_qhead, qsize);
-      
-    touched_vs += qsize;
+		int qsize{num_sinks}, steps{0};
+		int num_remaining_verts{N};
+		
+		while (qsize*alpha < num_remaining_verts) {
+			prop_distance_bfs_td<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+					N,
+					M,
+					iverts,
+					iedges,
+					iwgts,
+					dists,
+					queue,
+					_d_qhead,
+					_d_qtail,
+					qsize,
+					deps,
+					touched);
+			inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+			num_remaining_verts -= qsize;
+			qsize = _get_qsize();
+			steps++;
+		}
 
-    // update queue size
-    qsize = _get_qsize();
-    steps++;
-  }
-  
-  auto tend = NOW;  
-  prop_td_time = std::chrono::duration_cast<US>(tend-tbeg).count();
-  
-  std::cout << "direction switches at step " << steps << ".\n";
-  
-  // run bottom-up step
-  // get all the untouched vertices
-  tbeg = NOW;
-  thrust::device_vector<int> untouched_verts(N);
-  thrust::sequence(untouched_verts.begin(), untouched_verts.end());
-  auto is_touched = [touched] __host__ __device__ (int v) {
-    return touched[v];
-  };
-  auto num_untouched = thrust::count(thrust::device, touched, touched+N, false);
-  thrust::remove_if(untouched_verts.begin(), untouched_verts.end(),
-      is_touched);
-  untouched_verts.resize(num_untouched);
-  auto d_untouched_verts = thrust::raw_pointer_cast(&untouched_verts[0]);
+	std::cout << "direction switches @ step " << steps << ".\n";
 
-  while (num_untouched > 0) {
-    prop_distance_bfs_bu
-      <<<ROUNDUPBLOCKS(num_untouched, BLOCKSIZE), BLOCKSIZE>>>(
-          N,
-          M,
-          overts,
-          oedges,
-          owgts,
-          dists,
-          d_untouched_verts,
-          num_untouched,
-          touched,
-          deps);
-    
-    // update the untouched vertices
-    num_untouched = 
-      thrust::count(thrust::device, touched, touched+N, false);
-    thrust::remove_if(untouched_verts.begin(), untouched_verts.end(),
-        is_touched);
-    untouched_verts.resize(num_untouched);
-    d_untouched_verts = thrust::raw_pointer_cast(&untouched_verts[0]);
-    steps++;
-  } 
-  tend = NOW;
-  prop_bu_time = std::chrono::duration_cast<US>(tend-tbeg).count();
+	// move queue tail to the end of the queue
+	// so we can start the bottom-up step
+	inc_kernel<<<1, 1>>>(_d_qtail, qsize);
+
+	// run bottom-up step
+	thrust::device_vector<int> remaining_verts(num_remaining_verts);
+	auto d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+	auto tail = thrust::device_new<int>();
+	thrust::fill(thrust::device, tail, tail+1, 0);
+	
+	get_remaining_verts<<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+			N,
+			touched,
+			d_remaining_verts,
+			tail.get());
+
+	while (num_remaining_verts > 0) {
+		prop_distance_bfs_bu<<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
+				N,
+				M,
+				overts,
+				oedges,
+				owgts,
+				dists,
+				d_remaining_verts,
+				num_remaining_verts,
+				touched);
+
+		num_remaining_verts = 
+			thrust::count(thrust::device, touched, touched+N, false);
+
+		thrust::remove_if(remaining_verts.begin(), remaining_verts.end(),
+				[touched] __host__ __device__ (int v) {
+				return touched[v];
+				}
+		);
+		
+		remaining_verts.resize(num_remaining_verts);
+		d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+		steps++;
+	}
+	
+	std::cout << "bfs_adaptive executed " << steps << " steps.\n";
 }
 
+//void CpGen::bfs_hybrid(
+//    float traversal_completion_rate, 
+//    int* iverts,
+//    int* iedges,
+//    float* iwgts,
+//    int* overts,
+//    int* oedges,
+//    float* owgts,
+//    int* dists, 
+//    int* queue,
+//    int* deps,
+//    bool* touched) {
+//  // mf: #edges that will be touched by the frontiers
+//  // mu: #edges that are untouched
+//  // qsize: # of current frontiers
+//  auto mf = thrust::device_new<int>(); 
+//  auto mu = thrust::device_new<int>();
+//
+//  int M = num_edges();
+//  int N = num_verts();
+//  auto num_sinks = static_cast<int>(_sinks.size());
+//  
+//  // initialize host mu, mf
+//  int h_mf{0}, h_mu{M-num_sinks};
+//  int qsize{num_sinks}, steps{0}; 
+//  auto tbeg = NOW;  
+// 
+//  
+//  int touched_vs{0};
+//  while (touched_vs < traversal_completion_rate*N) {
+//    prop_distance_bfs_td<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+//        (N,
+//         M,
+//         iverts,
+//         iedges,
+//         iwgts,
+//         dists,
+//         queue,
+//         _d_qhead,
+//         _d_qtail,
+//         qsize,
+//         deps,
+//         touched);
+//      
+//    // update queue head once here
+//    inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+//      
+//    touched_vs += qsize;
+//
+//    // update queue size
+//    qsize = _get_qsize();
+//    steps++;
+//  }
+//  
+//  auto tend = NOW;  
+//  prop_td_time = std::chrono::duration_cast<US>(tend-tbeg).count();
+//  
+//  std::cout << "direction switches at step " << steps << ".\n";
+//  
+//  // run bottom-up step
+//  // get all the untouched vertices
+//  tbeg = NOW;
+//  thrust::device_vector<int> untouched_verts(N);
+//  thrust::sequence(untouched_verts.begin(), untouched_verts.end());
+//  auto is_touched = [touched] __host__ __device__ (int v) {
+//    return touched[v];
+//  };
+//  auto num_untouched = thrust::count(thrust::device, touched, touched+N, false);
+//  thrust::remove_if(untouched_verts.begin(), untouched_verts.end(),
+//      is_touched);
+//  untouched_verts.resize(num_untouched);
+//  auto d_untouched_verts = thrust::raw_pointer_cast(&untouched_verts[0]);
+//
+//  while (num_untouched > 0) {
+//    prop_distance_bfs_bu
+//      <<<ROUNDUPBLOCKS(num_untouched, BLOCKSIZE), BLOCKSIZE>>>(
+//          N,
+//          M,
+//          overts,
+//          oedges,
+//          owgts,
+//          dists,
+//          d_untouched_verts,
+//          num_untouched,
+//          touched,
+//          deps);
+//    
+//    // update the untouched vertices
+//    num_untouched = 
+//      thrust::count(thrust::device, touched, touched+N, false);
+//    thrust::remove_if(untouched_verts.begin(), untouched_verts.end(),
+//        is_touched);
+//    untouched_verts.resize(num_untouched);
+//    d_untouched_verts = thrust::raw_pointer_cast(&untouched_verts[0]);
+//    steps++;
+//  } 
+//  tend = NOW;
+//  prop_bu_time = std::chrono::duration_cast<US>(tend-tbeg).count();
+//}
 
 } // namespace gpucpg

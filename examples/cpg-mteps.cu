@@ -44,49 +44,45 @@ int main(int argc, char* argv[]) {
     os << "num_verts=" << base_cpgen.num_verts() << '\n';
     os << "num_edges=" << base_cpgen.num_edges() << '\n';
 
-    size_t base_pd_time_sum{0};
-    float my_pd_time_sum_bfs{0.0f}, my_pd_time_sum_bfs_priv{0.0f},
-          my_pd_time_sum_bfs_priv_merged{0.0f}; 
+    auto base_pd_time_sum{Timer::elapsed_time_t::zero()};
+    auto my_pd_time_sum_bfs{Timer::elapsed_time_t::zero()};
+    auto my_pd_time_sum_bfs_priv{Timer::elapsed_time_t::zero()};
+    auto my_pd_time_sum_bfs_priv_merged{Timer::elapsed_time_t::zero()};
     size_t runs{10};
 
     for (size_t i = 0; i < runs; i++) {
       base_cpgen.report_paths(k, MDL, enable_compress, base_pd_method,
-          pe_method, 0.005f, 80);
+          pe_method);
       base_pd_time_sum += base_cpgen.prop_time;
       
       // BFS
       my_cpgen_bfs.report_paths(k, MDL, enable_compress, my_pd_method_bfs,
-          pe_method, 0.005f, 80); 
+          pe_method); 
       my_pd_time_sum_bfs += my_cpgen_bfs.prop_time;
     
       // BFS privatized
       my_cpgen_bfs_priv.report_paths(k, MDL, enable_compress,
           my_pd_method_bfs_priv,
-          pe_method, 0.005f, 80); 
+          pe_method); 
       my_pd_time_sum_bfs_priv += my_cpgen_bfs_priv.prop_time;
     
       // BFS privatized + merged
       my_cpgen_bfs_priv_merged.report_paths(k, MDL, enable_compress,
           my_pd_method_bfs_priv_merged,
-          pe_method, 0.005f, 80); 
+          pe_method); 
       my_pd_time_sum_bfs_priv_merged += my_cpgen_bfs_priv_merged.prop_time;
     }
 
-    base_pd_time_sum /= 10.0f;
-    my_pd_time_sum_bfs /= 10.0f;
-    my_pd_time_sum_bfs_priv /= 10.0f;
-    my_pd_time_sum_bfs_priv_merged /= 10.0f;
+    base_pd_time_sum /= runs;
+    my_pd_time_sum_bfs /= runs;
+    my_pd_time_sum_bfs_priv /= runs;
+    my_pd_time_sum_bfs_priv_merged /= runs;
 
-    os << "baseline avg. PD time=" << static_cast<float>(base_pd_time_sum)
-      * 1e-6 << " s.\n";
-    os << "my avg. PD (BFS) time=" << static_cast<float>(my_pd_time_sum_bfs)
-      * 1e-6 << " s.\n";
-    os << "my avg. PD (BFS_PRIV) time=" <<
-      static_cast<float>(my_pd_time_sum_bfs_priv)
-      * 1e-6 << " s.\n";
-    os << "my avg. PD (BFS_PRIV_MERGED) time=" <<
-      static_cast<float>(my_pd_time_sum_bfs_priv_merged)
-      * 1e-6 << " s.\n";
+    os << "baseline avg. PD time=" << base_pd_time_sum / 1s<< " s.\n";
+    os << "my avg. PD (BFS) time=" << my_pd_time_sum_bfs / 1s << " s.\n";
+    os << "my avg. PD (BFS_PRIV) time=" << my_pd_time_sum_bfs_priv / 1s << " s.\n";
+    os << "my avg. PD (BFS_PRIV_MERGED) time=" << my_pd_time_sum_bfs_priv_merged / 1s << " s.\n";
+    
   }
 
   return 0;
