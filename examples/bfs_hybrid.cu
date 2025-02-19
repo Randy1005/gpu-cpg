@@ -30,7 +30,9 @@ int main(int argc, char* argv[]) {
   auto slks_ref = cpgen_ref.get_slacks(num_paths);
 
   std::cout << "BFS: k-th slack=" << slks_ref.back() << "\n";
+  std::cout << "DP runtime=" << cpgen_ref.prop_time / 1ms << " ms.\n";
   std::cout << "BFS_ADAPTIVE: k-th slack=" << slks.back() << "\n";
+  std::cout << "DP runtime=" << cpgen.prop_time / 1ms << " ms.\n";
 
   return 0;
 }
