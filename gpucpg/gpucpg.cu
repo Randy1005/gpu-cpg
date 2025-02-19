@@ -3153,7 +3153,6 @@ void CpGen::bfs_adaptive(
 	inc_kernel<<<1, 1>>>(_d_qhead, qsize);
 	
 	// run bottom-up step
-	
 	timer.start();	
 	thrust::device_vector<int> remaining_verts(num_remaining_verts);
 	auto d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
