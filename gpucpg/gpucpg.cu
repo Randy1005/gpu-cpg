@@ -780,6 +780,50 @@ __global__ void prop_distance_bfs_bu(
 
 }
 
+__global__ void prop_distance_bfs_bu_get_frontiers(
+    int num_verts, 
+    int num_edges,
+    int* overts,
+    int* oedges,
+    float* owgts,
+    int* distances_cache,
+    int* untouched_verts,
+    int num_untouched,
+		int* queue,
+		int* qtail,
+		bool* touched) {
+    
+  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
+  if (gid < num_untouched) {
+    const auto v = untouched_verts[gid];
+    const auto edge_beg = overts[v];
+    const auto edge_end = (v == num_verts-1) ? num_edges : overts[v+1]; 
+    
+		int min_dist{::cuda::std::numeric_limits<int>::max()};
+		for (auto eid = edge_beg; eid < edge_end; eid++) {
+      // in the bottom-up step, we let v find its parent
+      const auto neighbor = oedges[eid];
+      if (touched[neighbor]) {
+        // this is a valid parent for v  
+        int wgt = owgts[eid] * SCALE_UP;
+				min_dist = min(min_dist, distances_cache[neighbor]+wgt);
+      }
+			else {
+				return;
+			}
+    }
+		
+		distances_cache[v] = min_dist;
+		enqueue(v, queue, qtail);
+	}
+
+}
+
+
+
+
+
+
 __global__ void prop_distance_bfs_single_block(
     int num_verts, 
     int num_edges,
@@ -1763,6 +1807,8 @@ __global__ void pick_init_split(PfxtNode* short_pile, float* split,
     //printf("the init split is at short_pile[%d]=%f\n", idx, *split);
   }
 }
+
+
 
 void CpGen::report_paths(
     int k, 
@@ -3146,7 +3192,7 @@ void CpGen::bfs_adaptive(
 		rtlog << timer.get_elapsed_time() / 1us << '\n';
 	}
 
-	std::cout << "direction switches @ step " << steps << ".\n";
+	std::cout << "switched to top-down @ step " << steps << ".\n";
 
 	// move queue head to the end of the queue
 	// so we can start the bottom-up step
@@ -3169,6 +3215,7 @@ void CpGen::bfs_adaptive(
 
 	while (num_remaining_verts > 0) {
 		timer.start();
+		const auto prev_num_remaining_verts{num_remaining_verts};
 		prop_distance_bfs_bu<<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
 				N,
 				M,
@@ -3195,6 +3242,63 @@ void CpGen::bfs_adaptive(
 		
 		remaining_verts.resize(num_remaining_verts);
 		d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+		steps++;
+
+		timer.stop();
+		rtlog << timer.get_elapsed_time() / 1us << '\n';
+		auto num_frontiers{prev_num_remaining_verts - num_remaining_verts};
+		
+		if (num_frontiers < 0.008f*N) {
+			qsize = _get_qsize();
+			assert(qsize == 0);	
+			timer.start();	
+			prop_distance_bfs_bu_get_frontiers
+				<<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
+					N,
+					M,
+					overts,
+					oedges,
+					owgts,
+					dists,
+					d_remaining_verts,
+					num_remaining_verts,
+					queue,
+					_d_qtail,
+					touched);
+		
+			timer.stop();
+			rtlog << timer.get_elapsed_time() / 1us << '\n';
+			break;
+		}
+		
+	}
+
+	std::cout << "switched to top-down @ step " << steps << ".\n";
+	qsize = _get_qsize();
+	
+	// run the final top-down steps
+	while (qsize > 0) {
+		if (timer.is_paused) {
+			timer.resume();
+		}
+		else{
+			timer.start();
+		}
+		prop_distance_bfs
+			<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+				N,
+				M,
+				iverts,
+				iedges,
+				iwgts,
+				dists,
+				queue,
+				_d_qhead,
+				_d_qtail,
+				qsize,
+				deps);
+		inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+		qsize = _get_qsize();
 		steps++;
 
 		timer.stop();

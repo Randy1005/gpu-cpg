@@ -11,6 +11,8 @@ struct Timer {
   time_point_t tbeg, tend;
   elapsed_time_t elapsed_time;
 
+	bool is_paused{false};
+
   void start() {
 		elapsed_time = elapsed_time_t::zero();
 		tbeg = clock_t::now();
@@ -19,6 +21,17 @@ struct Timer {
   void stop() {
 		tend = clock_t::now();
 		elapsed_time = std::chrono::duration_cast<elapsed_time_t>(tend-tbeg);	
+	}
+
+	void pause() {
+		tend = clock_t::now();
+		elapsed_time += std::chrono::duration_cast<elapsed_time_t>(tend-tbeg);
+		is_paused = true;
+	}
+
+	void resume() {
+		tbeg = clock_t::now();
+		is_paused = false;
 	}
 
 	void reset() {
