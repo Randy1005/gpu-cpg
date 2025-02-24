@@ -24,7 +24,7 @@ int main(int argc, char* argv[]) {
   // cpu-sequential run to generate golden path slacks
   auto base_pd_method = gpucpg::PropDistMethod::BASIC;
   auto my_pd_method_bfs = gpucpg::PropDistMethod::BFS_TOP_DOWN; 
-  auto my_pd_method_bfs_priv = gpucpg::PropDistMethod::BFS_PRIVATIZED; 
+  auto my_pd_method_bfs_priv = gpucpg::PropDistMethod::BFS_TOP_DOWN_PRIVATIZED; 
   auto my_pd_method_bfs_priv_merged = gpucpg::PropDistMethod::BFS_PRIVATIZED_MERGED;
   auto pe_method = gpucpg::PfxtExpMethod::SHORT_LONG;
   

@@ -1752,11 +1752,12 @@ __global__ void pick_init_split(PfxtNode* short_pile, float* split,
 
 
 void CpGen::report_paths(
-    int k, 
-    int max_dev_lvls, 
-    bool enable_compress,
-    PropDistMethod pd_method,
-    PfxtExpMethod pe_method,
+    const int k, 
+    const int max_dev_lvls, 
+    const bool enable_compress,
+    const PropDistMethod pd_method,
+    const PfxtExpMethod pe_method,
+    const bool enable_runtime_log_file,
     const float init_split_perc,
     const float alpha) {
 
@@ -1767,8 +1768,8 @@ void CpGen::report_paths(
   cudaFuncSetCacheConfig(prop_distance_bfs_td_step_single_block, cudaFuncCachePreferShared);
 
 
-  const auto num_edges = _h_fanout_adjncy.size();
-  const auto num_verts = _h_fanin_adjp.size() - 1;
+  const auto num_edges{_h_fanout_adjncy.size()};
+  const auto num_verts{_h_fanin_adjp.size() - 1};
  
   // copy host out degrees to device
   // and initialize queue for bfs
@@ -1842,7 +1843,7 @@ void CpGen::report_paths(
       cudaMalloc(&_d_converged, sizeof(bool)),
       "_d_converged allocation failed.");
 
-  int iters{0};
+  int steps{0};
   // set the distance of the sink vertices to 0
   // and they are ready to be propagated
   for (const auto sink : _sinks) {
@@ -1880,7 +1881,7 @@ void CpGen::report_paths(
             cudaMemcpyDeviceToHost),
           "memcpy d_converged failed.");
 
-      iters++;
+      steps++;
     }
 
   } 
@@ -1907,19 +1908,33 @@ void CpGen::report_paths(
 
   } 
   else if (pd_method == PropDistMethod::BFS_HYBRID) {
-    bfs_hybrid
-      (alpha,
-       d_fanin_adjp, 
-       d_fanin_adjncy,
-       d_fanin_wgts,
-       d_fanout_adjp,
-       d_fanout_adjncy,
-       d_fanout_wgts,
-       d_dists_cache,
-       d_queue,
-       d_deps);
-  
-  } 
+    bfs_hybrid(
+      alpha,
+      d_fanin_adjp, 
+      d_fanin_adjncy,
+      d_fanin_wgts,
+      d_fanout_adjp,
+      d_fanout_adjncy,
+      d_fanout_wgts,
+      d_dists_cache,
+      d_queue,
+      d_deps,
+      enable_runtime_log_file);
+  }
+  else if (pd_method == PropDistMethod::BFS_HYBRID_TOP_DOWN_PRIVATIZED) {
+    bfs_hybrid_top_down_privatized(
+      alpha,
+      d_fanin_adjp, 
+      d_fanin_adjncy,
+      d_fanin_wgts,
+      d_fanout_adjp,
+      d_fanout_adjncy,
+      d_fanout_wgts,
+      d_dists_cache,
+      d_queue,
+      d_deps,
+      enable_runtime_log_file);
+  }
   else if (pd_method == PropDistMethod::CUDA_GRAPH) {
     cudaGraph_t cug;
     cudaGraphExec_t cug_exec;
@@ -2009,7 +2024,7 @@ void CpGen::report_paths(
   else if (pd_method == PropDistMethod::BFS_TOP_DOWN) {
     int qsize{static_cast<int>(_sinks.size())}; 
     Timer timer;
-    std::ofstream log("bfs_td.log");
+    std::ofstream log("bfs_td_step_rt.log");
     while (qsize > 0) {
       timer.start();
       prop_distance_bfs_td_step<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
@@ -2030,11 +2045,13 @@ void CpGen::report_paths(
         
       // update queue size
       qsize = _get_qsize();
-      iters++;
+      steps++;
+      
       timer.stop();
-      log << timer.get_elapsed_time() / 1us << '\n';
+      if (enable_runtime_log_file) {
+        log << timer.get_elapsed_time() / 1us << '\n';
+      }
     }
-    std::cout << "bfs_td executed " << iters << " steps.\n";
   }
   else if (pd_method == PropDistMethod::BFS_TOP_DOWN_NO_ATOMICMIN) {
     auto qsize{static_cast<int>(_sinks.size())};
@@ -2060,10 +2077,10 @@ void CpGen::report_paths(
       
       // update queue size
       qsize = _get_qsize();
-      iters++;
+      steps++;
     }
   }
-  else if (pd_method == PropDistMethod::BFS_PRIVATIZED) {
+  else if (pd_method == PropDistMethod::BFS_TOP_DOWN_PRIVATIZED) {
     // enqueue the sinks
     int qsize{static_cast<int>(_sinks.size())}; 
 
@@ -2087,7 +2104,7 @@ void CpGen::report_paths(
       
       // update queue size
       qsize = _get_qsize();
-      iters++;
+      steps++;
     }
   }
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
@@ -2165,7 +2182,7 @@ void CpGen::report_paths(
       
       // update queue size
       qsize = _get_qsize();
-      iters++;
+      steps++;
     }
   }
 
@@ -2226,7 +2243,7 @@ void CpGen::report_paths(
   auto d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
   auto d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
   
-  // initialize split
+  // initialize split value
   auto split = thrust::device_new<float>();
   thrust::fill(split, split+1, std::numeric_limits<float>::max());
   
@@ -3150,7 +3167,7 @@ void CpGen::bfs_hybrid_no_resize(
   int num_remaining_verts{N-num_sinks};
 
   Timer timer;
-  std::ofstream rtlog("bfs_hybrid.log");
+  std::ofstream rtlog("bfs_hybrid_step_rt.log");
   while (qsize*alpha < num_remaining_verts) {
     timer.start();
     prop_distance_bfs_td_step
@@ -3206,10 +3223,7 @@ void CpGen::bfs_hybrid_no_resize(
     rtlog << timer.get_elapsed_time() / 1us << '\n';
   }
 
-  std::cout << "bfs_hybrid executed " << steps << " steps.\n";
-
 }
-
 
 void CpGen::bfs_hybrid(
     const float alpha, 
@@ -3221,7 +3235,8 @@ void CpGen::bfs_hybrid(
     float* owgts,
     int* dists, 
     int* queue,
-    int* deps) {
+    int* deps,
+    const bool enable_runtime_log_file) {
 	const int M{static_cast<int>(num_edges())};
 	const int N{static_cast<int>(num_verts())};
 	const int num_sinks{static_cast<int>(_sinks.size())};
@@ -3230,7 +3245,7 @@ void CpGen::bfs_hybrid(
 	int num_remaining_verts{N};
 
 	Timer timer;
-	std::ofstream rtlog("bfs_hybrid.log");
+  std::ofstream rtlog("bfs_hybrid_step_rt.log");
 
 	while (qsize*alpha < num_remaining_verts) {
 		timer.start();
@@ -3252,10 +3267,10 @@ void CpGen::bfs_hybrid(
 		qsize = _get_qsize();
 		steps++;
 		timer.stop();
-		rtlog << timer.get_elapsed_time() / 1us << '\n';
+    if (enable_runtime_log_file) {
+      rtlog << timer.get_elapsed_time() / 1us << '\n';
+    }
 	}
-
-	std::cout << "switched to bottom-up @ step " << steps << ".\n";
 
 	// run bottom-up step
 	timer.start();	
@@ -3272,7 +3287,10 @@ void CpGen::bfs_hybrid(
           });
   
   timer.stop();
-  rtlog << timer.get_elapsed_time() / 1us << '\n';
+  
+  if (enable_runtime_log_file) {
+    rtlog << timer.get_elapsed_time() / 1us << '\n';
+  } 
 
 	while (num_remaining_verts > 0) {
     timer.start();
@@ -3300,7 +3318,9 @@ void CpGen::bfs_hybrid(
 		d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
     steps++;
 		timer.stop();
-		rtlog << timer.get_elapsed_time() / 1us << '\n';
+		if (enable_runtime_log_file) {
+      rtlog << timer.get_elapsed_time() / 1us << '\n';
+    }
 		//auto num_frontiers{prev_num_remaining_verts - num_remaining_verts};
 		
 		//if (num_frontiers < 0.008f*N) {
@@ -3360,7 +3380,107 @@ void CpGen::bfs_hybrid(
 	//}
   
   
-	std::cout << "bfs_hybrid executed " << steps << " steps.\n";
+	//std::cout << "bfs_hybrid executed " << steps << " steps.\n";
 }
+
+void CpGen::bfs_hybrid_top_down_privatized(
+    const float alpha, 
+    int* iverts,
+    int* iedges,
+    float* iwgts,
+    int* overts,
+    int* oedges,
+    float* owgts,
+    int* dists, 
+    int* queue,
+    int* deps,
+    const bool enable_runtime_log_file) {
+	const int M{static_cast<int>(num_edges())};
+	const int N{static_cast<int>(num_verts())};
+	const int num_sinks{static_cast<int>(_sinks.size())};
+
+	int qsize{num_sinks}, steps{0};
+	int num_remaining_verts{N};
+
+	Timer timer;
+  std::ofstream rtlog("bfs_hybrid_top_down_privatized_step_rt.log");
+
+	while (qsize*alpha < num_remaining_verts) {
+		timer.start();
+		prop_distance_bfs_td_step_privatized
+      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+				N,
+				M,
+				iverts,
+				iedges,
+				iwgts,
+				dists,
+				queue,
+				_d_qhead,
+				_d_qtail,
+				qsize,
+				deps);
+		inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+		num_remaining_verts -= qsize;
+		qsize = _get_qsize();
+		steps++;
+		timer.stop();
+    if (enable_runtime_log_file) {
+      rtlog << timer.get_elapsed_time() / 1us << '\n';
+    }
+	}
+
+	// run bottom-up step
+	timer.start();	
+	
+  thrust::device_vector<int> remaining_verts(num_remaining_verts);
+  auto d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+
+  // move untouched vertices to remaining_verts array
+  thrust::copy_if(thrust::make_counting_iterator(0), 
+          thrust::make_counting_iterator(N),
+          remaining_verts.begin(),
+          [deps] __device__ (const int v) {
+            return deps[v] > 0;
+          });
+  
+  timer.stop();
+  
+  if (enable_runtime_log_file) {
+    rtlog << timer.get_elapsed_time() / 1us << '\n';
+  } 
+
+	while (num_remaining_verts > 0) {
+    timer.start();
+		prop_distance_bfs_bu_step
+      <<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
+				N,
+				M,
+				overts,
+				oedges,
+				owgts,
+				dists,
+				d_remaining_verts,
+				num_remaining_verts,
+				deps);
+    
+    num_remaining_verts = thrust::remove_if(
+      remaining_verts.begin(), remaining_verts.end(),
+      [deps] __device__ (const int v) {
+        return deps[v] == 0;
+      }
+    ) - remaining_verts.begin();
+		
+		remaining_verts.resize(num_remaining_verts);
+		d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+    steps++;
+		timer.stop();
+		if (enable_runtime_log_file) {
+      rtlog << timer.get_elapsed_time() / 1us << '\n';
+    }
+	}
+	  
+}
+
 
 } // namespace gpucpg

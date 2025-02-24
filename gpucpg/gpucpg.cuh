@@ -24,10 +24,11 @@ enum class PropDistMethod {
   LEVELIZED_SHAREDMEM,
   BFS_TOP_DOWN,
   BFS_TOP_DOWN_NO_ATOMICMIN,
-  BFS_PRIVATIZED,
+  BFS_TOP_DOWN_PRIVATIZED,
   BFS_PRIVATIZED_MERGED,
   BFS_PRIVATIZED_PRECOMP_SPURS,
-  BFS_HYBRID
+  BFS_HYBRID,
+  BFS_HYBRID_TOP_DOWN_PRIVATIZED
 };
 
 enum class PfxtExpMethod {
@@ -96,7 +97,22 @@ public:
     float* owgts,
     int* dists,
     int* queue,
-    int* deps
+    int* deps,
+    const bool enable_runtime_log_file
+  );
+
+  void bfs_hybrid_top_down_privatized(
+    const float alpha,
+    int* ivs,
+    int* ies,
+    float* iwgts,
+    int* ovs,
+    int* oes,
+    float* owgts,
+    int* dists,
+    int* queue,
+    int* deps,
+    const bool enable_runtime_log_file
   );
 
   void bfs_hybrid_no_resize(
@@ -112,16 +128,16 @@ public:
     int* deps
   );
 
-
-
   void report_paths(
-    int k, 
-    int max_dev_lvls, 
-    bool enable_compress, 
-    PropDistMethod pd_method,
-    PfxtExpMethod pe_method,
-    float init_split_perc = 0.005f,
-    const float alpha = 10.0f);
+    const int k, 
+    const int max_dev_lvls, 
+    const bool enable_compress, 
+    const PropDistMethod pd_method,
+    const PfxtExpMethod pe_method,
+    const bool enable_runtime_log_file = false,
+    const float init_split_perc = 0.005f,
+    const float alpha = 15.0f);
+
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
 
