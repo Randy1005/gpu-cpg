@@ -36,21 +36,23 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CXX_FLAGS} -Wall --extended-lambda")
 # set compilation flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_CUDA_FLAGS_DEBUG "-g -G")
-if(NOT CMAKE_BUILD_TYPE)
-  message(STATUS "Setting build type to Release ")
-  set(
-    CMAKE_BUILD_TYPE Release
-    CACHE
-    STRING "Choose the type of build."
-    FORCE
-  )
-  # Set the possible values of build type for cmake-gui
-  set_property(
-    CACHE
-    CMAKE_BUILD_TYPE
-    PROPERTY STRINGS
-    "Debug" "Release" "MinSizeRel" "RelWithDebInfo"
-  )
+if(NOT EXISTS ${CMAKE_BINARY_DIR}/CMakeCache.txt)
+  if (NOT CMAKE_BUILD_TYPE)
+    message(STATUS "Setting build type to Release ")
+    set(
+      CMAKE_BUILD_TYPE Release
+      CACHE
+      STRING "Choose the type of build."
+      FORCE
+    )
+    # Set the possible values of build type for cmake-gui
+    set_property(
+      CACHE
+      CMAKE_BUILD_TYPE
+      PROPERTY STRINGS
+      "Debug" "Release" "MinSizeRel" "RelWithDebInfo"
+    )
+  endif()
 endif()
 
 set(CMAKE_VERBOSE_MAKEFILE ON)
