@@ -19,19 +19,10 @@ int main(int argc, char* argv[]) {
 
   std::cout << "num_verts=" << cpgen.num_verts() << '\n';
   std::cout << "num_edges=" << cpgen.num_edges() << '\n';
-  cpgen.report_paths(num_paths, max_dev_lvls, enable_compress,
-      gpucpg::PropDistMethod::BFS_BOTTOM_UP, pe_method);
-  cpgen_ref.report_paths(num_paths, max_dev_lvls, enable_compress,
-      gpucpg::PropDistMethod::BFS, pe_method);
   
-
-  auto slks = cpgen.get_slacks(num_paths);
-  auto slks_ref = cpgen_ref.get_slacks(num_paths);
-
-  std::cout << "BFS: k-th slack=" << slks_ref.back() << "\n";
-  std::cout << "DP runtime=" << cpgen_ref.prop_time / 1ms << " ms.\n";
-  std::cout << "BFS_BOTTOM_UP: k-th slack=" << slks.back() << "\n";
-  std::cout << "DP runtime=" << cpgen.prop_time / 1ms << " ms.\n";
-
+  
+  // TODO: compare TD step and BU step
+  
+  
   return 0;
 }

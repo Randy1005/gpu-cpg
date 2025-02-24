@@ -29,7 +29,7 @@ struct Timer {
 		is_paused = true;
 	}
 
-	void resume() {
+	void restart() {
 		tbeg = clock_t::now();
 		is_paused = false;
 	}

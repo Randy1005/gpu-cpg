@@ -2,6 +2,7 @@
 #include <thrust/scan.h>
 #include <thrust/sort.h>
 #include <thrust/device_new.h>
+#include <thrust/device_delete.h>
 #include <thrust/reduce.h>
 #include <thrust/count.h>
 #include <thrust/execution_policy.h>
@@ -57,6 +58,7 @@ struct printf_functor {
   }
 };
 
+
 template <typename Iterator>
 void print_range(const std::string& name, Iterator first, Iterator last) {
   std::cout << name << ": ";
@@ -70,6 +72,7 @@ void print_range_pfxt(const std::string& name, Iterator first, Iterator last) {
   thrust::for_each(thrust::device, first, last, printf_functor_pfxtnode());
   std::cout << '\n';
 }
+
 
 void checkError_t(cudaError_t error, std::string msg) {
   if (error != cudaSuccess) {
@@ -618,7 +621,7 @@ __global__ void prop_distance_bfs(
     int qsize,
     int* deps) {
 
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (tid >= qsize) {
     return;
   }
@@ -630,8 +633,8 @@ __global__ void prop_distance_bfs(
   
   for (int eid = edge_start; eid < edge_end; eid++) {
     const auto neighbor = edges[eid];
-    int wgt = wgts[eid] * SCALE_UP;
-    int new_distance = distances_cache[vid] + wgt;
+    const int wgt = wgts[eid] * SCALE_UP;
+    const auto new_distance = distances_cache[vid] + wgt;
     atomicMin(&distances_cache[neighbor], new_distance);
    
     // decrement the dependency counter for this neighbor
@@ -685,78 +688,68 @@ __global__ void prop_distance_bfs_td(
   }
 } 
 
-__global__ void prop_distance_bfs_td(
-    int num_verts, 
-    int num_edges,
-    int* ivs,
-    int* ies,
-    float* iwgts,
-    int* ovs,
-    int* oes,
-    int* distances_cache,
-    int* queue,
-    int* qhead,
-    int* qtail,
-    int qsize,
-    int* deps,
-    bool* touched,
-    int* mf,
-    int* mu) {
 
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (tid >= qsize) {
-    return;
-  }
+__global__ void prop_distance_bfs_td_step(
+  int num_verts,
+  int num_edges,
+  int* ivs,
+  int* ies,
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* distances,
+  int* queue,
+  int* qhead,
+  int* qtail,
+  int qsize,
+  int* deps) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid < qsize) {
+    // get a frontier from the queue
+    const auto v = queue[*qhead+tid];
+    
+    const auto oe_beg = ovs[v];
+    const auto oe_end = (v == num_verts-1) ? num_edges : ovs[v+1];
+    const auto odeg{oe_end-oe_beg};
+    // run relaxation first
+    if (odeg > 0) {
+      int min_dist{::cuda::std::numeric_limits<int>::max()};
+      for (auto e = oe_beg; e < oe_end; e++) {
+        const auto o_neighbor = oes[e];
+        const int wgt = owgts[e] * SCALE_UP;
+        min_dist = min(min_dist, distances[o_neighbor]+wgt);
+      }
 
-  // process a vertex from the queue
-  const auto vid = queue[*qhead+tid];
-  const auto edge_start = ivs[vid];
-  const auto edge_end = (vid == num_verts-1) ? num_edges : ivs[vid+1]; 
-  
-  for (int eid = edge_start; eid < edge_end; eid++) {
-    const auto neighbor = ies[eid];
-    int wgt = iwgts[eid] * SCALE_UP;
-    int new_distance = distances_cache[vid] + wgt;
-    atomicMin(&distances_cache[neighbor], new_distance);
-   
-    // decrement the dependency counter for this neighbor
-    if (atomicSub(&deps[neighbor], 1) == 1) {
-      // if this thread releases the last dependency
-      // it should add this neighbor to the queue
-      enqueue(neighbor, queue, qtail);
-
-      // mark this neighbor as touched
-      touched[neighbor] = true;
-
-      const auto ie_beg = ivs[neighbor];
-      const auto ie_end = (neighbor == num_verts-1) ? num_edges
-        : ivs[neighbor+1];
-      const auto ideg = ie_end-ie_beg;
-      const auto oe_beg = ovs[neighbor];
-      const auto oe_end = (neighbor == num_verts-1) ? num_edges
-        : ovs[neighbor+1];
-      const auto odeg = oe_end-oe_beg;
-      atomicAdd(mf, ideg);
-      atomicAdd(mu, -odeg);
+      // update the distance of v
+      distances[v] = min_dist;
     }
+    // now visit v's fanins to update their dependency counters
+    const auto ie_beg = ivs[v];
+    const auto ie_end = (v == num_verts-1) ? num_edges : ivs[v+1];
+    for (auto e = ie_beg; e < ie_end; e++) {
+      const auto i_neighbor = ies[e];
+      // decrement the dependency counter for this neighbor
+      if (atomicSub(&deps[i_neighbor], 1) == 1) {
+        // if this thread releases the last dependency
+        // it should add this neighbor to the queue
+        enqueue(i_neighbor, queue, qtail);
+      }
+    }
+  
   }
-} 
+}
 
-
-__global__ void prop_distance_bfs_bu(
+__global__ void prop_distance_bfs_bu_step(
     int num_verts, 
     int num_edges,
     int* overts,
     int* oedges,
     float* owgts,
     int* distances_cache,
-    int* untouched_verts,
-    int num_untouched,
-    bool* touched) {
+    int* deps) {
     
-  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (gid < num_untouched) {
-    const auto v = untouched_verts[gid];
+  int v = threadIdx.x + blockIdx.x * blockDim.x;  
+  if (v < num_verts && deps[v] > 0) {
     const auto edge_beg = overts[v];
     const auto edge_end = (v == num_verts-1) ? num_edges : overts[v+1]; 
     
@@ -764,7 +757,7 @@ __global__ void prop_distance_bfs_bu(
 		for (auto eid = edge_beg; eid < edge_end; eid++) {
       // in the bottom-up step, we let v find its parent
       const auto neighbor = oedges[eid];
-      if (touched[neighbor]) {
+      if (deps[neighbor] == 0) {
         // this is a valid parent for v  
         int wgt = owgts[eid] * SCALE_UP;
 				min_dist = min(min_dist, distances_cache[neighbor]+wgt);
@@ -774,13 +767,14 @@ __global__ void prop_distance_bfs_bu(
 			}
     }
 
-    touched[v] = true;
+    deps[v] = 0;
 		distances_cache[v] = min_dist;
 	}
 
 }
 
-__global__ void prop_distance_bfs_bu_get_frontiers(
+
+__global__ void prop_distance_bfs_bu_step(
     int num_verts, 
     int num_edges,
     int* overts,
@@ -789,11 +783,51 @@ __global__ void prop_distance_bfs_bu_get_frontiers(
     int* distances_cache,
     int* untouched_verts,
     int num_untouched,
-		int* queue,
-		int* qtail,
-		bool* touched) {
+    int* deps) {
     
   int gid = threadIdx.x + blockIdx.x * blockDim.x;  
+  if (gid < num_untouched) {
+    const auto v = untouched_verts[gid];
+    const auto edge_beg = overts[v];
+    const auto edge_end = (v == num_verts-1) ? num_edges : overts[v+1]; 
+    
+		for (auto eid = edge_beg; eid < edge_end; eid++) {
+      // in the bottom-up step, we let v find its parent
+      const auto neighbor = oedges[eid];
+      if (deps[neighbor] > 0) {
+        return;
+      }
+    }
+
+		auto min_dist{::cuda::std::numeric_limits<int>::max()};
+    for (auto eid = edge_beg; eid < edge_end; eid++) {
+      const auto neighbor = oedges[eid];
+      const int wgt = owgts[eid] * SCALE_UP;
+      int new_dist = distances_cache[neohbor] eid wgt;
+      min_dist = min(min_dist, new_dist); 
+    }
+
+		  distances_cache[v] = min_dist;
+    deps[v] = 0;
+	}
+
+}
+  
+__globauto eidvoiedge_beg; eidop_ance_end; eidu_get_  frontiers(
+    int num_vero, 
+   eidint   num_edges,
+    int*overtseid
+    int* oedg  es,
+    float* owgts,
+    int* distances_cache,
+      int* untouched_verts,
+    int num_untouch  ed,
+	  	int* queue,
+		int* qtail,
+		bool  * touched) {
+  	
+ 
+ int gid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (gid < num_untouched) {
     const auto v = untouched_verts[gid];
     const auto edge_beg = overts[v];
@@ -818,9 +852,6 @@ __global__ void prop_distance_bfs_bu_get_frontiers(
 	}
 
 }
-
-
-
 
 
 
@@ -1960,6 +1991,18 @@ void CpGen::report_paths(
 
   } 
   else if (pd_method == PropDistMethod::BFS_HYBRID) {
+    //bfs_adaptive
+    //  (alpha,
+    //   d_fanin_adjp, 
+    //   d_fanin_adjncy,
+    //   d_fanin_wgts,
+    //   d_fanout_adjp,
+    //   d_fanout_adjncy,
+    //   d_fanout_wgts,
+    //   d_dists_cache,
+    //   d_queue,
+    //   d_deps,
+    //   d_touched);
     bfs_adaptive
       (alpha,
        d_fanin_adjp, 
@@ -1970,8 +2013,8 @@ void CpGen::report_paths(
        d_fanout_wgts,
        d_dists_cache,
        d_queue,
-       d_deps,
-       d_touched);
+       d_deps);
+  
   } 
   else if (pd_method == PropDistMethod::CUDA_GRAPH) {
     cudaGraph_t cug;
@@ -2059,9 +2102,12 @@ void CpGen::report_paths(
 
     checkError_t(cudaGraphDestroy(cug), "destroy cuGraph failed.");
   }
-  else if (pd_method == PropDistMethod::BFS) {
+  else if (pd_method == PropDistMethod::BFS_TOP_DOWN) {
     int qsize{static_cast<int>(_sinks.size())}; 
+    Timer timer;
+    std::ofstream log("bfs_td.log");
     while (qsize > 0) {
+      timer.start();
       prop_distance_bfs<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
         (num_verts,
          num_edges,
@@ -2078,6 +2124,36 @@ void CpGen::report_paths(
       // update queue head once here
       inc_kernel<<<1, 1>>>(_d_qhead, qsize);
         
+      // update queue size
+      qsize = _get_qsize();
+      iters++;
+      timer.stop();
+      log << timer.get_elapsed_time() / 1us << '\n';
+    }
+    std::cout << "bfs_td executed " << iters << " steps.\n";
+  }
+  else if (pd_method == PropDistMethod::BFS_TOP_DOWN_NO_ATOMICMIN) {
+    auto qsize{static_cast<int>(_sinks.size())};
+    while (qsize > 0) {
+      prop_distance_bfs_td_step
+        <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+        (num_verts,
+         num_edges,
+         d_fanin_adjp,
+         d_fanin_adjncy,
+         d_fanout_adjp,
+         d_fanout_adjncy,
+         d_fanout_wgts,
+         d_dists_cache,
+         d_queue,
+         _d_qhead,
+         _d_qtail,
+         qsize,
+         d_deps);
+      
+      // update queue head once here
+      inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+      
       // update queue size
       qsize = _get_qsize();
       iters++;
@@ -3110,7 +3186,7 @@ int CpGen::_get_expansion_window_size(int* p_start, int* p_end) {
 
 __global__ void get_remaining_verts(
 	int num_verts, 
-	bool* touched, 
+	int* deps, 
 	int* remaining_verts,
 	int* tail) {
 	int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -3124,7 +3200,7 @@ __global__ void get_remaining_verts(
 	__syncthreads();
 	
 	if (tid < num_verts) {
-		if (!touched[tid]) {
+		if (deps[tid] > 0) {
 			const int idx = atomicAdd(&s_tail, 1);
 			s_remaining_verts[idx] = tid;
 		}
@@ -3147,6 +3223,87 @@ __global__ void get_remaining_verts(
 
 }
 
+
+void CpGen::bfs_adaptive_no_resize(
+  const float alpha,
+  int* ivs,
+  int* ies,
+  float* iwgts,
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* dists,
+  int* queue,
+  int* deps) {
+  const int M{static_cast<int>(num_edges())};
+  const int N{static_cast<int>(num_verts())};
+  const int num_sinks{static_cast<int>(_sinks.size())};
+
+  int qsize{num_sinks}, steps{0};
+  int num_remaining_verts{N-num_sinks};
+
+  Timer timer;
+  std::ofstream rtlog("bfs_hybrid.log");
+  while (qsize*alpha < num_remaining_verts) {
+    timer.start();
+    prop_distance_bfs
+      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+        N,
+        M,
+        ivs,
+        ies,
+        iwgts,
+        dists,
+        queue,
+        _d_qhead,
+        _d_qtail,
+        qsize,
+        deps);
+    inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+    qsize = _get_qsize();
+    num_remaining_verts -= qsize;
+    steps++;
+    timer.stop();
+    rtlog << timer.get_elapsed_time() / 1us << '\n';
+  }
+
+  std::cout << "switched to top-down @ step " << steps << ".\n";
+
+  // move queue head to the end of the queue
+  // so we can start the bottom-up step
+  inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+
+
+  while (num_remaining_verts > 0) {
+    timer.start();
+
+    prop_distance_bfs_bu_step
+      <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+        N,
+        M,
+        ovs,
+        oes,
+        owgts,
+        dists,
+        deps);
+
+    num_remaining_verts = 
+      thrust::count_if(thrust::device, deps, deps+N,
+          [deps] __host__ __device__ (int d) {
+            return d > 0;
+          }
+      );
+
+    steps++;
+    timer.stop();
+    rtlog << timer.get_elapsed_time() / 1us << '\n';
+  }
+
+  std::cout << "bfs_adaptive executed " << steps << " steps.\n";
+
+}
+
+
 void CpGen::bfs_adaptive(
     const float alpha, 
     int* iverts,
@@ -3157,135 +3314,21 @@ void CpGen::bfs_adaptive(
     float* owgts,
     int* dists, 
     int* queue,
-    int* deps,
-    bool* touched) {
+    int* deps) {
 	const int M{static_cast<int>(num_edges())};
 	const int N{static_cast<int>(num_verts())};
 	const int num_sinks{static_cast<int>(_sinks.size())};
 
 	int qsize{num_sinks}, steps{0};
-	int num_remaining_verts{N-num_sinks};
+	int num_remaining_verts{N};
 
 	Timer timer;
 	std::ofstream rtlog("bfs_hybrid.log");
 
 	while (qsize*alpha < num_remaining_verts) {
 		timer.start();
-		prop_distance_bfs_td<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
-				N,
-				M,
-				iverts,
-				iedges,
-				iwgts,
-				dists,
-				queue,
-				_d_qhead,
-				_d_qtail,
-				qsize,
-				deps,
-				touched);
-		inc_kernel<<<1, 1>>>(_d_qhead, qsize);
-		qsize = _get_qsize();
-		num_remaining_verts -= qsize;
-		steps++;
-		timer.stop();
-		rtlog << timer.get_elapsed_time() / 1us << '\n';
-	}
-
-	std::cout << "switched to top-down @ step " << steps << ".\n";
-
-	// move queue head to the end of the queue
-	// so we can start the bottom-up step
-	inc_kernel<<<1, 1>>>(_d_qhead, qsize);
-	
-	// run bottom-up step
-	timer.start();	
-	thrust::device_vector<int> remaining_verts(num_remaining_verts);
-	auto d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
-	auto tail = thrust::device_new<int>();
-	thrust::fill(thrust::device, tail, tail+1, 0);
-	
-	get_remaining_verts<<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
-			N,
-			touched,
-			d_remaining_verts,
-			tail.get());
-	timer.stop();
-	rtlog << timer.get_elapsed_time() / 1us << '\n';
-
-	while (num_remaining_verts > 0) {
-		timer.start();
-		const auto prev_num_remaining_verts{num_remaining_verts};
-		prop_distance_bfs_bu<<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
-				N,
-				M,
-				overts,
-				oedges,
-				owgts,
-				dists,
-				d_remaining_verts,
-				num_remaining_verts,
-				touched);
-
-		num_remaining_verts = 
-			thrust::count_if(remaining_verts.begin(), remaining_verts.end(),
-					[touched] __host__ __device__ (int v) {
-					return !touched[v];
-					}
-			);
-
-		thrust::remove_if(remaining_verts.begin(), remaining_verts.end(),
-				[touched] __host__ __device__ (int v) {
-				return touched[v];
-				}
-		);
-		
-		remaining_verts.resize(num_remaining_verts);
-		d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
-		steps++;
-
-		timer.stop();
-		rtlog << timer.get_elapsed_time() / 1us << '\n';
-		auto num_frontiers{prev_num_remaining_verts - num_remaining_verts};
-		
-		if (num_frontiers < 0.008f*N) {
-			qsize = _get_qsize();
-			assert(qsize == 0);	
-			timer.start();	
-			prop_distance_bfs_bu_get_frontiers
-				<<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
-					N,
-					M,
-					overts,
-					oedges,
-					owgts,
-					dists,
-					d_remaining_verts,
-					num_remaining_verts,
-					queue,
-					_d_qtail,
-					touched);
-		
-			timer.stop();
-			rtlog << timer.get_elapsed_time() / 1us << '\n';
-			break;
-		}
-		
-	}
-
-	std::cout << "switched to top-down @ step " << steps << ".\n";
-	qsize = _get_qsize();
-	
-	// run the final top-down steps
-	while (qsize > 0) {
-		if (timer.is_paused) {
-			timer.resume();
-		}
-		else{
-			timer.start();
-		}
 		prop_distance_bfs
-			<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
 				N,
 				M,
 				iverts,
@@ -3298,13 +3341,121 @@ void CpGen::bfs_adaptive(
 				qsize,
 				deps);
 		inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+		num_remaining_verts -= qsize;
 		qsize = _get_qsize();
 		steps++;
-
 		timer.stop();
 		rtlog << timer.get_elapsed_time() / 1us << '\n';
 	}
+
+	std::cout << "switched to bottom-up @ step " << steps << ".\n";
+
+	// run bottom-up step
+	timer.start();	
 	
+  thrust::device_vector<int> remaining_verts(num_remaining_verts);
+  auto d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+
+  // move untouched vertices to remaining_verts array
+  thrust::copy_if(thrust::make_counting_iterator(0), 
+          thrust::make_counting_iterator(N),
+          remaining_verts.begin(),
+          [deps] __device__ (const int v) {
+            return deps[v] > 0;
+          });
+
+  d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+  
+  timer.stop();
+  rtlog << timer.get_elapsed_time() / 1us << '\n';
+  std::cout << "transition took " << timer.get_elapsed_time() / 1us << " us.\n"; 
+
+	while (num_remaining_verts > 0) {
+    timer.start();
+		//const auto prev_num_remaining_verts{num_remaining_verts};
+		prop_distance_bfs_bu_step
+      <<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
+				N,
+				M,
+				overts,
+				oedges,
+				owgts,
+				dists,
+				d_remaining_verts,
+				num_remaining_verts,
+				deps);
+    
+    num_remaining_verts = thrust::remove_if(
+      remaining_verts.begin(), remaining_verts.end(),
+      [deps] __device__ (const int v) {
+        return deps[v] == 0;
+      }
+    ) - remaining_verts.begin();
+		
+		remaining_verts.resize(num_remaining_verts);
+		d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+    steps++;
+		timer.stop();
+		rtlog << timer.get_elapsed_time() / 1us << '\n';
+		//auto num_frontiers{prev_num_remaining_verts - num_remaining_verts};
+		
+		//if (num_frontiers < 0.008f*N) {
+		//	qsize = _get_qsize();
+		//	assert(qsize == 0);	
+		//	timer.start();	
+		//	prop_distance_bfs_bu_get_frontiers
+		//		<<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
+		//			N,
+		//			M,
+		//			overts,
+		//			oedges,
+		//			owgts,
+		//			dists,
+		//			d_remaining_verts,
+		//			num_remaining_verts,
+		//			queue,
+		//			_d_qtail,
+		//			touched);
+		//
+		//	timer.stop();
+		//	rtlog << timer.get_elapsed_time() / 1us << '\n';
+		//	break;
+		//}
+		
+	}
+
+	//std::cout << "switched to top-down @ step " << steps << ".\n";
+	//qsize = _get_qsize();
+	//
+	//while (qsize > 0) {
+	//	if (timer.is_paused) {
+	//		timer.resume();
+	//	}
+	//	else{
+	//		timer.start();
+	//	}
+	//	prop_distance_bfs
+	//		<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+	//			N,
+	//			M,
+	//			iverts,
+	//			iedges,
+	//			iwgts,
+	//			dists,
+	//			queue,
+	//			_d_qhead,
+	//			_d_qtail,
+	//			qsize,
+	//			deps);
+	//	inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+	//	qsize = _get_qsize();
+	//	steps++;
+
+	//	timer.stop();
+	//	rtlog << timer.get_elapsed_time() / 1us << '\n';
+	//}
+  
+  
 	std::cout << "bfs_adaptive executed " << steps << " steps.\n";
 }
 

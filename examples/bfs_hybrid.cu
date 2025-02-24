@@ -20,18 +20,28 @@ int main(int argc, char* argv[]) {
 
   std::cout << "num_verts=" << cpgen.num_verts() << '\n';
   std::cout << "num_edges=" << cpgen.num_edges() << '\n';
-  cpgen.report_paths(num_paths, max_dev_lvls, enable_compress,
-      gpucpg::PropDistMethod::BFS_HYBRID, pe_method, 0.005f, alpha);
   cpgen_ref.report_paths(num_paths, max_dev_lvls, enable_compress,
-      gpucpg::PropDistMethod::BFS, pe_method);
+      gpucpg::PropDistMethod::BFS_TOP_DOWN, pe_method);
+  cpgen.report_paths(num_paths, max_dev_lvls, enable_compress,
+      gpucpg::PropDistMethod::BFS_HYBRID, pe_method);
   
 
   auto slks = cpgen.get_slacks(num_paths);
   auto slks_ref = cpgen_ref.get_slacks(num_paths);
 
-  std::cout << "BFS: k-th slack=" << slks_ref.back() << "\n";
+  //std::ofstream slk_file_td("slk-td.txt");
+  //std::ofstream slk_file_hy("slk-hy.txt");
+  //for (auto slk : slks_ref) {
+  //  slk_file_td << slk << '\n';
+  //}
+  //for (auto slk : slks) {
+  //  slk_file_hy << slk << '\n';
+  //}
+
+
+  std::cout << "BFS_TOP_DOWN: k-th slack=" << slks_ref.back() << "\n";
   std::cout << "DP runtime=" << cpgen_ref.prop_time / 1ms << " ms.\n";
-  std::cout << "BFS_ADAPTIVE: k-th slack=" << slks.back() << "\n";
+  std::cout << "BFS_HYBRID: k-th slack=" << slks.back() << "\n";
   std::cout << "DP runtime=" << cpgen.prop_time / 1ms << " ms.\n";
 
   return 0;

@@ -22,7 +22,8 @@ enum class PropDistMethod {
   CUDA_GRAPH,
   LEVELIZED,
   LEVELIZED_SHAREDMEM,
-  BFS,
+  BFS_TOP_DOWN,
+  BFS_TOP_DOWN_NO_ATOMICMIN,
   BFS_PRIVATIZED,
   BFS_PRIVATIZED_MERGED,
   BFS_PRIVATIZED_PRECOMP_SPURS,
@@ -100,6 +101,34 @@ public:
     int* deps,
     bool* touched
   );
+
+  void bfs_adaptive(
+    const float alpha,
+    int* ivs,
+    int* ies,
+    float* iwgts,
+    int* ovs,
+    int* oes,
+    float* owgts,
+    int* dists,
+    int* queue,
+    int* deps
+  );
+
+  void bfs_adaptive_no_resize(
+    const float alpha,
+    int* ivs,
+    int* ies,
+    float* iwgts,
+    int* ovs,
+    int* oes,
+    float* owgts,
+    int* dists,
+    int* queue,
+    int* deps
+  );
+
+
 
   void report_paths(
     int k, 
