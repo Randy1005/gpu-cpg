@@ -26,9 +26,11 @@ int main(int argc, char* argv[]) {
   auto my_slacks = cpgen.get_slacks(num_paths);
 
   std::cout << "golden k-th slack=" << seq_slacks.back() << '\n';
-  std::cout << "sequential PE runtime=" << cpgen_sequential.expand_time/ 1us <<
-    " us.\n";
+  std::cout << "BFS_PRIVATIZED DP runtime=" << cpgen_sequential.prop_time / 1ms <<
+    " ms.\n";
+  std::cout << "sequential PE runtime=" << cpgen_sequential.expand_time/ 1ms <<
+    " ms.\n";
   std::cout << "my k-th slack=" << my_slacks.back() << '\n';
-  std::cout << "my PE runtime=" << cpgen.expand_time / 1us << " us.\n";
+  std::cout << "my PE runtime=" << cpgen.expand_time / 1ms << " ms.\n";
   return 0;
 }

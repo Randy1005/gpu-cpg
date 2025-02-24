@@ -8,7 +8,7 @@ int main(int argc, char* argv[]) {
 
   std::string benchmark = argv[1];
   auto alpha = std::stof(argv[2]);
-  int num_paths{100000};
+  int num_paths{1000};
   int max_dev_lvls{5};
   bool enable_compress{true};
   auto pe_method = gpucpg::PfxtExpMethod::SEQUENTIAL;
@@ -28,16 +28,6 @@ int main(int argc, char* argv[]) {
 
   auto slks = cpgen.get_slacks(num_paths);
   auto slks_ref = cpgen_ref.get_slacks(num_paths);
-
-  //std::ofstream slk_file_td("slk-td.txt");
-  //std::ofstream slk_file_hy("slk-hy.txt");
-  //for (auto slk : slks_ref) {
-  //  slk_file_td << slk << '\n';
-  //}
-  //for (auto slk : slks) {
-  //  slk_file_hy << slk << '\n';
-  //}
-
 
   std::cout << "BFS_TOP_DOWN: k-th slack=" << slks_ref.back() << "\n";
   std::cout << "DP runtime=" << cpgen_ref.prop_time / 1ms << " ms.\n";

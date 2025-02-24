@@ -13,13 +13,12 @@
 namespace cg = cooperative_groups;
 
 #define MAX_INTS_ON_SMEM 12288
-#define BLOCKSIZE 1024 
+#define BLOCKSIZE 512
 #define WARPS_PER_BLOCK 32
 #define WARP_SIZE 32
-#define S_FRONTIER_CAPACITY 1024*6 
+#define S_FRONTIER_CAPACITY 4096 
 #define W_FRONTIER_CAPACITY 64
-#define S_PFXT_CAPACITY 2000 // NOTE: somehow the expand kernel doesn't even
-                             // run with 2048, is it due to not enough smem?  
+#define S_PFXT_CAPACITY 1024 
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -603,7 +602,7 @@ __global__ void set_kernel(int* val, int n) {
   }
 }
 
-__global__ void prop_distance_bfs(
+__global__ void prop_distance_bfs_td_step(
     int num_verts, 
     int num_edges,
     int* verts,
@@ -641,47 +640,6 @@ __global__ void prop_distance_bfs(
   }
 } 
 
-__global__ void prop_distance_bfs_td(
-    int num_verts, 
-    int num_edges,
-    int* verts,
-    int* edges,
-    float* wgts,
-    int* distances_cache,
-    int* queue,
-    int* qhead,
-    int* qtail,
-    int qsize,
-    int* deps,
-    bool* touched) {
-
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (tid >= qsize) {
-    return;
-  }
-
-  // process a vertex from the queue
-  const auto vid = queue[*qhead+tid];
-  const auto edge_start = verts[vid];
-  const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
-  
-  for (int eid = edge_start; eid < edge_end; eid++) {
-    const auto neighbor = edges[eid];
-    int wgt = wgts[eid] * SCALE_UP;
-    int new_distance = distances_cache[vid] + wgt;
-    atomicMin(&distances_cache[neighbor], new_distance);
-   
-    // decrement the dependency counter for this neighbor
-    if (atomicSub(&deps[neighbor], 1) == 1) {
-      // if this thread releases the last dependency
-      // it should add this neighbor to the queue
-      enqueue(neighbor, queue, qtail);
-
-      // mark this neighbor as touched
-      touched[neighbor] = true;
-    }
-  }
-} 
 
 
 __global__ void prop_distance_bfs_td_step_no_atomic_min(
@@ -734,7 +692,7 @@ __global__ void prop_distance_bfs_td_step_no_atomic_min(
   }
 }
 
-__global__ void prop_distance_bfs_bu_step(
+__global__ void prop_distance_bfs_bu_step_no_resize(
     int num_verts, 
     int num_edges,
     int* overts,
@@ -808,7 +766,7 @@ __global__ void prop_distance_bfs_bu_step(
 }
 
 
-__global__ void prop_distance_bfs_single_block(
+__global__ void prop_distance_bfs_td_step_single_block(
     int num_verts, 
     int num_edges,
     int* verts,
@@ -900,7 +858,7 @@ __global__ void prop_distance_bfs_single_block(
   } 
 }
 
-__global__ void prop_distance_bfs_privatized(
+__global__ void prop_distance_bfs_td_step_privatized(
     int num_verts, 
     int num_edges,
     int* verts,
@@ -1802,6 +1760,13 @@ void CpGen::report_paths(
     const float init_split_perc,
     const float alpha) {
 
+  // set cache configuration
+  cudaFuncSetCacheConfig(prop_distance_bfs_td_step, cudaFuncCachePreferL1);
+  cudaFuncSetCacheConfig(prop_distance_bfs_bu_step, cudaFuncCachePreferL1);
+  cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
+  cudaFuncSetCacheConfig(prop_distance_bfs_td_step_single_block, cudaFuncCachePreferShared);
+
+
   const auto num_edges = _h_fanout_adjncy.size();
   const auto num_verts = _h_fanin_adjp.size() - 1;
  
@@ -2047,7 +2012,7 @@ void CpGen::report_paths(
     std::ofstream log("bfs_td.log");
     while (qsize > 0) {
       timer.start();
-      prop_distance_bfs<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+      prop_distance_bfs_td_step<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
         (num_verts,
          num_edges,
          d_fanin_adjp,
@@ -2103,7 +2068,7 @@ void CpGen::report_paths(
     int qsize{static_cast<int>(_sinks.size())}; 
 
     while (qsize > 0) {
-      prop_distance_bfs_privatized
+      prop_distance_bfs_td_step_privatized
         <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
         (num_verts,
          num_edges,
@@ -2136,7 +2101,7 @@ void CpGen::report_paths(
       }
 
       if (qsize < BLOCKSIZE) {
-        prop_distance_bfs_single_block
+        prop_distance_bfs_td_step_single_block
         <<<1, BLOCKSIZE>>>
         (num_verts,
          num_edges,
@@ -2151,7 +2116,7 @@ void CpGen::report_paths(
          BLOCKSIZE);
       }
       else {
-        prop_distance_bfs_privatized
+        prop_distance_bfs_td_step_privatized
           <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
           (num_verts,
            num_edges,
@@ -3188,7 +3153,7 @@ void CpGen::bfs_hybrid_no_resize(
   std::ofstream rtlog("bfs_hybrid.log");
   while (qsize*alpha < num_remaining_verts) {
     timer.start();
-    prop_distance_bfs
+    prop_distance_bfs_td_step
       <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
         N,
         M,
@@ -3219,7 +3184,7 @@ void CpGen::bfs_hybrid_no_resize(
   while (num_remaining_verts > 0) {
     timer.start();
 
-    prop_distance_bfs_bu_step
+    prop_distance_bfs_bu_step_no_resize
       <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
         N,
         M,
@@ -3269,7 +3234,7 @@ void CpGen::bfs_hybrid(
 
 	while (qsize*alpha < num_remaining_verts) {
 		timer.start();
-		prop_distance_bfs
+		prop_distance_bfs_td_step
       <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
 				N,
 				M,

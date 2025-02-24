@@ -27,8 +27,7 @@ enum class PropDistMethod {
   BFS_PRIVATIZED,
   BFS_PRIVATIZED_MERGED,
   BFS_PRIVATIZED_PRECOMP_SPURS,
-  BFS_HYBRID,
-  BFS_BOTTOM_UP
+  BFS_HYBRID
 };
 
 enum class PfxtExpMethod {
