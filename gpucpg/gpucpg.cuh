@@ -87,22 +87,7 @@ public:
   void read_input(const std::string& filename);
   void levelize();
   
- 
-  void bfs_adaptive(
-    const float alpha,
-    int* iverts,
-    int* iedges,
-    float* iwgts,
-    int* overts,
-    int* oedges,
-    float* owgts,
-    int* dists,
-    int* queue,
-    int* deps,
-    bool* touched
-  );
-
-  void bfs_adaptive(
+  void bfs_hybrid(
     const float alpha,
     int* ivs,
     int* ies,
@@ -115,7 +100,7 @@ public:
     int* deps
   );
 
-  void bfs_adaptive_no_resize(
+  void bfs_hybrid_no_resize(
     const float alpha,
     int* ivs,
     int* ies,

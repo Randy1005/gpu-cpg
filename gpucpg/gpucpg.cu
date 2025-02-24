@@ -8,7 +8,6 @@
 #include <thrust/execution_policy.h>
 #include <thrust/device_vector.h>
 #include <thrust/remove.h>
-#include <cub/cub.cuh>
 #include <cuda_runtime_api.h>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
@@ -72,7 +71,6 @@ void print_range_pfxt(const std::string& name, Iterator first, Iterator last) {
   thrust::for_each(thrust::device, first, last, printf_functor_pfxtnode());
   std::cout << '\n';
 }
-
 
 void checkError_t(cudaError_t error, std::string msg) {
   if (error != cudaSuccess) {
@@ -312,7 +310,6 @@ __device__ int dequeue(
   return vid;
 }
 
-
 __global__ void enqueue_sinks(
     const int num_sinks,
     int* queue,
@@ -322,8 +319,6 @@ __global__ void enqueue_sinks(
     enqueue(tid, queue, qtail);
   }
 } 
-
- 
 
 __global__ void check_if_no_dists_updated(
     int num_verts, 
@@ -689,7 +684,7 @@ __global__ void prop_distance_bfs_td(
 } 
 
 
-__global__ void prop_distance_bfs_td_step(
+__global__ void prop_distance_bfs_td_step_no_atomic_min(
   int num_verts,
   int num_edges,
   int* ivs,
@@ -803,56 +798,14 @@ __global__ void prop_distance_bfs_bu_step(
     for (auto eid = edge_beg; eid < edge_end; eid++) {
       const auto neighbor = oedges[eid];
       const int wgt = owgts[eid] * SCALE_UP;
-      int new_dist = distances_cache[neohbor] eid wgt;
+      int new_dist = distances_cache[neighbor] + wgt;
       min_dist = min(min_dist, new_dist); 
     }
 
-		  distances_cache[v] = min_dist;
+		distances_cache[v] = min_dist;
     deps[v] = 0;
 	}
-
 }
-  
-__globauto eidvoiedge_beg; eidop_ance_end; eidu_get_  frontiers(
-    int num_vero, 
-   eidint   num_edges,
-    int*overtseid
-    int* oedg  es,
-    float* owgts,
-    int* distances_cache,
-      int* untouched_verts,
-    int num_untouch  ed,
-	  	int* queue,
-		int* qtail,
-		bool  * touched) {
-  	
- 
- int gid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (gid < num_untouched) {
-    const auto v = untouched_verts[gid];
-    const auto edge_beg = overts[v];
-    const auto edge_end = (v == num_verts-1) ? num_edges : overts[v+1]; 
-    
-		int min_dist{::cuda::std::numeric_limits<int>::max()};
-		for (auto eid = edge_beg; eid < edge_end; eid++) {
-      // in the bottom-up step, we let v find its parent
-      const auto neighbor = oedges[eid];
-      if (touched[neighbor]) {
-        // this is a valid parent for v  
-        int wgt = owgts[eid] * SCALE_UP;
-				min_dist = min(min_dist, distances_cache[neighbor]+wgt);
-      }
-			else {
-				return;
-			}
-    }
-		
-		distances_cache[v] = min_dist;
-		enqueue(v, queue, qtail);
-	}
-
-}
-
 
 
 __global__ void prop_distance_bfs_single_block(
@@ -1256,7 +1209,6 @@ __global__ void condition_converged(
     *converged = true;
   }
 }
-
 
 // the conditional graph node kernel
 // uses the queue emptiness as condition check
@@ -1936,7 +1888,6 @@ void CpGen::report_paths(
 
 	Timer timer_cpg;
 
-
 	timer_cpg.start();
   if (pd_method == PropDistMethod::BASIC) { 
     while (!h_converged) {
@@ -1991,19 +1942,7 @@ void CpGen::report_paths(
 
   } 
   else if (pd_method == PropDistMethod::BFS_HYBRID) {
-    //bfs_adaptive
-    //  (alpha,
-    //   d_fanin_adjp, 
-    //   d_fanin_adjncy,
-    //   d_fanin_wgts,
-    //   d_fanout_adjp,
-    //   d_fanout_adjncy,
-    //   d_fanout_wgts,
-    //   d_dists_cache,
-    //   d_queue,
-    //   d_deps,
-    //   d_touched);
-    bfs_adaptive
+    bfs_hybrid
       (alpha,
        d_fanin_adjp, 
        d_fanin_adjncy,
@@ -2135,7 +2074,7 @@ void CpGen::report_paths(
   else if (pd_method == PropDistMethod::BFS_TOP_DOWN_NO_ATOMICMIN) {
     auto qsize{static_cast<int>(_sinks.size())};
     while (qsize > 0) {
-      prop_distance_bfs_td_step
+      prop_distance_bfs_td_step_no_atomic_min
         <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
         (num_verts,
          num_edges,
@@ -2861,6 +2800,10 @@ void CpGen::report_paths(
     std::cout << "short-long expansion executed " << steps << " steps.\n";
   }
   else if (pe_method == PfxtExpMethod::SEQUENTIAL) {
+    
+    auto M = static_cast<int>(num_edges);
+    auto N = static_cast<int>(num_verts);
+    
     // initialize a priority queue of src nodes
     auto cmp = [](const PfxtNode& a, const PfxtNode& b) {
       return a.slack > b.slack;
@@ -2892,7 +2835,7 @@ void CpGen::report_paths(
       auto slack = node.slack;
       while (v != -1) {
         auto edge_start = _h_fanout_adjp[v];
-        auto edge_end = (v == num_verts-1) ? num_edges : _h_fanout_adjp[v+1];
+        auto edge_end = (v == N-1) ? M : _h_fanout_adjp[v+1];
         for (auto eid = edge_start; eid < edge_end; eid++) {
           auto neighbor = _h_fanout_adjncy[eid];
           if (neighbor == h_succs[v]) {
@@ -2903,7 +2846,6 @@ void CpGen::report_paths(
           auto dist_neighbor = (float)h_dists[neighbor] / SCALE_UP;
           auto dist_v = (float)h_dists[v] / SCALE_UP;
           auto new_slack = slack + dist_neighbor + wgt - dist_v;
-
 
           // populate child path info
           pfxt_pq.emplace(level+1, v, neighbor, -1, 0, new_slack);
@@ -3224,7 +3166,7 @@ __global__ void get_remaining_verts(
 }
 
 
-void CpGen::bfs_adaptive_no_resize(
+void CpGen::bfs_hybrid_no_resize(
   const float alpha,
   int* ivs,
   int* ies,
@@ -3299,12 +3241,12 @@ void CpGen::bfs_adaptive_no_resize(
     rtlog << timer.get_elapsed_time() / 1us << '\n';
   }
 
-  std::cout << "bfs_adaptive executed " << steps << " steps.\n";
+  std::cout << "bfs_hybrid executed " << steps << " steps.\n";
 
 }
 
 
-void CpGen::bfs_adaptive(
+void CpGen::bfs_hybrid(
     const float alpha, 
     int* iverts,
     int* iedges,
@@ -3363,12 +3305,9 @@ void CpGen::bfs_adaptive(
           [deps] __device__ (const int v) {
             return deps[v] > 0;
           });
-
-  d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
   
   timer.stop();
   rtlog << timer.get_elapsed_time() / 1us << '\n';
-  std::cout << "transition took " << timer.get_elapsed_time() / 1us << " us.\n"; 
 
 	while (num_remaining_verts > 0) {
     timer.start();
@@ -3456,7 +3395,7 @@ void CpGen::bfs_adaptive(
 	//}
   
   
-	std::cout << "bfs_adaptive executed " << steps << " steps.\n";
+	std::cout << "bfs_hybrid executed " << steps << " steps.\n";
 }
 
 } // namespace gpucpg
