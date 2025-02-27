@@ -28,7 +28,7 @@ enum class PropDistMethod {
   BFS_PRIVATIZED_MERGED,
   BFS_PRIVATIZED_PRECOMP_SPURS,
   BFS_HYBRID,
-  BFS_HYBRID_TOP_DOWN_PRIVATIZED
+  BFS_HYBRID_PRIVATIZED
 };
 
 enum class PfxtExpMethod {
@@ -101,7 +101,7 @@ public:
     const bool enable_runtime_log_file
   );
 
-  void bfs_hybrid_top_down_privatized(
+  void bfs_hybrid_privatized(
     const float alpha,
     int* ivs,
     int* ies,
@@ -110,22 +110,12 @@ public:
     int* oes,
     float* owgts,
     int* dists,
-    int* queue,
+    int* frontiers,
+    int* curr_remainders,
+    int* next_remainders,
+    int* next_rem_tail,
     int* deps,
     const bool enable_runtime_log_file
-  );
-
-  void bfs_hybrid_no_resize(
-    const float alpha,
-    int* ivs,
-    int* ies,
-    float* iwgts,
-    int* ovs,
-    int* oes,
-    float* owgts,
-    int* dists,
-    int* queue,
-    int* deps
   );
 
   void report_paths(
