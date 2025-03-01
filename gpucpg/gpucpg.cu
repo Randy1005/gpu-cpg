@@ -717,12 +717,14 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
   int* overts,
   int* oedges,
   float* owgts,
-  int* distances_cache,
+  int* distances,
   int* next_remainders,
   int* next_rem_tail,
   int* frontiers,
-  int* f_tail,
-  int* deps) {
+  int* ftr_tail,
+  int* deps,
+  int* depths,
+  int current_depth) {  
   __shared__ int local_next_frontiers[S_FRONTIER_CAPACITY];
   __shared__ int num_local_next_frontiers;
   __shared__ int local_next_remainders[S_REMAINDER_CAPACITY];
@@ -738,50 +740,46 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
   this_block.sync();
 
   int u = threadIdx.x + blockIdx.x * blockDim.x;  
-  bool u_is_remainder{false};
-  if (u < num_verts) {
+  if (u < num_verts && depths[u] == -1) {
     const auto e_beg = overts[u];
     const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
     
+    auto min_dist{distances[u]};
     for (auto e = e_beg; e < e_end; e++) {
       // if any of the neighbors has unresolved dependencies
       // we should add u to the next remainder list 
       const auto v = oedges[e];
-      if (deps[v] > 0) {
-        // add u to the local remainder buffer
-        // we check if there's more space in the shared remainder storage
-        const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
-        if (local_rem_idx < S_REMAINDER_CAPACITY) {
-          // if we have more space, store to the local remainder buffer
-          local_next_remainders[local_rem_idx] = u;
-        }
-        else {
-          // if not, write back to global memory
-          num_local_next_remainders = S_REMAINDER_CAPACITY;
-          enqueue(u, next_remainders, next_rem_tail);
-        }
-        u_is_remainder = true;
-        break;
+      if (depths[v] == current_depth) {
+        int wgt = owgts[e] * SCALE_UP;
+        min_dist = min(min_dist, distances[v]+wgt);
+        deps[u]--;
       }
     }
 
-    if (!u_is_remainder && deps[u] > 0) {
-      // if we reach here, it means all neighbors of u have resolved
-      // their dependencies, so we can update the distance of u
-      auto min_dist{::cuda::std::numeric_limits<int>::max()};
-      for (auto e = e_beg; e < e_end; e++) {
-        const auto v = oedges[e];
-        const int wgt = owgts[e] * SCALE_UP;
-        int new_dist = distances_cache[v] + wgt;
-        min_dist = min(min_dist, new_dist);
-      }
-
-      distances_cache[u] = min_dist;
+    distances[u] = min_dist;
     
-      // set u's dependency counter to 0
-      deps[u] = 0;
-  
+    if (deps[u] > 0) {
+      // u stays in the remainder list
+      // add u to the local remainder buffer
+      // we check if there's more space in the shared remainder storage
+      const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
+      if (local_rem_idx < S_REMAINDER_CAPACITY) {
+        // if we have more space, store to the local remainder buffer
+        local_next_remainders[local_rem_idx] = u;
+      }
+      else {
+        // if not, write back to global memory
+        num_local_next_remainders = S_REMAINDER_CAPACITY;
+        enqueue(u, next_remainders, next_rem_tail);
+      }
+    }
+    else {
       // u is now a frontier
+
+      // update u's depth
+      depths[u] = current_depth + 1;
+      // add u to the local frontier buffer
+      // we check if there's more space in the shared frontier storage
       const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
       if (local_frontier_idx < S_FRONTIER_CAPACITY) {
         // if we have more space, store to the local frontier buffer
@@ -790,46 +788,46 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
       else {
         // if not, write back to global memory
         num_local_next_frontiers = S_FRONTIER_CAPACITY;
-        enqueue(u, frontiers, f_tail);
+        enqueue(u, frontiers, ftr_tail);
       }
     }
-
   }
   
   this_block.sync();
 
   // now we commit the local frontiers and local remainders to global memory
-  __shared__ int next_f_beg, next_rem_beg;
+  __shared__ int next_ftr_beg, next_rem_beg;
   if (this_block.thread_rank() == 0) {
-    next_f_beg = atomicAdd(f_tail, num_local_next_frontiers);
+    next_ftr_beg = atomicAdd(ftr_tail, num_local_next_frontiers);
     next_rem_beg = atomicAdd(next_rem_tail, num_local_next_remainders);
   }
   this_block.sync();
 
   // commit local frontiers to the global memory
   commit_local_to_global(this_block, 
-    frontiers, next_f_beg, num_local_next_frontiers, local_next_frontiers);
+    frontiers, next_ftr_beg, num_local_next_frontiers, local_next_frontiers);
   // commit local remainders to the global memory
   commit_local_to_global(this_block, 
     next_remainders, next_rem_beg, num_local_next_remainders, local_next_remainders);
 
 }
 
-
 __global__ void prop_distance_bfs_bu_step_privatized(
-  int num_verts, 
+  int num_verts,
   int num_edges,
   int* overts,
   int* oedges,
   float* owgts,
-  int* distances_cache,
+  int* distances,
   int* curr_remainders,
-  int* next_remainders,
   int num_curr_remainders,
+  int* next_remainders,
   int* next_rem_tail,
   int* frontiers,
-  int* f_tail,
-  int* deps) {
+  int* ftr_tail,
+  int* deps,
+  int* depths,
+  int current_depth) {  
   __shared__ int local_next_frontiers[S_FRONTIER_CAPACITY];
   __shared__ int num_local_next_frontiers;
   __shared__ int local_next_remainders[S_REMAINDER_CAPACITY];
@@ -844,54 +842,49 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   }
   this_block.sync();
 
-  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (gid < num_curr_remainders) {
-    bool u_is_remainder{false};
-    const auto u = curr_remainders[gid];
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+  if (tid < num_curr_remainders) {
+    const auto u = curr_remainders[tid];
     const auto e_beg = overts[u];
     const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
     
+    auto min_dist{distances[u]};
     for (auto e = e_beg; e < e_end; e++) {
       // if any of the neighbors has unresolved dependencies
       // we should add u to the next remainder list 
       const auto v = oedges[e];
-      if (deps[v] > 0) {
-        // add u to the local remainder buffer
-        // we check if there's more space in the shared remainder storage
-        const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
-        if (local_rem_idx < S_REMAINDER_CAPACITY) {
-          // if we have more space, store to the local remainder buffer
-          local_next_remainders[local_rem_idx] = u;
-        }
-        else {
-          // if not, write back to global memory
-          num_local_next_remainders = S_REMAINDER_CAPACITY;
-          enqueue(u, next_remainders, next_rem_tail);
-        }
-
-        u_is_remainder = true;
-        break;
+      if (depths[v] == current_depth) {
+        int wgt = owgts[e] * SCALE_UP;
+        min_dist = min(min_dist, distances[v]+wgt);
+        deps[u]--;
       }
     }
 
-    if (!u_is_remainder && deps[u] > 0) {
-
-      // if we reach here, it means all neighbors of u have resolved
-      // their dependencies, so we can update the distance of u
-      auto min_dist{::cuda::std::numeric_limits<int>::max()};
-      for (auto e = e_beg; e < e_end; e++) {
-        const auto v = oedges[e];
-        const int wgt = owgts[e] * SCALE_UP;
-        int new_dist = distances_cache[v] + wgt;
-        min_dist = min(min_dist, new_dist);
-      }
-
-      distances_cache[u] = min_dist;
+    distances[u] = min_dist;
     
-      // set u's dependency counter to 0
-      deps[u] = 0;
-  
+    if (deps[u] > 0) {
+      // u stays in the remainder list
+      // add u to the local remainder buffer
+      // we check if there's more space in the shared remainder storage
+      const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
+      if (local_rem_idx < S_REMAINDER_CAPACITY) {
+        // if we have more space, store to the local remainder buffer
+        local_next_remainders[local_rem_idx] = u;
+      }
+      else {
+        // if not, write back to global memory
+        num_local_next_remainders = S_REMAINDER_CAPACITY;
+        enqueue(u, next_remainders, next_rem_tail);
+      }
+    }
+    else {
       // u is now a frontier
+      distances[u] = min_dist;
+
+      // update u's depth
+      depths[u] = current_depth + 1;
+      // add u to the local frontier buffer
+      // we check if there's more space in the shared frontier storage
       const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
       if (local_frontier_idx < S_FRONTIER_CAPACITY) {
         // if we have more space, store to the local frontier buffer
@@ -900,33 +893,29 @@ __global__ void prop_distance_bfs_bu_step_privatized(
       else {
         // if not, write back to global memory
         num_local_next_frontiers = S_FRONTIER_CAPACITY;
-        enqueue(u, frontiers, f_tail);
+        enqueue(u, frontiers, ftr_tail);
       }
-
     }
-
-   
   }
   
   this_block.sync();
 
   // now we commit the local frontiers and local remainders to global memory
-  __shared__ int next_f_beg, next_rem_beg;
+  __shared__ int next_ftr_beg, next_rem_beg;
   if (this_block.thread_rank() == 0) {
-    next_f_beg = atomicAdd(f_tail, num_local_next_frontiers);
+    next_ftr_beg = atomicAdd(ftr_tail, num_local_next_frontiers);
     next_rem_beg = atomicAdd(next_rem_tail, num_local_next_remainders);
   }
   this_block.sync();
 
-  // commit local frontiers to the global memory 
+  // commit local frontiers to the global memory
   commit_local_to_global(this_block, 
-    frontiers, next_f_beg, num_local_next_frontiers, local_next_frontiers);
-      
+    frontiers, next_ftr_beg, num_local_next_frontiers, local_next_frontiers);
   // commit local remainders to the global memory
   commit_local_to_global(this_block, 
     next_remainders, next_rem_beg, num_local_next_remainders, local_next_remainders);
-}
 
+}
 
 __global__ void prop_distance_bfs_bu_step(
     int num_verts, 
@@ -1070,7 +1059,9 @@ __global__ void prop_distance_bfs_td_step_privatized(
     int* qhead,
     int* qtail,
     int qsize,
-    int* deps) {
+    int* deps,
+    int* depths,
+    int current_depth) {
   // initialize privatized frontiers
   __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
 
@@ -1096,9 +1087,12 @@ __global__ void prop_distance_bfs_td_step_privatized(
       const int wgt = wgts[eid] * SCALE_UP;
       const int new_distance = distances_cache[vid] + wgt;
       atomicMin(&distances_cache[neighbor], new_distance);
-     
+    
       // decrement the dependency counter for this neighbor
       if (atomicSub(&deps[neighbor], 1) == 1) {
+        // update the depth of this neighbor
+        depths[neighbor] = current_depth + 1;
+        
         // if this thread releases the last dependency
         // it should add this neighbor to the frontier queue
         
@@ -2123,13 +2117,27 @@ void CpGen::report_paths(
     //  enable_runtime_log_file);
   }
   else if (pd_method == PropDistMethod::BFS_HYBRID_PRIVATIZED) {
-    thrust::device_vector<int> curr_remainders(num_verts), next_remainders(num_verts);
+    // initialize the remainder storages
+    thrust::device_vector<int> curr_remainders(num_verts, -1); 
+    thrust::device_vector<int> next_remainders(num_verts, -1);
     auto d_curr_remainders = thrust::raw_pointer_cast(&curr_remainders[0]);
     auto d_next_remainders = thrust::raw_pointer_cast(&next_remainders[0]);
+   
+    // initialize the frontier vertices
+    thrust::device_vector<int> frontiers(h_queue);
+    auto d_frontiers = thrust::raw_pointer_cast(&frontiers[0]);
+   
+    // initialize the depths of the vertices
+    thrust::device_vector<int> depths(num_verts, -1);
+    for (const auto& sink: _sinks) {
+      depths[sink] = 0;
+    }
+    auto d_depths = thrust::raw_pointer_cast(&depths[0]);
+   
+    // initialize the tail for next_remainder
     auto next_rem_tail = thrust::device_new<int>();
     thrust::fill(next_rem_tail, next_rem_tail+1, 0);
   
-
     bfs_hybrid_privatized(
       alpha,
       d_fanin_adjp, 
@@ -2139,11 +2147,12 @@ void CpGen::report_paths(
       d_fanout_adjncy,
       d_fanout_wgts,
       d_dists_cache,
-      d_queue,
+      d_frontiers,
       d_curr_remainders,
       d_next_remainders,
       next_rem_tail.get(),
       d_deps,
+      d_depths,
       enable_runtime_log_file);
 
   }
@@ -2239,18 +2248,19 @@ void CpGen::report_paths(
     std::ofstream log("bfs_td_step_rt.log");
     while (qsize > 0) {
       timer.start();
-      prop_distance_bfs_td_step<<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-        (num_verts,
-         num_edges,
-         d_fanin_adjp,
-         d_fanin_adjncy,
-         d_fanin_wgts,
-         d_dists_cache,
-         d_queue,
-         _d_qhead,
-         _d_qtail,
-         qsize,
-         d_deps);
+      prop_distance_bfs_td_step
+      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+        num_verts,
+        num_edges,
+        d_fanin_adjp,
+        d_fanin_adjncy,
+        d_fanin_wgts,
+        d_dists_cache,
+        d_queue,
+        _d_qhead,
+        _d_qtail,
+        qsize,
+        d_deps);
       
       // update queue head once here
       inc_kernel<<<1, 1>>>(_d_qhead, qsize);
@@ -2269,20 +2279,20 @@ void CpGen::report_paths(
     auto qsize{static_cast<int>(_sinks.size())};
     while (qsize > 0) {
       prop_distance_bfs_td_step_no_atomic_min
-        <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-        (num_verts,
-         num_edges,
-         d_fanin_adjp,
-         d_fanin_adjncy,
-         d_fanout_adjp,
-         d_fanout_adjncy,
-         d_fanout_wgts,
-         d_dists_cache,
-         d_queue,
-         _d_qhead,
-         _d_qtail,
-         qsize,
-         d_deps);
+        <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+          num_verts,
+          num_edges,
+          d_fanin_adjp,
+          d_fanin_adjncy,
+          d_fanout_adjp,
+          d_fanout_adjncy,
+          d_fanout_wgts,
+          d_dists_cache,
+          d_queue,
+          _d_qhead,
+          _d_qtail,
+          qsize,
+          d_deps);
       
       // update queue head once here
       inc_kernel<<<1, 1>>>(_d_qhead, qsize);
@@ -2293,76 +2303,85 @@ void CpGen::report_paths(
     }
   }
   else if (pd_method == PropDistMethod::BFS_TOP_DOWN_PRIVATIZED) {
-    // enqueue the sinks
-    int qsize{static_cast<int>(_sinks.size())}; 
+    
+    thrust::device_vector<int> depths(num_verts, -1);
+    for (const auto& sink: _sinks) {
+      depths[sink] = 0;
+    }
+    auto d_depths = thrust::raw_pointer_cast(&depths[0]);
 
-    while (qsize > 0) {
+    int curr_depth{0};
+
+    int num_frontiers{static_cast<int>(_sinks.size())}; 
+    while (num_frontiers > 0) {
       prop_distance_bfs_td_step_privatized
-        <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-        (num_verts,
-         num_edges,
-         d_fanin_adjp,
-         d_fanin_adjncy,
-         d_fanin_wgts,
-         d_dists_cache,
-         d_queue,
-         _d_qhead,
-         _d_qtail,
-         qsize,
-         d_deps);
+        <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
+          num_verts,
+          num_edges,
+          d_fanin_adjp,
+          d_fanin_adjncy,
+          d_fanin_wgts,
+          d_dists_cache,
+          d_queue,
+          _d_qhead,
+          _d_qtail,
+          num_frontiers,
+          d_deps,
+          d_depths,
+          curr_depth);
 
       // update queue head once here
-      inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+      inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
       
       // update queue size
-      qsize = _get_qsize();
-      steps++;
+      num_frontiers = _get_qsize();
+      curr_depth++;
     }
+    std::cout << "total depth=" << curr_depth << '\n';
   }
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
-    // enqueue the sinks
-    int qsize{static_cast<int>(_sinks.size())}; 
+    //int qsize{static_cast<int>(_sinks.size())}; 
 
-    while (true) {
-      qsize = _get_qsize();
-      if (qsize == 0) {
-        break;
-      }
+    //while (true) {
+    //  qsize = _get_qsize();
+    //  if (qsize == 0) {
+    //    break;
+    //  }
 
-      if (qsize < BLOCKSIZE) {
-        prop_distance_bfs_td_step_single_block
-        <<<1, BLOCKSIZE>>>
-        (num_verts,
-         num_edges,
-         d_fanin_adjp,
-         d_fanin_adjncy,
-         d_fanin_wgts,
-         d_dists_cache,
-         d_queue,
-         _d_qhead,
-         _d_qtail,
-         d_deps,
-         BLOCKSIZE);
-      }
-      else {
-        prop_distance_bfs_td_step_privatized
-          <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-          (num_verts,
-           num_edges,
-           d_fanin_adjp,
-           d_fanin_adjncy,
-           d_fanin_wgts,
-           d_dists_cache,
-           d_queue,
-           _d_qhead,
-           _d_qtail,
-           qsize,
-           d_deps);
+    //  if (qsize < BLOCKSIZE) {
+    //    prop_distance_bfs_td_step_single_block
+    //    <<<1, BLOCKSIZE>>>
+    //    (num_verts,
+    //     num_edges,
+    //     d_fanin_adjp,
+    //     d_fanin_adjncy,
+    //     d_fanin_wgts,
+    //     d_dists_cache,
+    //     d_queue,
+    //     _d_qhead,
+    //     _d_qtail,
+    //     d_deps,
+    //     BLOCKSIZE);
+    //  }
+    //  else {
+    //    prop_distance_bfs_td_step_privatized
+    //      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
+    //      (num_verts,
+    //       num_edges,
+    //       d_fanin_adjp,
+    //       d_fanin_adjncy,
+    //       d_fanin_wgts,
+    //       d_dists_cache,
+    //       d_queue,
+    //       _d_qhead,
+    //       _d_qtail,
+    //       qsize,
+    //       d_deps);
 
-        // update queue head once here
-        inc_kernel<<<1, 1>>>(_d_qhead, qsize);
-      }
-    }
+    //    // update queue head once here
+    //    inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+    //  }
+    //}
   }
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_PRECOMP_SPURS) {
     // enqueue the sinks
@@ -3320,45 +3339,6 @@ int CpGen::_get_expansion_window_size(int* p_start, int* p_end) {
 }
 
 
-__global__ void get_remaining_verts(
-	int num_verts, 
-	int* deps, 
-	int* remaining_verts,
-	int* tail) {
-	int tid = threadIdx.x + blockIdx.x * blockDim.x;
-	
-	__shared__ int s_remaining_verts[BLOCKSIZE];
-	__shared__ int s_tail;
-	
-	if (threadIdx.x == 0) {
-		s_tail = 0;
-	}
-	__syncthreads();
-	
-	if (tid < num_verts) {
-		if (deps[tid] > 0) {
-			const int idx = atomicAdd(&s_tail, 1);
-			s_remaining_verts[idx] = tid;
-		}
-	}
-
-	__syncthreads();
-
-	// compute the index of the global array to start
-	// copying the remaining vertices
-	__shared__ int s_start;
-	if (threadIdx.x == 0) {
-		s_start = atomicAdd(tail, s_tail);
-	}
-	__syncthreads();
-
-	// commit the remaining vertices to the global array
-	for (auto i = threadIdx.x; i < s_tail; i += blockDim.x) {
-		remaining_verts[s_start + i] = s_remaining_verts[i];
-	}
-
-}
-
 void CpGen::bfs_hybrid(
     const float alpha, 
     int* iverts,
@@ -3472,15 +3452,16 @@ void CpGen::bfs_hybrid_privatized(
   int* next_remainders,
   int* next_rem_tail,
   int* deps,
+  int* depths,
   const bool enable_runtime_log_file) {
   const int M{static_cast<int>(num_edges())};
   const int N{static_cast<int>(num_verts())};
   const int num_sinks{static_cast<int>(_sinks.size())};
 
-  int num_frontiers{num_sinks}, steps{0};
+  int num_frontiers{num_sinks}, curr_depth{0};
   int num_remainders{N};
-  bool is_bu_first_step{true};
 
+  bool ran_first_bu_pass{false};
   while (num_frontiers && num_remainders) {
     if (num_frontiers*alpha < num_remainders) {
       // run top-down step
@@ -3496,21 +3477,18 @@ void CpGen::bfs_hybrid_privatized(
             _d_qhead,
             _d_qtail,
             num_frontiers,
-            deps);
-      
-      // equivalent to std::swap(curr_frontiers, next_frontiers)
-      // if we use two arrays to keep track of the frontiers
-      inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-      num_remainders -= num_frontiers;
-      num_frontiers = _get_qsize();
+            deps,
+            depths,
+            curr_depth);
     }
     else {
-      std::cout << "bottom-up @ step " << steps << '\n';
+      //std::cout << "bottom-up @ depth " << curr_depth << '\n';
       
-      if (is_bu_first_step) {
-        std::cout << "first pass\n";
-        is_bu_first_step = false;
+      if (!ran_first_bu_pass) {
+        ran_first_bu_pass = true;
+        //std::cout << "first bu pass\n";
         // we need to do a first pass to scan all the N vertices
+        // and get the remainder vertices
         prop_distance_bfs_bu_step_privatized_no_curr_remainders
           <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
               N,
@@ -3523,57 +3501,141 @@ void CpGen::bfs_hybrid_privatized(
               next_rem_tail,
               frontiers,
               _d_qtail,
-              deps);
+              deps,
+              depths,
+              curr_depth);
       }
       else {
-        prop_distance_bfs_bu_step_privatized
-          <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
+        prop_distance_bfs_td_step_privatized
+          <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
               N,
               M,
-              ovs,
-              oes,
-              owgts,
+              ivs,
+              ies,
+              iwgts,
               dists,
-              curr_remainders,
-              next_remainders,
-              num_remainders,
-              next_rem_tail,
               frontiers,
+              _d_qhead,
               _d_qtail,
-              deps);
+              num_frontiers,
+              deps,
+              depths,
+              curr_depth);
       }
-      // equivalent to std::swap(curr_frontiers, next_frontiers)
-      // if we use two arrays to keep track of the frontiers
-      inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-      
-      // TODO: fix this counting issue
-      //num_remainders -= num_frontiers;
-      cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-          cudaMemcpyDeviceToHost);
-      
-      num_frontiers = _get_qsize();
-   
-      //std::cout << "num_remainders=" << num_remainders << '\n';
-      //std::cout << "num_frontiers=" << num_frontiers << '\n';
-      //print_range("curr_remainders", curr_remainders, curr_remainders+N);
-      //print_range("next_remainders", next_remainders, next_remainders+N);
-      //print_range("frontiers", frontiers, frontiers+N);
-      // swap the contents of the two arrays
-      thrust::swap_ranges(
-        thrust::device,
-        next_remainders,
-        next_remainders+N,
-        curr_remainders); 
-      
+
       // reset the tail of the next remainders
       set_kernel<<<1, 1>>>(next_rem_tail, 0);
     }
-
-    steps++;
     
+    // equivalent to std::swap(curr_frontiers, next_frontiers)
+    // if we use two arrays to keep track of the frontiers
+    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+    num_remainders -= num_frontiers;
+    num_frontiers = _get_qsize();
+
+    // update the curr_remainders
+    //thrust::swap_ranges(
+    //  thrust::device,
+    //  next_remainders,
+    //  next_remainders+N,
+    //  curr_remainders);
+    thrust::copy(
+      thrust::device,
+      next_remainders,
+      next_remainders+N,
+      curr_remainders);
+
+    curr_depth++;
   }
 
+  // TODO: make this into a unit test
+  //while (num_frontiers > 0) {
+  //  if (curr_depth == 1) {
+  //    prop_distance_bfs_bu_step_privatized_no_curr_remainders
+  //      <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+  //          N,
+  //          M,
+  //          ovs,
+  //          oes,
+  //          owgts,
+  //          dists,
+  //          next_remainders,
+  //          next_rem_tail,
+  //          frontiers,
+  //          _d_qtail,
+  //          deps,
+  //          depths,
+  //          curr_depth);
+  //    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+  //    num_frontiers = _get_qsize();
+  //  }
+  //  else if (curr_depth == 2) {
+  //    std::cout << "num_remainders=" << num_remainders << '\n';
+  //    prop_distance_bfs_bu_step_privatized
+  //      <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
+  //          N,
+  //          M,
+  //          ovs,
+  //          oes,
+  //          owgts,
+  //          dists,
+  //          curr_remainders,
+  //          num_remainders,
+  //          next_remainders,
+  //          next_rem_tail,
+  //          frontiers,
+  //          _d_qtail,
+  //          deps,
+  //          depths,
+  //          curr_depth);
+  //    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+  //    num_frontiers = _get_qsize();
+  //  }
+  //  else {
+  //    prop_distance_bfs_td_step_privatized
+  //      <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
+  //          N,
+  //          M,
+  //          ivs,
+  //          ies,
+  //          iwgts,
+  //          dists,
+  //          frontiers,
+  //          _d_qhead,
+  //          _d_qtail,
+  //          num_frontiers,
+  //          deps,
+  //          depths,
+  //          curr_depth);
+  //    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+  //    num_frontiers = _get_qsize();
+  //  }
 
+  //  // copy num_remainder from device
+  //  cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+  //      cudaMemcpyDeviceToHost);
+  //  
+  //  thrust::swap_ranges(
+  //    thrust::device,
+  //    next_remainders,
+  //    next_remainders+N,
+  //    curr_remainders);
+  //  
+  //  // reset the tail of the next remainders
+  //  set_kernel<<<1, 1>>>(next_rem_tail, 0);
+
+  //  //std::cout << "depth " << curr_depth << '\n';
+  //  //print_range("frontiers", frontiers, frontiers+N);
+  //  //print_range("curr_remainders", curr_remainders, curr_remainders+N);
+  //  //print_range("next_remainders", next_remainders, next_remainders+N);
+  //  //print_range("deps", deps, deps+N);
+  //  //print_range("distances", dists, dists+N);
+  //  //print_range("depths", depths, depths+N);
+
+  //  curr_depth++;
+  //}
+
+  std::cout << "total depth=" << curr_depth << '\n';
 }
 
 

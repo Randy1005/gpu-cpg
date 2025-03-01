@@ -115,6 +115,7 @@ public:
     int* next_remainders,
     int* next_rem_tail,
     int* deps,
+    int* depths,
     const bool enable_runtime_log_file
   );
 
