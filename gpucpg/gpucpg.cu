@@ -845,6 +845,10 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (tid < num_curr_remainders) {
     const auto u = curr_remainders[tid];
+    if (depths[u] != -1) {
+      return;
+    }
+    
     const auto e_beg = overts[u];
     const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
     
@@ -3462,136 +3466,9 @@ void CpGen::bfs_hybrid_privatized(
   int num_remainders{N};
 
   bool ran_first_bu_pass{false};
-  while (num_frontiers && num_remainders) {
-    if (num_frontiers*alpha < num_remainders) {
-      // run top-down step
-      prop_distance_bfs_td_step_privatized
-        <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
-            N,
-            M,
-            ivs,
-            ies,
-            iwgts,
-            dists,
-            frontiers,
-            _d_qhead,
-            _d_qtail,
-            num_frontiers,
-            deps,
-            depths,
-            curr_depth);
-    }
-    else {
-      //std::cout << "bottom-up @ depth " << curr_depth << '\n';
-      
-      if (!ran_first_bu_pass) {
-        ran_first_bu_pass = true;
-        //std::cout << "first bu pass\n";
-        // we need to do a first pass to scan all the N vertices
-        // and get the remainder vertices
-        prop_distance_bfs_bu_step_privatized_no_curr_remainders
-          <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
-              N,
-              M,
-              ovs,
-              oes,
-              owgts,
-              dists,
-              next_remainders,
-              next_rem_tail,
-              frontiers,
-              _d_qtail,
-              deps,
-              depths,
-              curr_depth);
-      }
-      else {
-        prop_distance_bfs_td_step_privatized
-          <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
-              N,
-              M,
-              ivs,
-              ies,
-              iwgts,
-              dists,
-              frontiers,
-              _d_qhead,
-              _d_qtail,
-              num_frontiers,
-              deps,
-              depths,
-              curr_depth);
-      }
-
-      // reset the tail of the next remainders
-      set_kernel<<<1, 1>>>(next_rem_tail, 0);
-    }
-    
-    // equivalent to std::swap(curr_frontiers, next_frontiers)
-    // if we use two arrays to keep track of the frontiers
-    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-    num_remainders -= num_frontiers;
-    num_frontiers = _get_qsize();
-
-    // update the curr_remainders
-    //thrust::swap_ranges(
-    //  thrust::device,
-    //  next_remainders,
-    //  next_remainders+N,
-    //  curr_remainders);
-    thrust::copy(
-      thrust::device,
-      next_remainders,
-      next_remainders+N,
-      curr_remainders);
-
-    curr_depth++;
-  }
-
-  // TODO: make this into a unit test
-  //while (num_frontiers > 0) {
-  //  if (curr_depth == 1) {
-  //    prop_distance_bfs_bu_step_privatized_no_curr_remainders
-  //      <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
-  //          N,
-  //          M,
-  //          ovs,
-  //          oes,
-  //          owgts,
-  //          dists,
-  //          next_remainders,
-  //          next_rem_tail,
-  //          frontiers,
-  //          _d_qtail,
-  //          deps,
-  //          depths,
-  //          curr_depth);
-  //    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-  //    num_frontiers = _get_qsize();
-  //  }
-  //  else if (curr_depth == 2) {
-  //    std::cout << "num_remainders=" << num_remainders << '\n';
-  //    prop_distance_bfs_bu_step_privatized
-  //      <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
-  //          N,
-  //          M,
-  //          ovs,
-  //          oes,
-  //          owgts,
-  //          dists,
-  //          curr_remainders,
-  //          num_remainders,
-  //          next_remainders,
-  //          next_rem_tail,
-  //          frontiers,
-  //          _d_qtail,
-  //          deps,
-  //          depths,
-  //          curr_depth);
-  //    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-  //    num_frontiers = _get_qsize();
-  //  }
-  //  else {
+  //while (num_frontiers && num_remainders) {
+  //  if (num_frontiers*alpha < num_remainders) {
+  //    // run top-down step
   //    prop_distance_bfs_td_step_privatized
   //      <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
   //          N,
@@ -3607,33 +3484,186 @@ void CpGen::bfs_hybrid_privatized(
   //          deps,
   //          depths,
   //          curr_depth);
-  //    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-  //    num_frontiers = _get_qsize();
+  //    num_remainders -= num_frontiers; 
   //  }
+  //  else {
+  //    std::cout << "bottom-up @ depth " << curr_depth << '\n';
+  //    
+  //    if (!ran_first_bu_pass) {
+  //      ran_first_bu_pass = true;
+  //      std::cout << "first bu pass\n";
+  //      // we need to do a first pass to scan all the N vertices
+  //      // and get the remainder vertices
+  //      prop_distance_bfs_bu_step_privatized_no_curr_remainders
+  //        <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+  //            N,
+  //            M,
+  //            ovs,
+  //            oes,
+  //            owgts,
+  //            dists,
+  //            next_remainders,
+  //            next_rem_tail,
+  //            frontiers,
+  //            _d_qtail,
+  //            deps,
+  //            depths,
+  //            curr_depth);
+  //    }
+  //    else {
+  //      
+  //      
+  //      // run bottom-up step
+  //      prop_distance_bfs_bu_step_privatized
+  //        <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
+  //            N,
+  //            M,
+  //            ovs,
+  //            oes,
+  //            owgts,
+  //            dists,
+  //            curr_remainders,
+  //            num_remainders,
+  //            next_remainders,
+  //            next_rem_tail,
+  //            frontiers,
+  //            _d_qtail,
+  //            deps,
+  //            depths,
+  //            curr_depth);
+  //    }
 
-  //  // copy num_remainder from device
-  //  cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-  //      cudaMemcpyDeviceToHost);
-  //  
-  //  thrust::swap_ranges(
-  //    thrust::device,
-  //    next_remainders,
-  //    next_remainders+N,
-  //    curr_remainders);
-  //  
-  //  // reset the tail of the next remainders
-  //  set_kernel<<<1, 1>>>(next_rem_tail, 0);
+  //    // copy num_remainder from device
+  //    cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+  //        cudaMemcpyDeviceToHost);
 
-  //  //std::cout << "depth " << curr_depth << '\n';
-  //  //print_range("frontiers", frontiers, frontiers+N);
-  //  //print_range("curr_remainders", curr_remainders, curr_remainders+N);
-  //  //print_range("next_remainders", next_remainders, next_remainders+N);
-  //  //print_range("deps", deps, deps+N);
-  //  //print_range("distances", dists, dists+N);
-  //  //print_range("depths", depths, depths+N);
+  //    // reset the tail of the next remainders
+  //    set_kernel<<<1, 1>>>(next_rem_tail, 0);
+  //    
+  //    // only copy the next_remainders to curr_remainders when necessary
+  //    // we also don't need to copy all N elements
+  //    // just the num_remainders
+  //    thrust::copy(
+  //      thrust::device,
+  //      next_remainders,
+  //      next_remainders+num_remainders,
+  //      curr_remainders);
+
+  //  }
+  //  
+  //  // equivalent to std::swap(curr_frontiers, next_frontiers)
+  //  // if we use two arrays to keep track of the frontiers
+  //  inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+  //  num_frontiers = _get_qsize();
 
   //  curr_depth++;
   //}
+
+  // TODO: make this into a unit test
+  while (num_frontiers > 0) {
+    if (curr_depth == 1) {
+      prop_distance_bfs_bu_step_privatized_no_curr_remainders
+        <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+            N,
+            M,
+            ovs,
+            oes,
+            owgts,
+            dists,
+            next_remainders,
+            next_rem_tail,
+            frontiers,
+            _d_qtail,
+            deps,
+            depths,
+            curr_depth);
+      
+      // copy num_remainder from device
+      cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+          cudaMemcpyDeviceToHost);
+      
+      std::cout << "num_remainders=" << num_remainders << '\n';
+      set_kernel<<<1, 1>>>(next_rem_tail, 0);
+      
+      
+      thrust::copy(
+        thrust::device,
+        next_remainders,
+        next_remainders+num_remainders,
+        curr_remainders);
+
+
+    }
+    else if (curr_depth >= 4 && curr_depth < 15) {
+      
+      prop_distance_bfs_bu_step_privatized
+        <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
+            N,
+            M,
+            ovs,
+            oes,
+            owgts,
+            dists,
+            curr_remainders,
+            num_remainders,
+            next_remainders,
+            next_rem_tail,
+            frontiers,
+            _d_qtail,
+            deps,
+            depths,
+            curr_depth);
+      
+      // copy num_remainder from device
+      cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+          cudaMemcpyDeviceToHost);
+      
+      std::cout << "num_remainders=" << num_remainders << '\n';
+      // reset the tail of the next remainders
+      set_kernel<<<1, 1>>>(next_rem_tail, 0);
+      
+      
+      thrust::copy(
+        thrust::device,
+        next_remainders,
+        next_remainders+num_remainders,
+        curr_remainders);
+    
+    }
+    else {
+      prop_distance_bfs_td_step_privatized
+        <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
+            N,
+            M,
+            ivs,
+            ies,
+            iwgts,
+            dists,
+            frontiers,
+            _d_qhead,
+            _d_qtail,
+            num_frontiers,
+            deps,
+            depths,
+            curr_depth);
+    
+    }
+
+    inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+    num_frontiers = _get_qsize();
+    
+    
+
+    //std::cout << "depth " << curr_depth << '\n';
+    //print_range("frontiers", frontiers, frontiers+N);
+    //print_range("curr_remainders", curr_remainders, curr_remainders+N);
+    //print_range("next_remainders", next_remainders, next_remainders+N);
+    //print_range("deps", deps, deps+N);
+    //print_range("distances", dists, dists+N);
+    //print_range("depths", depths, depths+N);
+
+    curr_depth++;
+  }
 
   std::cout << "total depth=" << curr_depth << '\n';
 }
