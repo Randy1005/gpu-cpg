@@ -845,59 +845,56 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (tid < num_curr_remainders) {
     const auto u = curr_remainders[tid];
-    if (depths[u] != -1) {
-      return;
-    }
-    
-    const auto e_beg = overts[u];
-    const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
-    
-    auto min_dist{distances[u]};
-    for (auto e = e_beg; e < e_end; e++) {
-      // if any of the neighbors has unresolved dependencies
-      // we should add u to the next remainder list 
-      const auto v = oedges[e];
-      if (depths[v] == current_depth) {
-        int wgt = owgts[e] * SCALE_UP;
-        min_dist = min(min_dist, distances[v]+wgt);
-        deps[u]--;
+    if (depths[u] == -1) {
+      const auto e_beg = overts[u];
+      const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
+      auto min_dist{distances[u]};
+      for (auto e = e_beg; e < e_end; e++) {
+        // if any of the neighbors has unresolved dependencies
+        // we should add u to the next remainder list 
+        const auto v = oedges[e];
+        if (depths[v] == current_depth) {
+          int wgt = owgts[e] * SCALE_UP;
+          min_dist = min(min_dist, distances[v]+wgt);
+          deps[u]--;
+        }
       }
-    }
 
-    distances[u] = min_dist;
-    
-    if (deps[u] > 0) {
-      // u stays in the remainder list
-      // add u to the local remainder buffer
-      // we check if there's more space in the shared remainder storage
-      const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
-      if (local_rem_idx < S_REMAINDER_CAPACITY) {
-        // if we have more space, store to the local remainder buffer
-        local_next_remainders[local_rem_idx] = u;
-      }
-      else {
-        // if not, write back to global memory
-        num_local_next_remainders = S_REMAINDER_CAPACITY;
-        enqueue(u, next_remainders, next_rem_tail);
-      }
-    }
-    else {
-      // u is now a frontier
       distances[u] = min_dist;
-
-      // update u's depth
-      depths[u] = current_depth + 1;
-      // add u to the local frontier buffer
-      // we check if there's more space in the shared frontier storage
-      const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
-      if (local_frontier_idx < S_FRONTIER_CAPACITY) {
-        // if we have more space, store to the local frontier buffer
-        local_next_frontiers[local_frontier_idx] = u;
+    
+      if (deps[u] > 0) {
+        // u stays in the remainder list
+        // add u to the local remainder buffer
+        // we check if there's more space in the shared remainder storage
+        const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
+        if (local_rem_idx < S_REMAINDER_CAPACITY) {
+          // if we have more space, store to the local remainder buffer
+          local_next_remainders[local_rem_idx] = u;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_next_remainders = S_REMAINDER_CAPACITY;
+          enqueue(u, next_remainders, next_rem_tail);
+        }
       }
       else {
-        // if not, write back to global memory
-        num_local_next_frontiers = S_FRONTIER_CAPACITY;
-        enqueue(u, frontiers, ftr_tail);
+        // u is now a frontier
+        distances[u] = min_dist;
+
+        // update u's depth
+        depths[u] = current_depth + 1;
+        // add u to the local frontier buffer
+        // we check if there's more space in the shared frontier storage
+        const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
+        if (local_frontier_idx < S_FRONTIER_CAPACITY) {
+          // if we have more space, store to the local frontier buffer
+          local_next_frontiers[local_frontier_idx] = u;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_next_frontiers = S_FRONTIER_CAPACITY;
+          enqueue(u, frontiers, ftr_tail);
+        }
       }
     }
   }
@@ -2051,6 +2048,29 @@ void CpGen::report_paths(
 		touched[sink]	= true;
 	}
 
+  // these data structures are for the BFS hybrid method
+  // initialize the remainder storages
+  thrust::device_vector<int> curr_remainders(num_verts, -1); 
+  thrust::device_vector<int> next_remainders(num_verts, -1);
+  auto d_curr_remainders = thrust::raw_pointer_cast(&curr_remainders[0]);
+  auto d_next_remainders = thrust::raw_pointer_cast(&next_remainders[0]);
+  
+  // initialize the frontier vertices
+  thrust::device_vector<int> frontiers(h_queue);
+  auto d_frontiers = thrust::raw_pointer_cast(&frontiers[0]);
+  
+  // initialize the depths of the vertices
+  thrust::device_vector<int> depths(num_verts, -1);
+  for (const auto& sink: _sinks) {
+    depths[sink] = 0;
+  }
+  auto d_depths = thrust::raw_pointer_cast(&depths[0]);
+  
+  // initialize the tail for next_remainder
+  auto next_rem_tail = thrust::device_new<int>();
+  thrust::fill(next_rem_tail, next_rem_tail+1, 0);
+
+
 	Timer timer_cpg;
 
 	timer_cpg.start();
@@ -2121,27 +2141,7 @@ void CpGen::report_paths(
     //  enable_runtime_log_file);
   }
   else if (pd_method == PropDistMethod::BFS_HYBRID_PRIVATIZED) {
-    // initialize the remainder storages
-    thrust::device_vector<int> curr_remainders(num_verts, -1); 
-    thrust::device_vector<int> next_remainders(num_verts, -1);
-    auto d_curr_remainders = thrust::raw_pointer_cast(&curr_remainders[0]);
-    auto d_next_remainders = thrust::raw_pointer_cast(&next_remainders[0]);
-   
-    // initialize the frontier vertices
-    thrust::device_vector<int> frontiers(h_queue);
-    auto d_frontiers = thrust::raw_pointer_cast(&frontiers[0]);
-   
-    // initialize the depths of the vertices
-    thrust::device_vector<int> depths(num_verts, -1);
-    for (const auto& sink: _sinks) {
-      depths[sink] = 0;
-    }
-    auto d_depths = thrust::raw_pointer_cast(&depths[0]);
-   
-    // initialize the tail for next_remainder
-    auto next_rem_tail = thrust::device_new<int>();
-    thrust::fill(next_rem_tail, next_rem_tail+1, 0);
-  
+      
     bfs_hybrid_privatized(
       alpha,
       d_fanin_adjp, 
@@ -3465,172 +3465,15 @@ void CpGen::bfs_hybrid_privatized(
   int num_frontiers{num_sinks}, curr_depth{0};
   int num_remainders{N};
 
+  double td_scans = num_frontiers;
+  double bu_scans = num_remainders;
+  
   bool ran_first_bu_pass{false};
-  //while (num_frontiers && num_remainders) {
-  //  if (num_frontiers*alpha < num_remainders) {
-  //    // run top-down step
-  //    prop_distance_bfs_td_step_privatized
-  //      <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
-  //          N,
-  //          M,
-  //          ivs,
-  //          ies,
-  //          iwgts,
-  //          dists,
-  //          frontiers,
-  //          _d_qhead,
-  //          _d_qtail,
-  //          num_frontiers,
-  //          deps,
-  //          depths,
-  //          curr_depth);
-  //    num_remainders -= num_frontiers; 
-  //  }
-  //  else {
-  //    std::cout << "bottom-up @ depth " << curr_depth << '\n';
-  //    
-  //    if (!ran_first_bu_pass) {
-  //      ran_first_bu_pass = true;
-  //      std::cout << "first bu pass\n";
-  //      // we need to do a first pass to scan all the N vertices
-  //      // and get the remainder vertices
-  //      prop_distance_bfs_bu_step_privatized_no_curr_remainders
-  //        <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
-  //            N,
-  //            M,
-  //            ovs,
-  //            oes,
-  //            owgts,
-  //            dists,
-  //            next_remainders,
-  //            next_rem_tail,
-  //            frontiers,
-  //            _d_qtail,
-  //            deps,
-  //            depths,
-  //            curr_depth);
-  //    }
-  //    else {
-  //      
-  //      
-  //      // run bottom-up step
-  //      prop_distance_bfs_bu_step_privatized
-  //        <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
-  //            N,
-  //            M,
-  //            ovs,
-  //            oes,
-  //            owgts,
-  //            dists,
-  //            curr_remainders,
-  //            num_remainders,
-  //            next_remainders,
-  //            next_rem_tail,
-  //            frontiers,
-  //            _d_qtail,
-  //            deps,
-  //            depths,
-  //            curr_depth);
-  //    }
-
-  //    // copy num_remainder from device
-  //    cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-  //        cudaMemcpyDeviceToHost);
-
-  //    // reset the tail of the next remainders
-  //    set_kernel<<<1, 1>>>(next_rem_tail, 0);
-  //    
-  //    // only copy the next_remainders to curr_remainders when necessary
-  //    // we also don't need to copy all N elements
-  //    // just the num_remainders
-  //    thrust::copy(
-  //      thrust::device,
-  //      next_remainders,
-  //      next_remainders+num_remainders,
-  //      curr_remainders);
-
-  //  }
-  //  
-  //  // equivalent to std::swap(curr_frontiers, next_frontiers)
-  //  // if we use two arrays to keep track of the frontiers
-  //  inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-  //  num_frontiers = _get_qsize();
-
-  //  curr_depth++;
-  //}
-
-  // TODO: make this into a unit test
-  while (num_frontiers > 0) {
-    if (curr_depth == 1) {
-      prop_distance_bfs_bu_step_privatized_no_curr_remainders
-        <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
-            N,
-            M,
-            ovs,
-            oes,
-            owgts,
-            dists,
-            next_remainders,
-            next_rem_tail,
-            frontiers,
-            _d_qtail,
-            deps,
-            depths,
-            curr_depth);
-      
-      // copy num_remainder from device
-      cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-          cudaMemcpyDeviceToHost);
-      
-      std::cout << "num_remainders=" << num_remainders << '\n';
-      set_kernel<<<1, 1>>>(next_rem_tail, 0);
-      
-      
-      thrust::copy(
-        thrust::device,
-        next_remainders,
-        next_remainders+num_remainders,
-        curr_remainders);
-
-
-    }
-    else if (curr_depth >= 4 && curr_depth < 15) {
-      
-      prop_distance_bfs_bu_step_privatized
-        <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
-            N,
-            M,
-            ovs,
-            oes,
-            owgts,
-            dists,
-            curr_remainders,
-            num_remainders,
-            next_remainders,
-            next_rem_tail,
-            frontiers,
-            _d_qtail,
-            deps,
-            depths,
-            curr_depth);
-      
-      // copy num_remainder from device
-      cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-          cudaMemcpyDeviceToHost);
-      
-      std::cout << "num_remainders=" << num_remainders << '\n';
-      // reset the tail of the next remainders
-      set_kernel<<<1, 1>>>(next_rem_tail, 0);
-      
-      
-      thrust::copy(
-        thrust::device,
-        next_remainders,
-        next_remainders+num_remainders,
-        curr_remainders);
+  while (num_frontiers && num_remainders) {
+    //std::cout << "td_scans=" << td_scans << " bu_scans=" << bu_scans << '\n';
     
-    }
-    else {
+    if (td_scans*alpha < bu_scans) {
+      // run top-down step
       prop_distance_bfs_td_step_privatized
         <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
             N,
@@ -3646,24 +3489,186 @@ void CpGen::bfs_hybrid_privatized(
             deps,
             depths,
             curr_depth);
-    
+      bu_scans -= td_scans; 
     }
+    else {
+      //std::cout << "bottom-up @ depth " << curr_depth << '\n';
+      
+      if (!ran_first_bu_pass) {
+        ran_first_bu_pass = true;
+        // we need to do a first pass to scan all the N vertices
+        // and get the remainder vertices
+        prop_distance_bfs_bu_step_privatized_no_curr_remainders
+          <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+              N,
+              M,
+              ovs,
+              oes,
+              owgts,
+              dists,
+              curr_remainders,
+              next_rem_tail,
+              frontiers,
+              _d_qtail,
+              deps,
+              depths,
+              curr_depth);
+           
+      
+        // copy num_remainder from device
+        cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+            cudaMemcpyDeviceToHost);
 
+        // reset the tail of the next remainders
+        set_kernel<<<1, 1>>>(next_rem_tail, 0);
+      }
+      else {
+        // run bottom-up step
+        prop_distance_bfs_bu_step_privatized
+          <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
+              N,
+              M,
+              ovs,
+              oes,
+              owgts,
+              dists,
+              curr_remainders,
+              num_remainders,
+              next_remainders,
+              next_rem_tail,
+              frontiers,
+              _d_qtail,
+              deps,
+              depths,
+              curr_depth);
+        
+        // copy num_remainder from device
+        cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int), 
+          cudaMemcpyDeviceToHost);
+
+        // reset the tail of the next remainders
+        set_kernel<<<1, 1>>>(next_rem_tail, 0);
+
+        // copy the next_remainders to curr_remainders
+        // we don't need to copy all N elements
+        // just the num_remainders
+        thrust::copy(
+          thrust::device,
+          next_remainders,
+          next_remainders+num_remainders,
+          curr_remainders);      
+      }
+    
+      bu_scans = num_remainders;
+    }
+    
+    
+    // equivalent to std::swap(curr_frontiers, next_frontiers)
+    // if we use two arrays to keep track of the frontiers
     inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
     num_frontiers = _get_qsize();
+    td_scans = num_frontiers;
     
-    
-
-    //std::cout << "depth " << curr_depth << '\n';
-    //print_range("frontiers", frontiers, frontiers+N);
-    //print_range("curr_remainders", curr_remainders, curr_remainders+N);
-    //print_range("next_remainders", next_remainders, next_remainders+N);
-    //print_range("deps", deps, deps+N);
-    //print_range("distances", dists, dists+N);
-    //print_range("depths", depths, depths+N);
-
     curr_depth++;
   }
+
+  // TODO: make this into a unit test
+  //while (num_frontiers > 0) {
+  //  if (curr_depth == 1) {
+  //    prop_distance_bfs_bu_step_privatized_no_curr_remainders
+  //      <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+  //          N,
+  //          M,
+  //          ovs,
+  //          oes,
+  //          owgts,
+  //          dists,
+  //          curr_remainders,
+  //          next_rem_tail,
+  //          frontiers,
+  //          _d_qtail,
+  //          deps,
+  //          depths,
+  //          curr_depth);
+  //    
+  //    // copy num_remainder from device
+  //    cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+  //        cudaMemcpyDeviceToHost);
+  //    
+  //    std::cout << "num_remainders=" << num_remainders << '\n';
+  //    set_kernel<<<1, 1>>>(next_rem_tail, 0);
+
+  //  }
+  //  else if (curr_depth == 4 || curr_depth == 5) {
+  //    
+  //    prop_distance_bfs_bu_step_privatized
+  //      <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
+  //          N,
+  //          M,
+  //          ovs,
+  //          oes,
+  //          owgts,
+  //          dists,
+  //          curr_remainders,
+  //          num_remainders,
+  //          next_remainders,
+  //          next_rem_tail,
+  //          frontiers,
+  //          _d_qtail,
+  //          deps,
+  //          depths,
+  //          curr_depth);
+  //    
+  //    // copy num_remainder from device
+  //    cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+  //        cudaMemcpyDeviceToHost);
+  //    
+  //    std::cout << "num_remainders=" << num_remainders << '\n';
+  //    // reset the tail of the next remainders
+  //    set_kernel<<<1, 1>>>(next_rem_tail, 0);
+  //    
+  //    
+  //    thrust::copy(
+  //      thrust::device,
+  //      next_remainders,
+  //      next_remainders+num_remainders,
+  //      curr_remainders);
+  //  
+  //  }
+  //  else {
+  //    prop_distance_bfs_td_step_privatized
+  //      <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
+  //          N,
+  //          M,
+  //          ivs,
+  //          ies,
+  //          iwgts,
+  //          dists,
+  //          frontiers,
+  //          _d_qhead,
+  //          _d_qtail,
+  //          num_frontiers,
+  //          deps,
+  //          depths,
+  //          curr_depth);
+  //  
+  //  }
+
+  //  inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+  //  num_frontiers = _get_qsize();
+  //  
+  //  
+  //  //std::cout << "===============\n";
+  //  //std::cout << "depth " << curr_depth << '\n';
+  //  //print_range("frontiers", frontiers, frontiers+N);
+  //  //print_range("curr_remainders", curr_remainders, curr_remainders+N);
+  //  //print_range("next_remainders", next_remainders, next_remainders+N);
+  //  //print_range("deps", deps, deps+N);
+  //  //print_range("distances", dists, dists+N);
+  //  //print_range("depths", depths, depths+N);
+
+  //  curr_depth++;
+  //}
 
   std::cout << "total depth=" << curr_depth << '\n';
 }
