@@ -3,7 +3,7 @@
 
 int main(int argc, char* argv[]) {
   if (argc != 3) {
-    std::cerr << "usage: ./a.out [MDL] [result_filename]";
+    std::cerr << "usage: ./a.out [MDL] [result_filename]\n";
     std::exit(1);
   }
   
@@ -24,28 +24,44 @@ int main(int argc, char* argv[]) {
   auto base_pd_method = gpucpg::PropDistMethod::BASIC;
   auto base_pe_method = gpucpg::PfxtExpMethod::BASIC;
   
-  auto my_pd_method = gpucpg::PropDistMethod::BFS_PRIVATIZED_MERGED;
+  auto my_pd_method = gpucpg::PropDistMethod::BFS_HYBRID_PRIVATIZED;
   auto my_pe_method = gpucpg::PfxtExpMethod::SHORT_LONG;
   
   bool enable_compress{true};
 
+  // if the result_file exists, rename it with a suffix ".backup"
+  std::ifstream ifs(result_file);
+  if (ifs.good()) {
+    std::string backup_file = std::string(result_file) + ".backup";
+    std::rename(result_file, backup_file.c_str());
+  }
+  ifs.close();
+  // create a new result_file
   std::ofstream os(result_file);
+  
   for (const auto& [benchmark, k] : benchmark_ks) {
-    gpucpg::CpGen base_cpgen, my_cpgen;
-    base_cpgen.read_input(benchmark);
-    my_cpgen.read_input(benchmark);
-    os << "benchmark=" << benchmark << '\n';
-    os << "k=" << k << '\n';
-    os << "num_verts=" << base_cpgen.num_verts() << '\n';
-    os << "num_edges=" << base_cpgen.num_edges() << '\n';
-
     auto base_pd_time_sum{Timer::elapsed_time_t::zero()};
     auto base_pe_time_sum{Timer::elapsed_time_t::zero()};
     auto my_pd_time_sum{Timer::elapsed_time_t::zero()};
     auto my_pe_time_sum{Timer::elapsed_time_t::zero()};
     size_t runs{10};
+    int N, M;
     for (size_t i = 0; i < runs; i++) {
-      os << " ======== run " << i << " ========\n";
+      gpucpg::CpGen base_cpgen, my_cpgen;
+      #pragma omp parallel
+      {
+        #pragma omp single
+        {
+          #pragma omp task
+          base_cpgen.read_input(benchmark);
+          #pragma omp task
+          my_cpgen.read_input(benchmark);
+        }
+      }
+      #pragma omp taskwait
+      N = base_cpgen.num_verts();
+      M = base_cpgen.num_edges();
+
       base_cpgen.report_paths(k, MDL, enable_compress, base_pd_method,
           base_pe_method);
       base_pd_time_sum += base_cpgen.prop_time;
@@ -59,7 +75,11 @@ int main(int argc, char* argv[]) {
     base_pe_time_sum /= runs;
     my_pd_time_sum /= runs;
     my_pe_time_sum /= runs;
-
+    
+    os << "========= benchmark=" << benchmark << " ========\n";
+    os << "k=" << k << '\n';
+    os << "num_verts=" << N << '\n';
+    os << "num_edges=" << M << '\n';
     os << "baseline avg. PD time=" << base_pd_time_sum / 1ms << " ms\n";
     os << "baseline avg. PE time=" << base_pe_time_sum / 1ms << " ms\n";
     os << "my avg. PD time=" << my_pd_time_sum / 1ms << " ms\n";

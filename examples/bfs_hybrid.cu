@@ -27,13 +27,12 @@ int main(int argc, char* argv[]) {
   }
   #pragma omp taskwait
  
-
   std::cout << "num_verts=" << cpgen_td_priv.num_verts() << '\n';
   std::cout << "num_edges=" << cpgen_td_priv.num_edges() << '\n';
   cpgen_td_priv.report_paths(num_paths, max_dev_lvls, enable_compress,
       gpucpg::PropDistMethod::BFS_TOP_DOWN_PRIVATIZED, pe_method, enable_log);
   cpgen_hybrid_priv.report_paths(num_paths, max_dev_lvls, enable_compress,
-      gpucpg::PropDistMethod::BFS_HYBRID_PRIVATIZED, pe_method, enable_log); 
+      gpucpg::PropDistMethod::BFS_HYBRID_PRIVATIZED, pe_method, enable_log, 0.005f, alpha); 
   auto slks_td_priv = cpgen_td_priv.get_slacks(num_paths);
   auto slks_hybrid_priv = cpgen_hybrid_priv.get_slacks(num_paths);
 
@@ -41,6 +40,5 @@ int main(int argc, char* argv[]) {
   std::cout << "DP runtime=" << cpgen_td_priv.prop_time / 1ms << " ms.\n";
   std::cout << "BFS_HYBRID_PRIVATIZED: k-th slack=" << slks_hybrid_priv.back() << "\n";
   std::cout << "DP runtime=" << cpgen_hybrid_priv.prop_time / 1ms << " ms.\n";
-
   return 0;
 }

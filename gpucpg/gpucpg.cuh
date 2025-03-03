@@ -127,7 +127,7 @@ public:
     const PfxtExpMethod pe_method,
     const bool enable_runtime_log_file = false,
     const float init_split_perc = 0.005f,
-    const float alpha = 15.0f);
+    const float alpha = 2.0f);
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);

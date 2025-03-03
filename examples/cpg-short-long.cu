@@ -15,18 +15,18 @@ int main(int argc, char* argv[]) {
   std::cout << "num_verts=" << cpgen.num_verts() << '\n';
   std::cout << "num_edges=" << cpgen.num_edges() << '\n';
   cpgen.report_paths(num_paths, 10, true,
-      gpucpg::PropDistMethod::BFS_PRIVATIZED_MERGED,
+      gpucpg::PropDistMethod::BFS_HYBRID_PRIVATIZED,
       gpucpg::PfxtExpMethod::SHORT_LONG);
 
   cpgen_sequential.report_paths(num_paths, 10, true,
-      gpucpg::PropDistMethod::BFS_PRIVATIZED_MERGED,
+      gpucpg::PropDistMethod::BFS_HYBRID_PRIVATIZED,
       gpucpg::PfxtExpMethod::SEQUENTIAL);
  
   auto seq_slacks = cpgen_sequential.get_slacks(num_paths);
   auto my_slacks = cpgen.get_slacks(num_paths);
 
   std::cout << "golden k-th slack=" << seq_slacks.back() << '\n';
-  std::cout << "BFS_PRIVATIZED DP runtime=" << cpgen_sequential.prop_time / 1ms <<
+  std::cout << "BFS_HYBRID_PRIVATIZED DP runtime=" << cpgen_sequential.prop_time / 1ms <<
     " ms.\n";
   std::cout << "sequential PE runtime=" << cpgen_sequential.expand_time/ 1ms <<
     " ms.\n";

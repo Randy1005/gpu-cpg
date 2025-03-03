@@ -2301,14 +2301,14 @@ void CpGen::report_paths(
     int num_frontiers{static_cast<int>(_sinks.size())}; 
     
     // timer to record the time taken for each step
-    Timer timer;
-    std::ofstream log("bfs_td_step_rt.csv");
-    if (enable_runtime_log_file) {
-      log << "depth runtime\n";
-    }
+    //Timer timer;
+    //std::ofstream log("bfs_td_step_rt.csv");
+    //if (enable_runtime_log_file) {
+    //  log << "depth,runtime(top-down)\n";
+    //}
     
     while (num_frontiers > 0) {
-      timer.start();
+      //timer.start();
       prop_distance_bfs_td_step_privatized
         <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
           num_verts,
@@ -2324,11 +2324,11 @@ void CpGen::report_paths(
           d_deps,
           d_depths,
           curr_depth);
-      
-      timer.stop();
-      if (enable_runtime_log_file) {
-        log << curr_depth << ' ' << timer.get_elapsed_time() / 1us << '\n';
-      }
+     
+      //timer.stop();
+      //if (enable_runtime_log_file) {
+      //  log << curr_depth << ',' << timer.get_elapsed_time() / 1us << '\n';
+      //}
       // update queue head once here
       inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
       
@@ -2336,7 +2336,7 @@ void CpGen::report_paths(
       num_frontiers = _get_qsize();
       curr_depth++;
     }
-    std::cout << "total depth=" << curr_depth << '\n';
+    //std::cout << "total depth=" << curr_depth << '\n';
   }
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
     //int qsize{static_cast<int>(_sinks.size())}; 
@@ -2416,22 +2416,24 @@ void CpGen::report_paths(
     }
   }
 
+  cudaDeviceSynchronize();
+	timer_cpg.stop();
+	prop_time = timer_cpg.get_elapsed_time();
+ 
   // copy distance vector back to host
   std::vector<int> h_dists(num_verts);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
 
-	timer_cpg.stop();
-	prop_time = timer_cpg.get_elapsed_time();
-
   // get successors of each vertex (the next hop on the shortest path) 
-  update_successors<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
-      (num_verts, 
-       num_edges,
-       d_fanin_adjp,
-       d_fanin_adjncy,
-       d_fanin_wgts,
-       d_dists_cache,
-       d_succs);
+  update_successors
+    <<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>(
+      num_verts, 
+      num_edges,
+      d_fanin_adjp,
+      d_fanin_adjncy,
+      d_fanin_wgts,
+      d_dists_cache,
+      d_succs);
   
   // host level offsets
   std::vector<int> _h_lvl_offsets(max_dev_lvls+1, 0);
@@ -3076,36 +3078,33 @@ void CpGen::report_paths(
     _h_pfxt_nodes = std::move(paths);
   }
 
-	timer_cpg.stop();
-	expand_time = timer_cpg.get_elapsed_time();
-
-  std::string slk_output_file;
   if (pe_method == PfxtExpMethod::BASIC ||
       pe_method == PfxtExpMethod::PRECOMP_SPURS ||
       pe_method == PfxtExpMethod::ATOMIC_ENQ) {
   
     int total_paths{0};
-    std::cout << "==== level-by-level expansion ====\n";
+    //std::cout << "==== level-by-level expansion ====\n";
     for (int i = 0; i < max_dev_lvls; i++) {
       auto beg = _h_lvl_offsets[i];
       auto end = _h_lvl_offsets[i+1];
       auto lvl_size = (beg > end) ? 0 : end-beg;
       total_paths += lvl_size;
-      std::cout << "pfxt level " << i << " size=" << lvl_size << '\n';
+      //std::cout << "pfxt level " << i << " size=" << lvl_size << '\n';
     }
-    std::cout << "total pfxt nodes=" << total_paths << '\n';
-    std::cout << "==================================\n";
     _h_pfxt_nodes.resize(total_paths);
     thrust::sort(pfxt_nodes.begin(), pfxt_nodes.end(), pfxt_node_comp());
     thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
   }
   else if (pe_method == PfxtExpMethod::SHORT_LONG) {
-    std::cout << "==== short-long expansion ====\n";
-    std::cout << "short_pile_size=" << short_pile_size << '\n';
+    //std::cout << "==== short-long expansion ====\n";
+    //std::cout << "short_pile_size=" << short_pile_size << '\n';
     _h_pfxt_nodes.resize(short_pile_size);
     thrust::sort(short_pile.begin(), short_pile.end(), pfxt_node_comp());
     thrust::copy(short_pile.begin(), short_pile.end(), _h_pfxt_nodes.begin());
   }
+
+	timer_cpg.stop();
+	expand_time = timer_cpg.get_elapsed_time();
 
   // free gpu memory
   _free();
@@ -3463,24 +3462,22 @@ void CpGen::bfs_hybrid_privatized(
   // separate the tracking of:
   // num_remainders / bu_scans
   // num_frontiers / td_scans
-  // because num_remainders will be used to launch the bfs steps (and is onlu updated when running bu_step)
+  // because num_remainders will be used to launch the bfs steps (and is only updated when running bu_step)
   // it should not be affected by the heuristic information update
-  double td_scans = num_frontiers;
-  double bu_scans = num_remainders;
+  double td_scans = num_sinks;
+  double bu_scans = N;
  
   // a timer to record the runtime of each step
-  Timer timer;
-  std::ofstream rtlog("bfs_hybrid_step_rt.csv");
-  if (enable_runtime_log_file) {
-    rtlog << "depth runtime td_or_bu\n";
-  }
+  //Timer timer;
+  //std::ofstream rtlog("bfs_hybrid_step_rt.csv");
+  //if (enable_runtime_log_file) {
+  //  rtlog << "depth,runtime(hybrid),td_or_bu\n";
+  //}
 
   bool ran_first_bu_pass{false};
   while (num_frontiers && num_remainders) {
-    //std::cout << "td_scans=" << td_scans << " bu_scans=" << bu_scans << '\n';
-    
-    if (td_scans*alpha < bu_scans) {
-      timer.start();
+    if (num_frontiers*alpha < bu_scans) {
+      //timer.start();
       // run top-down step
       prop_distance_bfs_td_step_privatized
         <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
@@ -3497,20 +3494,20 @@ void CpGen::bfs_hybrid_privatized(
             deps,
             depths,
             curr_depth);
-      timer.stop();
-      bu_scans -= td_scans;
-      if (enable_runtime_log_file) {
-        rtlog << curr_depth << ' ' << timer.get_elapsed_time() / 1us << " TD\n";
-      } 
+      
+      //timer.stop();
+      //if (enable_runtime_log_file) {
+      //  rtlog << curr_depth << ',' << timer.get_elapsed_time() / 1us << ",TD\n";
+      //} 
     }
     else {
-      //std::cout << "bottom-up @ depth " << curr_depth << '\n';
-      
-      if (!ran_first_bu_pass) {
-        ran_first_bu_pass = true;
+      std::cout << "num_remainders=" << num_remainders << '\n';
+      std::cout << "num_frontiers=" << num_frontiers << '\n';
+      std::cout << "bu_scans=" << bu_scans << '\n';
+      if (num_remainders == N) {
         // we need to do a first pass to scan all the N vertices
         // and get the remainder vertices
-        timer.start();
+        //timer.start();
         prop_distance_bfs_bu_step_privatized_no_curr_remainders
           <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
               N,
@@ -3526,18 +3523,18 @@ void CpGen::bfs_hybrid_privatized(
               deps,
               depths,
               curr_depth);
-        timer.stop();
-      
-        // copy num_remainder from device
+        //timer.stop();
+     
+        // update the number of remainders
         cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
             cudaMemcpyDeviceToHost);
-
+        
         // reset the tail of the next remainders
         set_kernel<<<1, 1>>>(next_rem_tail, 0);
       }
       else {
         // run bottom-up step
-        timer.start();
+        //timer.start();
         prop_distance_bfs_bu_step_privatized
           <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
               N,
@@ -3555,11 +3552,11 @@ void CpGen::bfs_hybrid_privatized(
               deps,
               depths,
               curr_depth);
-        timer.stop();    
-        
-        // copy num_remainder from device
-        cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int), 
-          cudaMemcpyDeviceToHost);
+        //timer.stop();    
+       
+        // update the number of remainders
+        cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+            cudaMemcpyDeviceToHost);
 
         // reset the tail of the next remainders
         set_kernel<<<1, 1>>>(next_rem_tail, 0);
@@ -3573,22 +3570,17 @@ void CpGen::bfs_hybrid_privatized(
           next_remainders+num_remainders,
           curr_remainders);      
       }
-      // update the bottom-up scans
-      bu_scans = num_remainders;
       
-      if (enable_runtime_log_file) {
-        rtlog << curr_depth << ' ' << timer.get_elapsed_time() / 1us << " BU\n";
-      }
+      //if (enable_runtime_log_file) {
+      //  rtlog << curr_depth << ',' << timer.get_elapsed_time() / 1us << ",BU\n";
+      //}
     }
-    
     
     // equivalent to std::swap(curr_frontiers, next_frontiers)
     // if we use two arrays to keep track of the frontiers
     inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+    bu_scans -= num_frontiers;
     num_frontiers = _get_qsize();
-    
-    // update the top-down scans
-    td_scans = num_frontiers;
     
     // increment depth
     curr_depth++;
