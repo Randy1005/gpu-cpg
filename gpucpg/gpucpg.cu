@@ -18,7 +18,7 @@ namespace cg = cooperative_groups;
 #define BLOCKSIZE 512
 #define WARPS_PER_BLOCK 32
 #define WARP_SIZE 32
-#define S_BUFF_CAPACITY 2048 
+#define S_BUFF_CAPACITY 4096 
 #define S_FRONTIER_CAPACITY 4096 
 #define W_FRONTIER_CAPACITY 64
 #define S_PFXT_CAPACITY 1024 
@@ -616,7 +616,9 @@ __global__ void prop_distance_bfs_td_step(
     int* qhead,
     int* qtail,
     int qsize,
-    int* deps) {
+    int* deps,
+    int* depths,
+    int curr_depth) {
 
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (tid >= qsize) {
@@ -636,6 +638,7 @@ __global__ void prop_distance_bfs_td_step(
    
     // decrement the dependency counter for this neighbor
     if (atomicSub(&deps[neighbor], 1) == 1) {
+      depths[neighbor] = curr_depth + 1;
       // if this thread releases the last dependency
       // it should add this neighbor to the queue
       enqueue(neighbor, queue, qtail);
@@ -724,7 +727,7 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
   int* ftr_tail,
   int* deps,
   int* depths,
-  int current_depth) {  
+  int current_depth) {
   __shared__ int local_next_frontiers[S_BUFF_CAPACITY];
   __shared__ int num_local_next_frontiers;
   __shared__ int local_next_remainders[S_BUFF_CAPACITY];
@@ -847,7 +850,7 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (tid < num_curr_remainders) {
     const auto u = curr_remainders[tid];
-    if (depths[u] == -1) {
+    // if (depths[u] == -1) {
       const auto e_beg = overts[u];
       const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
       auto min_dist{distances[u]};
@@ -898,7 +901,7 @@ __global__ void prop_distance_bfs_bu_step_privatized(
           enqueue(u, frontiers, ftr_tail);
         }
       }
-    }
+    // }
   }
   
   this_block.sync();
@@ -1963,6 +1966,8 @@ void CpGen::report_paths(
   cudaFuncSetCacheConfig(prop_distance_bfs_td_step, cudaFuncCachePreferL1);
   cudaFuncSetCacheConfig(prop_distance_bfs_bu_step, cudaFuncCachePreferL1);
   cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
+  cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized_no_curr_remainders, cudaFuncCachePreferShared);
+  cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized, cudaFuncCachePreferShared);
   cudaFuncSetCacheConfig(prop_distance_bfs_td_step_single_block, cudaFuncCachePreferShared);
 
 
@@ -2052,8 +2057,8 @@ void CpGen::report_paths(
 
   // these data structures are for the BFS hybrid method
   // initialize the remainder storages
-  thrust::device_vector<int> curr_remainders(num_verts, -1); 
-  thrust::device_vector<int> next_remainders(num_verts, -1);
+  thrust::device_vector<int> curr_remainders(num_verts); 
+  thrust::device_vector<int> next_remainders(num_verts);
   auto d_curr_remainders = thrust::raw_pointer_cast(&curr_remainders[0]);
   auto d_next_remainders = thrust::raw_pointer_cast(&next_remainders[0]);
   
@@ -2247,10 +2252,11 @@ void CpGen::report_paths(
     checkError_t(cudaGraphDestroy(cug), "destroy cuGraph failed.");
   }
   else if (pd_method == PropDistMethod::BFS_TOP_DOWN) {
-    int qsize{static_cast<int>(_sinks.size())}; 
-    while (qsize > 0) {
+    int curr_depth{0};
+    int num_frontiers{static_cast<int>(_sinks.size())}; 
+    while (num_frontiers) {
       prop_distance_bfs_td_step
-      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+      <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
         num_verts,
         num_edges,
         d_fanin_adjp,
@@ -2260,15 +2266,17 @@ void CpGen::report_paths(
         d_queue,
         _d_qhead,
         _d_qtail,
-        qsize,
-        d_deps);
+        num_frontiers,
+        d_deps,
+        d_depths,
+        curr_depth);
       
       // update queue head once here
-      inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+      inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
         
       // update queue size
-      qsize = _get_qsize();
-      steps++;
+      num_frontiers = _get_qsize();
+      curr_depth++;
     }
   }
   else if (pd_method == PropDistMethod::BFS_TOP_DOWN_NO_ATOMICMIN) {
@@ -3338,103 +3346,103 @@ int CpGen::_get_expansion_window_size(int* p_start, int* p_end) {
 }
 
 
-void CpGen::bfs_hybrid(
-    const float alpha, 
-    int* iverts,
-    int* iedges,
-    float* iwgts,
-    int* overts,
-    int* oedges,
-    float* owgts,
-    int* dists, 
-    int* queue,
-    int* deps,
-    const bool enable_runtime_log_file) {
-	const int M{static_cast<int>(num_edges())};
-	const int N{static_cast<int>(num_verts())};
-	const int num_sinks{static_cast<int>(_sinks.size())};
-
-	int qsize{num_sinks}, steps{0};
-	int num_remaining_verts{N};
-
-	Timer timer;
-  std::ofstream rtlog("bfs_hybrid_step_rt.log");
-
-	while (qsize*alpha < num_remaining_verts) {
-		timer.start();
-		prop_distance_bfs_td_step
-      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
-				N,
-				M,
-				iverts,
-				iedges,
-				iwgts,
-				dists,
-				queue,
-				_d_qhead,
-				_d_qtail,
-				qsize,
-				deps);
-		inc_kernel<<<1, 1>>>(_d_qhead, qsize);
-		num_remaining_verts -= qsize;
-		qsize = _get_qsize();
-		steps++;
-		timer.stop();
-    if (enable_runtime_log_file) {
-      rtlog << timer.get_elapsed_time() / 1us << '\n';
-    }
-	}
-
-	// run bottom-up step
-	timer.start();	
-	
-  thrust::device_vector<int> remaining_verts(num_remaining_verts);
-  auto d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
-
-  // move untouched vertices to remaining_verts array
-  thrust::copy_if(thrust::make_counting_iterator(0), 
-          thrust::make_counting_iterator(N),
-          remaining_verts.begin(),
-          [deps] __device__ (const int v) {
-            return deps[v] > 0;
-          });
-  
-  timer.stop();
-  
-  if (enable_runtime_log_file) {
-    rtlog << timer.get_elapsed_time() / 1us << '\n';
-  } 
-
-	while (num_remaining_verts > 0) {
-    timer.start();
-		prop_distance_bfs_bu_step
-      <<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
-				N,
-				M,
-				overts,
-				oedges,
-				owgts,
-				dists,
-				d_remaining_verts,
-				num_remaining_verts,
-				deps);
-    
-    num_remaining_verts = thrust::remove_if(
-      remaining_verts.begin(), remaining_verts.end(),
-      [deps] __device__ (const int v) {
-        return deps[v] == 0;
-      }
-    ) - remaining_verts.begin();
-		
-		remaining_verts.resize(num_remaining_verts);
-		d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
-    steps++;
-		timer.stop();
-		if (enable_runtime_log_file) {
-      rtlog << timer.get_elapsed_time() / 1us << '\n';
-    }
-  }
-}
+//void CpGen::bfs_hybrid(
+//    const float alpha, 
+//    int* iverts,
+//    int* iedges,
+//    float* iwgts,
+//    int* overts,
+//    int* oedges,
+//    float* owgts,
+//    int* dists, 
+//    int* queue,
+//    int* deps,
+//    const bool enable_runtime_log_file) {
+//	const int M{static_cast<int>(num_edges())};
+//	const int N{static_cast<int>(num_verts())};
+//	const int num_sinks{static_cast<int>(_sinks.size())};
+//
+//	int qsize{num_sinks}, steps{0};
+//	int num_remaining_verts{N};
+//
+//	Timer timer;
+//  std::ofstream rtlog("bfs_hybrid_step_rt.log");
+//
+//	while (qsize*alpha < num_remaining_verts) {
+//		timer.start();
+//		prop_distance_bfs_td_step
+//      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>(
+//				N,
+//				M,
+//				iverts,
+//				iedges,
+//				iwgts,
+//				dists,
+//				queue,
+//				_d_qhead,
+//				_d_qtail,
+//				qsize,
+//				deps);
+//		inc_kernel<<<1, 1>>>(_d_qhead, qsize);
+//		num_remaining_verts -= qsize;
+//		qsize = _get_qsize();
+//		steps++;
+//		timer.stop();
+//    if (enable_runtime_log_file) {
+//      rtlog << timer.get_elapsed_time() / 1us << '\n';
+//    }
+//	}
+//
+//	// run bottom-up step
+//	timer.start();	
+//	
+//  thrust::device_vector<int> remaining_verts(num_remaining_verts);
+//  auto d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+//
+//  // move untouched vertices to remaining_verts array
+//  thrust::copy_if(thrust::make_counting_iterator(0), 
+//          thrust::make_counting_iterator(N),
+//          remaining_verts.begin(),
+//          [deps] __device__ (const int v) {
+//            return deps[v] > 0;
+//          });
+//  
+//  timer.stop();
+//  
+//  if (enable_runtime_log_file) {
+//    rtlog << timer.get_elapsed_time() / 1us << '\n';
+//  } 
+//
+//	while (num_remaining_verts > 0) {
+//    timer.start();
+//		prop_distance_bfs_bu_step
+//      <<<ROUNDUPBLOCKS(num_remaining_verts, BLOCKSIZE), BLOCKSIZE>>>(
+//				N,
+//				M,
+//				overts,
+//				oedges,
+//				owgts,
+//				dists,
+//				d_remaining_verts,
+//				num_remaining_verts,
+//				deps);
+//    
+//    num_remaining_verts = thrust::remove_if(
+//      remaining_verts.begin(), remaining_verts.end(),
+//      [deps] __device__ (const int v) {
+//        return deps[v] == 0;
+//      }
+//    ) - remaining_verts.begin();
+//		
+//		remaining_verts.resize(num_remaining_verts);
+//		d_remaining_verts = thrust::raw_pointer_cast(&remaining_verts[0]);
+//    steps++;
+//		timer.stop();
+//		if (enable_runtime_log_file) {
+//      rtlog << timer.get_elapsed_time() / 1us << '\n';
+//    }
+//  }
+//}
 
 
 void CpGen::bfs_hybrid_privatized(
@@ -3526,6 +3534,40 @@ void CpGen::bfs_hybrid_privatized(
               deps,
               depths,
               curr_depth);
+        
+        //num_remainders = thrust::copy_if(
+        //  thrust::device,
+        //  thrust::make_counting_iterator(0),
+        //  thrust::make_counting_iterator(N),
+        //  curr_remainders,
+        //  [depths] __device__ (int v) {
+        //    return depths[v] == -1;
+        //  }) - curr_remainders;
+       
+        //prop_distance_bfs_bu_step_privatized
+        //  <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
+        //      N,
+        //      M,
+        //      ovs,
+        //      oes,
+        //      owgts,
+        //      dists,
+        //      curr_remainders,
+        //      num_remainders,
+        //      next_remainders,
+        //      next_rem_tail,
+        //      frontiers,
+        //      _d_qtail,
+        //      deps,
+        //      depths,
+        //      curr_depth);
+
+        //thrust::copy(
+        //  thrust::device,
+        //  next_remainders,
+        //  next_remainders+num_remainders,
+        //  curr_remainders);  
+        
         if (enable_runtime_log_file) {
           cudaDeviceSynchronize();
           timer.stop();
@@ -3540,6 +3582,24 @@ void CpGen::bfs_hybrid_privatized(
       else {
         // run bottom-up step
         timer.start();
+        //std::cout << "bu_step @ depth " << curr_depth << '\n';
+        //std::cout << "bu_scans=" << bu_scans << '\n';
+        //std::cout << "num_remainders=" << num_remainders << '\n';
+
+        // if num_remainders > bu_scans
+        // that means one or more top-down steps was run before this step
+        // we need to filter out the vertices that already have their depths determined
+        if (num_remainders > bu_scans) {
+          num_remainders = thrust::remove_if(
+            thrust::device,
+            curr_remainders,
+            curr_remainders+num_remainders,
+            [depths] __device__ (int v) {
+              return depths[v] != -1;
+            }
+          ) - curr_remainders;
+        }
+
         prop_distance_bfs_bu_step_privatized
           <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
               N,
@@ -3570,7 +3630,7 @@ void CpGen::bfs_hybrid_privatized(
           thrust::device,
           next_remainders,
           next_remainders+num_remainders,
-          curr_remainders);
+          curr_remainders); 
 
         // update the number of remainders
         //cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),

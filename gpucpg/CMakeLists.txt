@@ -19,4 +19,5 @@ target_compile_options(gpucpg PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
                        --use_fast_math
                        --relocatable-device-code=true
                        -fopenmp
+                       -lineinfo
                        >)
