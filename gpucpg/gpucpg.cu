@@ -18,8 +18,8 @@ namespace cg = cooperative_groups;
 #define BLOCKSIZE 512
 #define WARPS_PER_BLOCK 32
 #define WARP_SIZE 32
-#define S_FRONTIER_CAPACITY 2048
-#define S_REMAINDER_CAPACITY 2048 
+#define S_BUFF_CAPACITY 2048 
+#define S_FRONTIER_CAPACITY 4096 
 #define W_FRONTIER_CAPACITY 64
 #define S_PFXT_CAPACITY 1024 
 
@@ -27,7 +27,7 @@ namespace cg = cooperative_groups;
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
   (((DATALEN) + (NTHREADS) - 1) / (NTHREADS))
 
-#define SCALE_UP 10000
+#define SCALE_UP 100000
 #define cudaCheckErrors(msg) \
   do { \
     cudaError_t __err = cudaGetLastError(); \
@@ -725,9 +725,9 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
   int* deps,
   int* depths,
   int current_depth) {  
-  __shared__ int local_next_frontiers[S_FRONTIER_CAPACITY];
+  __shared__ int local_next_frontiers[S_BUFF_CAPACITY];
   __shared__ int num_local_next_frontiers;
-  __shared__ int local_next_remainders[S_REMAINDER_CAPACITY];
+  __shared__ int local_next_remainders[S_BUFF_CAPACITY];
   __shared__ int num_local_next_remainders;
 
   auto this_block = cg::this_thread_block();
@@ -745,6 +745,7 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
     const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
     
     auto min_dist{distances[u]};
+    auto u_deps{deps[u]};
     for (auto e = e_beg; e < e_end; e++) {
       // if any of the neighbors has unresolved dependencies
       // we should add u to the next remainder list 
@@ -752,24 +753,25 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
       if (depths[v] == current_depth) {
         int wgt = owgts[e] * SCALE_UP;
         min_dist = min(min_dist, distances[v]+wgt);
-        deps[u]--;
+        u_deps--;
       }
     }
 
     distances[u] = min_dist;
+    deps[u] = u_deps;
     
-    if (deps[u] > 0) {
+    if (u_deps > 0) {
       // u stays in the remainder list
       // add u to the local remainder buffer
       // we check if there's more space in the shared remainder storage
       const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
-      if (local_rem_idx < S_REMAINDER_CAPACITY) {
+      if (local_rem_idx < S_BUFF_CAPACITY) {
         // if we have more space, store to the local remainder buffer
         local_next_remainders[local_rem_idx] = u;
       }
       else {
         // if not, write back to global memory
-        num_local_next_remainders = S_REMAINDER_CAPACITY;
+        num_local_next_remainders = S_BUFF_CAPACITY;
         enqueue(u, next_remainders, next_rem_tail);
       }
     }
@@ -781,13 +783,13 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
       // add u to the local frontier buffer
       // we check if there's more space in the shared frontier storage
       const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
-      if (local_frontier_idx < S_FRONTIER_CAPACITY) {
+      if (local_frontier_idx < S_BUFF_CAPACITY) {
         // if we have more space, store to the local frontier buffer
         local_next_frontiers[local_frontier_idx] = u;
       }
       else {
         // if not, write back to global memory
-        num_local_next_frontiers = S_FRONTIER_CAPACITY;
+        num_local_next_frontiers = S_BUFF_CAPACITY;
         enqueue(u, frontiers, ftr_tail);
       }
     }
@@ -828,9 +830,9 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   int* deps,
   int* depths,
   int current_depth) {  
-  __shared__ int local_next_frontiers[S_FRONTIER_CAPACITY];
+  __shared__ int local_next_frontiers[S_BUFF_CAPACITY];
   __shared__ int num_local_next_frontiers;
-  __shared__ int local_next_remainders[S_REMAINDER_CAPACITY];
+  __shared__ int local_next_remainders[S_BUFF_CAPACITY];
   __shared__ int num_local_next_remainders;
 
   auto this_block = cg::this_thread_block();
@@ -849,6 +851,7 @@ __global__ void prop_distance_bfs_bu_step_privatized(
       const auto e_beg = overts[u];
       const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
       auto min_dist{distances[u]};
+      auto u_deps{deps[u]};
       for (auto e = e_beg; e < e_end; e++) {
         // if any of the neighbors has unresolved dependencies
         // we should add u to the next remainder list 
@@ -856,43 +859,42 @@ __global__ void prop_distance_bfs_bu_step_privatized(
         if (depths[v] == current_depth) {
           int wgt = owgts[e] * SCALE_UP;
           min_dist = min(min_dist, distances[v]+wgt);
-          deps[u]--;
+          u_deps--;
         }
       }
 
       distances[u] = min_dist;
-    
-      if (deps[u] > 0) {
+      deps[u] = u_deps;      
+
+      if (u_deps > 0) {
         // u stays in the remainder list
         // add u to the local remainder buffer
         // we check if there's more space in the shared remainder storage
         const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
-        if (local_rem_idx < S_REMAINDER_CAPACITY) {
+        if (local_rem_idx < S_BUFF_CAPACITY) {
           // if we have more space, store to the local remainder buffer
           local_next_remainders[local_rem_idx] = u;
         }
         else {
           // if not, write back to global memory
-          num_local_next_remainders = S_REMAINDER_CAPACITY;
+          num_local_next_remainders = S_BUFF_CAPACITY;
           enqueue(u, next_remainders, next_rem_tail);
         }
       }
       else {
         // u is now a frontier
-        distances[u] = min_dist;
-
         // update u's depth
         depths[u] = current_depth + 1;
         // add u to the local frontier buffer
         // we check if there's more space in the shared frontier storage
         const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
-        if (local_frontier_idx < S_FRONTIER_CAPACITY) {
+        if (local_frontier_idx < S_BUFF_CAPACITY) {
           // if we have more space, store to the local frontier buffer
           local_next_frontiers[local_frontier_idx] = u;
         }
         else {
           // if not, write back to global memory
-          num_local_next_frontiers = S_FRONTIER_CAPACITY;
+          num_local_next_frontiers = S_BUFF_CAPACITY;
           enqueue(u, frontiers, ftr_tail);
         }
       }
@@ -2301,14 +2303,14 @@ void CpGen::report_paths(
     int num_frontiers{static_cast<int>(_sinks.size())}; 
     
     // timer to record the time taken for each step
-    //Timer timer;
-    //std::ofstream log("bfs_td_step_rt.csv");
-    //if (enable_runtime_log_file) {
-    //  log << "depth,runtime(top-down)\n";
-    //}
+    Timer timer;
+    std::ofstream log("bfs_td_step_rt.csv");
+    if (enable_runtime_log_file) {
+      log << "depth,runtime(top-down)\n";
+    }
     
-    while (num_frontiers > 0) {
-      //timer.start();
+    while (num_frontiers) {
+      timer.start();
       prop_distance_bfs_td_step_privatized
         <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
           num_verts,
@@ -2324,11 +2326,11 @@ void CpGen::report_paths(
           d_deps,
           d_depths,
           curr_depth);
-     
-      //timer.stop();
-      //if (enable_runtime_log_file) {
-      //  log << curr_depth << ',' << timer.get_elapsed_time() / 1us << '\n';
-      //}
+      if (enable_runtime_log_file) {
+        cudaDeviceSynchronize();
+        timer.stop();
+        log << curr_depth << ',' << timer.get_elapsed_time() / 1us << '\n';
+      }
       // update queue head once here
       inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
       
@@ -2336,7 +2338,6 @@ void CpGen::report_paths(
       num_frontiers = _get_qsize();
       curr_depth++;
     }
-    //std::cout << "total depth=" << curr_depth << '\n';
   }
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
     //int qsize{static_cast<int>(_sinks.size())}; 
@@ -3460,25 +3461,29 @@ void CpGen::bfs_hybrid_privatized(
   int num_remainders{N};
   
   // separate the tracking of:
-  // num_remainders / bu_scans
-  // num_frontiers / td_scans
-  // because num_remainders will be used to launch the bfs steps (and is only updated when running bu_step)
-  // it should not be affected by the heuristic information update
+  // we separate the tracking of bu_scans and num_remainders
+  // because num_remainders should not be affected by the heuristic information update
   double td_scans = num_sinks;
   double bu_scans = N;
  
   // a timer to record the runtime of each step
-  //Timer timer;
-  //std::ofstream rtlog("bfs_hybrid_step_rt.csv");
-  //if (enable_runtime_log_file) {
-  //  rtlog << "depth,runtime(hybrid),td_or_bu\n";
-  //}
+  Timer timer;
+  std::ofstream rtlog("bfs_hybrid_step_rt.csv");
+  if (enable_runtime_log_file) {
+    rtlog << "depth,runtime(hybrid),td_or_bu\n";
+  }
 
-  bool ran_first_bu_pass{false};
-  while (num_frontiers && num_remainders) {
-    if (num_frontiers*alpha < bu_scans) {
-      //timer.start();
+  bool should_update_num_remainders{false};
+  while (num_frontiers) {
+    bu_scans -= td_scans;
+    if (should_update_num_remainders) {
+      should_update_num_remainders = false;
+      num_remainders = bu_scans;
+    }
+
+    if (td_scans*alpha < bu_scans) {
       // run top-down step
+      timer.start();
       prop_distance_bfs_td_step_privatized
         <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
             N,
@@ -3494,20 +3499,18 @@ void CpGen::bfs_hybrid_privatized(
             deps,
             depths,
             curr_depth);
-      
-      //timer.stop();
-      //if (enable_runtime_log_file) {
-      //  rtlog << curr_depth << ',' << timer.get_elapsed_time() / 1us << ",TD\n";
-      //} 
+      if (enable_runtime_log_file) {
+        cudaDeviceSynchronize();
+        timer.stop();
+        rtlog << curr_depth << ',' << timer.get_elapsed_time() / 1us << ",td\n";
+      }
     }
     else {
-      std::cout << "num_remainders=" << num_remainders << '\n';
-      std::cout << "num_frontiers=" << num_frontiers << '\n';
-      std::cout << "bu_scans=" << bu_scans << '\n';
+      // std::cout << "bu_step @ depth " << curr_depth << '\n';
       if (num_remainders == N) {
         // we need to do a first pass to scan all the N vertices
         // and get the remainder vertices
-        //timer.start();
+        timer.start();
         prop_distance_bfs_bu_step_privatized_no_curr_remainders
           <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
               N,
@@ -3523,18 +3526,20 @@ void CpGen::bfs_hybrid_privatized(
               deps,
               depths,
               curr_depth);
-        //timer.stop();
-     
+        if (enable_runtime_log_file) {
+          cudaDeviceSynchronize();
+          timer.stop();
+          rtlog << curr_depth << ',' << timer.get_elapsed_time() / 1us << ",1st-bu\n";
+        }
+
         // update the number of remainders
-        cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-            cudaMemcpyDeviceToHost);
-        
-        // reset the tail of the next remainders
-        set_kernel<<<1, 1>>>(next_rem_tail, 0);
+        //cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+        //    cudaMemcpyDeviceToHost);
+        should_update_num_remainders = true;
       }
       else {
         // run bottom-up step
-        //timer.start();
+        timer.start();
         prop_distance_bfs_bu_step_privatized
           <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
               N,
@@ -3552,14 +3557,11 @@ void CpGen::bfs_hybrid_privatized(
               deps,
               depths,
               curr_depth);
-        //timer.stop();    
-       
-        // update the number of remainders
-        cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-            cudaMemcpyDeviceToHost);
-
-        // reset the tail of the next remainders
-        set_kernel<<<1, 1>>>(next_rem_tail, 0);
+        if (enable_runtime_log_file) {
+          cudaDeviceSynchronize();
+          timer.stop();
+          rtlog << curr_depth << ',' << timer.get_elapsed_time() / 1us << ",bu\n";
+        }
 
         // copy the next_remainders to curr_remainders
         // we don't need to copy all N elements
@@ -3568,19 +3570,23 @@ void CpGen::bfs_hybrid_privatized(
           thrust::device,
           next_remainders,
           next_remainders+num_remainders,
-          curr_remainders);      
+          curr_remainders);
+
+        // update the number of remainders
+        //cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
+        //    cudaMemcpyDeviceToHost);
+        should_update_num_remainders = true;
       }
-      
-      //if (enable_runtime_log_file) {
-      //  rtlog << curr_depth << ',' << timer.get_elapsed_time() / 1us << ",BU\n";
-      //}
+
+      // reset the tail of the next remainders
+      set_kernel<<<1, 1>>>(next_rem_tail, 0);
     }
     
     // equivalent to std::swap(curr_frontiers, next_frontiers)
     // if we use two arrays to keep track of the frontiers
     inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-    bu_scans -= num_frontiers;
     num_frontiers = _get_qsize();
+    td_scans = num_frontiers;
     
     // increment depth
     curr_depth++;
