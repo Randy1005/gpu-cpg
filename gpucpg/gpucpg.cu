@@ -23,6 +23,7 @@ namespace cg = cooperative_groups;
 #define S_FRONTIER_CAPACITY 4096 
 #define W_FRONTIER_CAPACITY 64
 #define S_PFXT_CAPACITY 1024 
+#define PER_THREAD_WORK_ITEMS 2
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -52,10 +53,16 @@ struct printf_functor_pfxtnode {
   }
 };
 
+template <typename Iterator>
+void print_range_pfxt(const std::string& name, Iterator first, Iterator last) {
+  std::cout << name << ": ";
+  thrust::for_each(thrust::device, first, last, printf_functor_pfxtnode());
+  std::cout << '\n';
+}
+
 struct printf_functor {
   __host__ __device__
-  void operator() (int x)
-  {
+  void operator() (int x) {
       printf("%4d ", x);
   }
 };
@@ -68,12 +75,7 @@ void print_range(const std::string& name, Iterator first, Iterator last) {
   std::cout << '\n';
 }
 
-template <typename Iterator>
-void print_range_pfxt(const std::string& name, Iterator first, Iterator last) {
-  std::cout << name << ": ";
-  thrust::for_each(thrust::device, first, last, printf_functor_pfxtnode());
-  std::cout << '\n';
-}
+
 
 void checkError_t(cudaError_t error, std::string msg) {
   if (error != cudaSuccess) {
@@ -1047,20 +1049,114 @@ __global__ void prop_distance_bfs_td_step_single_block(
   } 
 }
 
+
+__global__ void prop_distance_bfs_td_step_privatized_multi_work(
+  int num_verts, 
+  int num_edges,
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* distances_cache,
+  int* glob_queue,
+  int* qhead,
+  int* qtail,
+  int qsize,
+  int* deps,
+  int* depths,
+  int current_depth) {
+  // initialize privatized frontiers
+  __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
+
+  // shared counter to count fontiers in this block
+  __shared__ int s_num_curr_frontiers;
+  if (threadIdx.x == 0) {
+    // let tid 0 initialize the counter
+    s_num_curr_frontiers = 0;
+  }
+  __syncthreads();
+
+  // perform BFS
+  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
+
+  while (gid < qsize) {
+    const auto vid = glob_queue[*qhead+gid];
+    const auto edge_start = verts[vid];
+    const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
+    for (int eid = edge_start; eid < edge_end; eid++) {
+      const auto neighbor = edges[eid];
+      
+      const int wgt = wgts[eid] * SCALE_UP;
+      const int new_distance = distances_cache[vid] + wgt;
+      atomicMin(&distances_cache[neighbor], new_distance);
+    
+      // decrement the dependency counter for this neighbor
+      if (atomicSub(&deps[neighbor], 1) == 1) {
+        // update the depth of this neighbor
+        depths[neighbor] = current_depth + 1;
+        
+        // if this thread releases the last dependency
+        // it should add this neighbor to the frontier queue
+        
+        // we check if there's more space in the shared frontier storage
+        const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
+        if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
+          // if we have space, store to the shared frontier storage
+          s_curr_frontiers[s_curr_frontier_idx] = neighbor;
+        }
+        else {
+          // if not, we have no choice but to store directly
+          // back to glob mem
+          s_num_curr_frontiers = S_FRONTIER_CAPACITY;
+          enqueue(neighbor, glob_queue, qtail);
+        }
+      }
+    }
+    gid += blockDim.x * gridDim.x;
+  }
+  __syncthreads();
+
+  // calculate the index to start placing frontiers
+  // in the global queue
+  __shared__ int curr_frontier_beg;
+  if (threadIdx.x == 0) {
+    curr_frontier_beg = atomicAdd(qtail, s_num_curr_frontiers);
+  }
+  __syncthreads();
+
+  // commit local frontiers to the global queue
+  // each thread will handle the frontiers in a strided fashion
+  // NOTE: I think this is to ensure coalesced access on glob mem?
+  // e.g., blocksize = 4, 8 local frontiers
+  // tid 0 will handle frontier idx 0 and 0 + 4
+  // tid 1 will handle frontier idx 1 and 1 + 4
+  // etc.
+  for (auto s_curr_frontier_idx = threadIdx.x; 
+      s_curr_frontier_idx < s_num_curr_frontiers; 
+      s_curr_frontier_idx += blockDim.x) {
+    auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
+    glob_queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
+  }
+} 
+
+
+
+
+
+
 __global__ void prop_distance_bfs_td_step_privatized(
-    int num_verts, 
-    int num_edges,
-    int* verts,
-    int* edges,
-    float* wgts,
-    int* distances_cache,
-    int* glob_queue,
-    int* qhead,
-    int* qtail,
-    int qsize,
-    int* deps,
-    int* depths,
-    int current_depth) {
+  int num_verts, 
+  int num_edges,
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* distances_cache,
+  int* glob_queue,
+  int* qhead,
+  int* qtail,
+  int qsize,
+  int* deps,
+  int* depths,
+  int current_depth) {
   // initialize privatized frontiers
   __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
 
@@ -2069,6 +2165,14 @@ void CpGen::report_paths(
   thrust::fill(rem_tail, rem_tail+1, 0);
 
 
+  // cuda device properties
+  cudaDeviceProp prop;
+  checkError_t(cudaGetDeviceProperties(&prop, 0), "get device properties failed.");
+  int max_blks_per_sm = prop.maxBlocksPerMultiProcessor;
+  int num_sms = prop.multiProcessorCount;
+  int max_blks = max_blks_per_sm * num_sms;
+  std::cout << "max blks on gpu: " << max_blks << '\n';
+
 	Timer timer_cpg;
 
 	timer_cpg.start();
@@ -2297,19 +2401,41 @@ void CpGen::report_paths(
       steps++;
     }
   }
+  else if (pd_method == PropDistMethod::BFS_TOP_DOWN_PRIVATIZED_MULTI_WORK) {
+    int curr_depth{0};
+    int num_frontiers{static_cast<int>(_sinks.size())}; 
+    
+    while (num_frontiers) {
+      int num_blks = ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE)/PER_THREAD_WORK_ITEMS + 1;
+
+      prop_distance_bfs_td_step_privatized_multi_work
+        <<<num_blks, BLOCKSIZE>>>(
+          num_verts,
+          num_edges,
+          d_fanin_adjp,
+          d_fanin_adjncy,
+          d_fanin_wgts,
+          d_dists_cache,
+          d_queue,
+          _d_qhead,
+          _d_qtail,
+          num_frontiers,
+          d_deps,
+          d_depths,
+          curr_depth);
+      // update queue head once here
+      inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
+      
+      // update queue size
+      num_frontiers = _get_qsize();
+      curr_depth++;
+    }
+  }
   else if (pd_method == PropDistMethod::BFS_TOP_DOWN_PRIVATIZED) {
     int curr_depth{0};
     int num_frontiers{static_cast<int>(_sinks.size())}; 
     
-    // timer to record the time taken for each step
-    Timer timer;
-    std::ofstream log("bfs_td_step_rt.csv");
-    if (enable_runtime_log_file) {
-      log << "depth,runtime(top-down)\n";
-    }
-    
     while (num_frontiers) {
-      timer.start();
       prop_distance_bfs_td_step_privatized
         <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
           num_verts,
@@ -2325,11 +2451,7 @@ void CpGen::report_paths(
           d_deps,
           d_depths,
           curr_depth);
-      if (enable_runtime_log_file) {
-        cudaDeviceSynchronize();
-        timer.stop();
-        log << curr_depth << ',' << timer.get_elapsed_time() / 1us << '\n';
-      }
+      
       // update queue head once here
       inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
       

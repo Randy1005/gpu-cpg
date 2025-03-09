@@ -1,7 +1,7 @@
 enable_testing()
 include(${GPUCPG_3RDPARTY_DIR}/doctest/doctest.cmake)
 list(APPEND CU_UNITTESTS
-  memcpy 
+  ballot
 )
 
 foreach(unittest IN LISTS CU_UNITTESTS)
