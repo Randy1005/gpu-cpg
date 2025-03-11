@@ -22,12 +22,8 @@ enum class PropDistMethod {
   CUDA_GRAPH,
   LEVELIZED,
   LEVELIZED_SHAREDMEM,
-  BFS_TOP_DOWN,
-  BFS_TOP_DOWN_NO_ATOMICMIN,
-  BFS_TOP_DOWN_PRIVATIZED_MULTI_WORK,
   BFS_TOP_DOWN_PRIVATIZED,
   BFS_PRIVATIZED_MERGED,
-  BFS_PRIVATIZED_PRECOMP_SPURS,
   BFS_HYBRID,
   BFS_HYBRID_PRIVATIZED
 };
@@ -111,10 +107,12 @@ public:
     int* oes,
     float* owgts,
     int* dists,
-    int* frontiers,
+    int* curr_frontiers,
+    int* next_frontiers,
     int* curr_remainders,
     int* next_remainders,
-    int* rem_tail,
+    int* next_ftr_tail,
+    int* next_rem_tail,
     int* deps,
     int* depths,
     const bool enable_runtime_log_file
