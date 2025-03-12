@@ -7,6 +7,7 @@
 #include <thrust/count.h>
 #include <thrust/execution_policy.h>
 #include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
 #include <thrust/remove.h>
 #include <thrust/swap.h>
 #include <cuda_runtime_api.h>
@@ -23,7 +24,7 @@ namespace cg = cooperative_groups;
 #define S_FRONTIER_CAPACITY 4096 
 #define W_FRONTIER_CAPACITY 64
 #define S_PFXT_CAPACITY 1024 
-#define PER_THREAD_WORK_ITEMS 2
+#define PER_THREAD_WORK_ITEMS 4
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -85,7 +86,7 @@ void checkError_t(cudaError_t error, std::string msg) {
 }
 
 size_t CpGen::num_verts() const {
-  return _h_fanout_adjp.size() - 1; 
+  return _h_fanout_adjp.size()-1; 
 }
 
 size_t CpGen::num_edges() const {
@@ -719,15 +720,14 @@ __device__ void commit_local_to_global(
 
 __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
   int num_verts,
-  int num_edges,
   int* overts,
   int* oedges,
   float* owgts,
   int* distances,
   int* curr_remainders,
   int* curr_rem_tail,
-  int* frontiers,
-  int* ftr_tail,
+  int* next_frontiers,
+  int* next_ftr_tail,
   int* deps,
   int* depths,
   int current_depth) {
@@ -746,59 +746,62 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
   this_block.sync();
 
   int u = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (u < num_verts && depths[u] == -1) {
-    const auto e_beg = overts[u];
-    const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
+  while (u < num_verts) {
+    if (depths[u] == -1) {
+      const auto e_beg = overts[u];
+      const auto e_end = overts[u+1];
     
-    auto min_dist{distances[u]};
-    auto u_deps{deps[u]};
-    for (auto e = e_beg; e < e_end; e++) {
-      const auto v = oedges[e];
-      if (depths[v] == current_depth) {
-        // v is a frontier, we run relaxation
-        // and update u's dependency counter
-        int wgt = owgts[e] * SCALE_UP;
-        min_dist = min(min_dist, distances[v]+wgt);
-        u_deps--;
+      auto min_dist{distances[u]};
+      auto u_deps{deps[u]};
+      for (auto e = e_beg; e < e_end; e++) {
+        const auto v = oedges[e];
+        if (depths[v] == current_depth) {
+          // v is a frontier, we run relaxation
+          // and update u's dependency counter
+          int wgt = owgts[e] * SCALE_UP;
+          min_dist = min(min_dist, distances[v]+wgt);
+          u_deps--;
+        }
       }
-    }
 
-    distances[u] = min_dist;
-    deps[u] = u_deps;
+      distances[u] = min_dist;
+      deps[u] = u_deps;
     
-    if (u_deps > 0) {
-      // u stays in the remainder list
-      // add u to the local remainder buffer
-      // we check if there's more space in the shared remainder storage
-      const auto local_rem_idx = atomicAdd(&num_local_curr_remainders, 1);
-      if (local_rem_idx < S_BUFF_CAPACITY) {
-        // if we have more space, store to the local remainder buffer
-        local_curr_remainders[local_rem_idx] = u;
+      if (u_deps > 0) {
+        // u stays in the remainder list
+        // add u to the local remainder buffer
+        // we check if there's more space in the shared remainder storage
+        const auto local_rem_idx = atomicAdd(&num_local_curr_remainders, 1);
+        if (local_rem_idx < S_BUFF_CAPACITY) {
+          // if we have more space, store to the local remainder buffer
+          local_curr_remainders[local_rem_idx] = u;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_curr_remainders = S_BUFF_CAPACITY;
+          enqueue(u, curr_remainders, curr_rem_tail);
+        }
       }
       else {
-        // if not, write back to global memory
-        num_local_curr_remainders = S_BUFF_CAPACITY;
-        enqueue(u, curr_remainders, curr_rem_tail);
-      }
-    }
-    else {
-      // u is now a frontier
+        // u is now a frontier
 
-      // update u's depth
-      depths[u] = current_depth + 1;
-      // add u to the local frontier buffer
-      // we check if there's more space in the shared frontier storage
-      const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
-      if (local_frontier_idx < S_BUFF_CAPACITY) {
-        // if we have more space, store to the local frontier buffer
-        local_next_frontiers[local_frontier_idx] = u;
-      }
-      else {
-        // if not, write back to global memory
-        num_local_next_frontiers = S_BUFF_CAPACITY;
-        enqueue(u, frontiers, ftr_tail);
+        // update u's depth
+        depths[u] = current_depth + 1;
+        // add u to the local frontier buffer
+        // we check if there's more space in the shared frontier storage
+        const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
+        if (local_frontier_idx < S_BUFF_CAPACITY) {
+          // if we have more space, store to the local frontier buffer
+          local_next_frontiers[local_frontier_idx] = u;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_next_frontiers = S_BUFF_CAPACITY;
+          enqueue(u, next_frontiers, next_ftr_tail);
+        }
       }
     }
+    u += blockDim.x * gridDim.x;
   }
   
   this_block.sync();
@@ -806,19 +809,17 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
   // now we commit the local frontiers and local remainders to global memory
   __shared__ int next_ftr_beg, curr_rem_beg;
   if (this_block.thread_rank() == 0) {
-    next_ftr_beg = atomicAdd(ftr_tail, num_local_next_frontiers);
+    next_ftr_beg = atomicAdd(next_ftr_tail, num_local_next_frontiers);
     curr_rem_beg = atomicAdd(curr_rem_tail, num_local_curr_remainders);
   }
   this_block.sync();
 
   // commit local frontiers and local remainders to the global memory
-  commit_local_to_global(this_block, frontiers, next_ftr_beg, num_local_next_frontiers, local_next_frontiers);
+  commit_local_to_global(this_block, next_frontiers, next_ftr_beg, num_local_next_frontiers, local_next_frontiers);
   commit_local_to_global(this_block, curr_remainders, curr_rem_beg, num_local_curr_remainders, local_curr_remainders);
 }
 
 __global__ void prop_distance_bfs_bu_step_privatized(
-  int num_verts,
-  int num_edges,
   int* overts,
   int* oedges,
   float* owgts,
@@ -827,8 +828,8 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   int num_curr_remainders,
   int* next_remainders,
   int* next_rem_tail,
-  int* frontiers,
-  int* ftr_tail,
+  int* next_frontiers,
+  int* next_ftr_tail,
   int* deps,
   int* depths,
   int current_depth) {  
@@ -847,22 +848,22 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   this_block.sync();
 
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (tid < num_curr_remainders) {
+  while (tid < num_curr_remainders) {
     const auto u = curr_remainders[tid];
     if (depths[u] == -1) {
       const auto e_beg = overts[u];
-      const auto e_end = (u == num_verts-1) ? num_edges : overts[u+1];
+      const auto e_end = overts[u+1];
       auto min_dist{distances[u]};
       auto u_deps{deps[u]};
       for (auto e = e_beg; e < e_end; e++) {
-        // if any of the neighbors has unresolved dependencies
-        // we should add u to the next remainder list 
-        const auto v = oedges[e];
-        if (depths[v] == current_depth) {
-          int wgt = owgts[e] * SCALE_UP;
-          min_dist = min(min_dist, distances[v]+wgt);
-          u_deps--;
-        }
+       // if any of the neighbors has unresolved dependencies
+       // we should add u to the next remainder list 
+       const auto v = oedges[e];
+       if (depths[v] == current_depth) {
+         int wgt = owgts[e] * SCALE_UP;
+         min_dist = min(min_dist, distances[v]+wgt);
+         u_deps--;
+       }
       }
 
       distances[u] = min_dist;
@@ -897,24 +898,24 @@ __global__ void prop_distance_bfs_bu_step_privatized(
         else {
           // if not, write back to global memory
           num_local_next_frontiers = S_BUFF_CAPACITY;
-          enqueue(u, frontiers, ftr_tail);
+          enqueue(u, next_frontiers, next_ftr_tail);
         }
       }
     }
+    tid += blockDim.x * gridDim.x;
   }
-  
   this_block.sync();
 
   // now we commit the local frontiers and local remainders to global memory
   __shared__ int next_ftr_beg, next_rem_beg;
   if (this_block.thread_rank() == 0) {
-    next_ftr_beg = atomicAdd(ftr_tail, num_local_next_frontiers);
+    next_ftr_beg = atomicAdd(next_ftr_tail, num_local_next_frontiers);
     next_rem_beg = atomicAdd(next_rem_tail, num_local_next_remainders);
   }
   this_block.sync();
 
   // commit local frontiers and local remainders to global memory
-  commit_local_to_global(this_block, frontiers, next_ftr_beg, num_local_next_frontiers, local_next_frontiers);
+  commit_local_to_global(this_block, next_frontiers, next_ftr_beg, num_local_next_frontiers, local_next_frontiers);
   commit_local_to_global(this_block, next_remainders, next_rem_beg, num_local_next_remainders, local_next_remainders);
 }
 
@@ -1139,7 +1140,6 @@ __global__ void prop_distance_bfs_td_step_single_block(
 //} 
 
 __global__ void prop_distance_bfs_td_step_privatized(
-  int num_verts, 
   int* verts,
   int* edges,
   float* wgts,
@@ -1164,7 +1164,7 @@ __global__ void prop_distance_bfs_td_step_privatized(
 
   // perform BFS
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-  while (tid < num_curr_ftrs) {
+  if (tid < num_curr_ftrs) {
     const auto vid = curr_ftrs[tid];
     const auto edge_start = verts[vid];
     const auto edge_end = verts[vid+1]; 
@@ -1195,7 +1195,6 @@ __global__ void prop_distance_bfs_td_step_privatized(
         }
       }
     }
-    tid += blockDim.x*gridDim.x;
   }
   __syncthreads();
 
@@ -1587,20 +1586,17 @@ __global__ void update_successors(
 
 
 __global__ void compute_long_path_counts(
-    int num_verts,
-    int num_edges,
-    int* verts,
-    int* edges,
-    float* wgts,
-    int* succs,
-    int* dists,
-    PfxtNode* short_pile,
-    int window_start,
-    int window_end,
-    int* num_long_paths,
-    int* num_short_paths,
-    float* split) {
-  
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* succs,
+  int* dists,
+  PfxtNode* short_pile,
+  int window_start,
+  int window_end,
+  int* num_long_paths,
+  int* num_short_paths,
+  float split) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   const auto node_idx = tid + window_start;
   
@@ -1617,7 +1613,7 @@ __global__ void compute_long_path_counts(
     auto slack = short_pile[node_idx].slack;
     while (v != -1) {
       auto edge_start = verts[v];
-      auto edge_end = (v == num_verts - 1) ? num_edges : verts[v+1];
+      auto edge_end = verts[v+1];
 
       for (auto eid = edge_start; eid < edge_end; eid++) {
         // calculate the slack of each spurred path
@@ -1633,14 +1629,13 @@ __global__ void compute_long_path_counts(
         auto new_path_slack = 
           slack + dist_neighbor + wgt - dist_v;
 
-        if (new_path_slack > *split) {
+        if (new_path_slack > split) {
           //printf("slack=%f, > split=%f\n", new_path_slack, *split);
           atomicAdd(&s_num_long_paths, 1);
         }
         else {
           atomicAdd(&s_num_short_paths, 1);
         }
-        
       }
 
       // traverse to next successor
@@ -1998,20 +1993,18 @@ __global__ void expand_new_pfxt_level_atomic_enq(
 }
 
 __global__ void expand_short_pile(
-    int num_verts,
-    int num_edges,
-    int* verts,
-    int* edges,
-    float* wgts,
-    int* succs,
-    int* dists,
-    PfxtNode* short_pile,
-    PfxtNode* long_pile,
-    int window_start,
-    int window_end,
-    int* curr_tail_short,
-    int* curr_tail_long,
-    float* split) {
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* succs,
+  int* dists,
+  PfxtNode* short_pile,
+  PfxtNode* long_pile,
+  int window_start,
+  int window_end,
+  int* curr_tail_short,
+  int* curr_tail_long,
+  float split) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   const auto node_idx = tid + window_start;
   
@@ -2021,7 +2014,7 @@ __global__ void expand_short_pile(
     auto slack = short_pile[node_idx].slack;
     while (v != -1) {
       auto edge_start = verts[v];
-      auto edge_end = (v == num_verts - 1) ? num_edges : verts[v+1];
+      auto edge_end = verts[v+1];
 
       for (auto eid = edge_start; eid < edge_end; eid++) {
         // calculate the slack of each spurred path
@@ -2038,7 +2031,7 @@ __global__ void expand_short_pile(
         auto new_slack = 
           slack + dist_neighbor + wgt - dist_v;
 
-        if (new_slack <= *split) {
+        if (new_slack <= split) {
           // this path belongs to the short pile
           auto new_node_idx = atomicAdd(curr_tail_short, 1);
           //printf("new idx (short)=%d\n", new_node_idx);
@@ -2136,22 +2129,21 @@ void CpGen::report_paths(
   cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
   cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized_no_curr_remainders, cudaFuncCachePreferShared);
   cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized, cudaFuncCachePreferShared);
-  cudaFuncSetCacheConfig(prop_distance_bfs_td_step_single_block, cudaFuncCachePreferShared);
 
 
-  const auto num_edges{_h_fanout_adjncy.size()};
-  const auto num_verts{_h_fanin_adjp.size() - 1};
+  const int N = num_verts();
+  const int M = num_edges();
  
   // copy host out degrees to device
   // and initialize queue for bfs
   std::vector<int> h_queue(_sinks);
-  h_queue.resize(num_verts);
+  h_queue.resize(N);
   thrust::device_vector<int> queue(h_queue);
   
   thrust::device_vector<int> out_degs(_h_out_degrees);
   thrust::device_vector<int> deps(_h_out_degrees);
   thrust::device_vector<int> in_degs(_h_in_degrees);
-  thrust::device_vector<int> accum_spurs(num_verts, 0);
+  thrust::device_vector<int> accum_spurs(N, 0);
 
   checkError_t(cudaMalloc(&_d_qhead, sizeof(int)), "malloc qhead failed.");
   checkError_t(cudaMalloc(&_d_qtail, sizeof(int)), "malloc qtail failed.");
@@ -2171,7 +2163,7 @@ void CpGen::report_paths(
   checkError_t(cudaMemset(_d_pfxt_tail, 0, sizeof(int)), "memset pfxt tail failed.");
   
   // record level of each vertex
-  thrust::device_vector<int> vert_lvls(num_verts, std::numeric_limits<int>::max());
+  thrust::device_vector<int> vert_lvls(N, std::numeric_limits<int>::max());
   int* d_vert_lvls = thrust::raw_pointer_cast(&vert_lvls[0]);
 
   // copy host csr to device
@@ -2184,14 +2176,14 @@ void CpGen::report_paths(
 
 
   // shortest distances cache
-  thrust::device_vector<int> dists_cache(num_verts,
+  thrust::device_vector<int> dists_cache(N,
       std::numeric_limits<int>::max());
 
   // indicator of whether the distance of a vertex is updated
-  thrust::device_vector<bool> dists_updated(num_verts, false);
+  thrust::device_vector<bool> dists_updated(N, false);
 
   // each vertex's successor
-  thrust::device_vector<int> successors(num_verts, -1);
+  thrust::device_vector<int> successors(N, -1);
 
   int* d_fanin_adjp = thrust::raw_pointer_cast(&fanin_adjp[0]);
   int* d_fanin_adjncy = thrust::raw_pointer_cast(&fanin_adjncy[0]);
@@ -2206,7 +2198,7 @@ void CpGen::report_paths(
   int* d_succs = thrust::raw_pointer_cast(&successors[0]);
 
   // record whether a vertex is visited
-  thrust::device_vector<bool> touched(num_verts, false);
+  thrust::device_vector<bool> touched(N, false);
   auto d_touched = thrust::raw_pointer_cast(&touched[0]);
 
   bool h_converged{false};
@@ -2225,18 +2217,17 @@ void CpGen::report_paths(
 
   // these data structures are for the BFS hybrid method
   // store frontiers and remainders in a contiguous array
-  thrust::device_vector<int> ftr_and_rems(4*num_verts);
+  thrust::device_vector<int> ftr_and_rems(4*N);
   auto d_curr_frontiers = thrust::raw_pointer_cast(ftr_and_rems.data());
-  auto d_next_frontiers = d_curr_frontiers + num_verts;
-  auto d_curr_remainders = d_curr_frontiers + 2*num_verts;
-  auto d_next_remainders = d_curr_frontiers + 3*num_verts;
-  
+  auto d_next_frontiers = d_curr_frontiers + N;
+  auto d_curr_remainders = d_curr_frontiers + 2*N;
+  auto d_next_remainders = d_curr_frontiers + 3*N;
   
   // initialize the frontier vertices
   ftr_and_rems = h_queue;
   
   // initialize the depths of the vertices
-  thrust::device_vector<int> depths(num_verts, -1);
+  thrust::device_vector<int> depths(N, -1);
   for (const auto& sink: _sinks) {
     depths[sink] = 0;
   }
@@ -2264,17 +2255,17 @@ void CpGen::report_paths(
           cudaMemset(_d_converged, true, sizeof(bool)), 
           "memset d_converged failed.");
 
-      prop_distance<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
-        (num_verts, 
-         num_edges,
+      prop_distance<<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>
+        (N, 
+         M,
          d_fanin_adjp,
          d_fanin_adjncy,
          d_fanin_wgts,
          d_dists_cache,
          d_dists_updated);
 
-      check_if_no_dists_updated<<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>
-        (num_verts, d_dists_updated, _d_converged);
+      check_if_no_dists_updated<<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>
+        (N, d_dists_updated, _d_converged);
 
       checkError_t(
           cudaMemcpy(
@@ -2301,8 +2292,8 @@ void CpGen::report_paths(
     //  prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
     //    (v_beg,
     //     v_end,
-    //     num_verts,
-    //     num_edges,
+    //     N,
+    //     M,
     //     d_fanin_adjp,
     //     d_fanin_adjncy,
     //     d_fanin_wgts,
@@ -2327,6 +2318,8 @@ void CpGen::report_paths(
   else if (pd_method == PropDistMethod::BFS_HYBRID_PRIVATIZED) {
     bfs_hybrid_privatized(
       alpha,
+      N,
+      M,
       d_fanin_adjp, 
       d_fanin_adjncy,
       d_fanin_wgts,
@@ -2390,9 +2383,9 @@ void CpGen::report_paths(
         "begin capture stream failed.");
 
     prop_distance
-      <<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE, 0, capture_stream>>>
-      (num_verts, 
-       num_edges,
+      <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE, 0, capture_stream>>>
+      (N, 
+       M,
        d_fanin_adjp,
        d_fanin_adjncy,
        d_fanin_wgts,
@@ -2400,8 +2393,8 @@ void CpGen::report_paths(
        d_dists_updated);
 
     check_if_no_dists_updated
-      <<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE, 0, capture_stream>>>
-      (num_verts, d_dists_updated, _d_converged);
+      <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE, 0, capture_stream>>>
+      (N, d_dists_updated, _d_converged);
 
     condition_converged<<<1, 1, 0, capture_stream>>>(_d_converged, handle);
 
@@ -2435,11 +2428,9 @@ void CpGen::report_paths(
     int num_curr_frontiers{static_cast<int>(_sinks.size())}; 
     
     while (num_curr_frontiers) {
-      // int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE)/PER_THREAD_WORK_ITEMS + 1;
       int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE);
       prop_distance_bfs_td_step_privatized
         <<<num_blks, BLOCKSIZE>>>(
-          num_verts,
           d_fanin_adjp,
           d_fanin_adjncy,
           d_fanin_wgts,
@@ -2470,8 +2461,8 @@ void CpGen::report_paths(
     //  if (qsize < BLOCKSIZE) {
     //    prop_distance_bfs_td_step_single_block
     //    <<<1, BLOCKSIZE>>>
-    //    (num_verts,
-    //     num_edges,
+    //    (N,
+    //     M,
     //     d_fanin_adjp,
     //     d_fanin_adjncy,
     //     d_fanin_wgts,
@@ -2485,8 +2476,8 @@ void CpGen::report_paths(
     //  else {
     //    prop_distance_bfs_td_step_privatized
     //      <<<ROUNDUPBLOCKS(qsize, BLOCKSIZE), BLOCKSIZE>>>
-    //      (num_verts,
-    //       num_edges,
+    //      (N,
+    //       M,
     //       d_fanin_adjp,
     //       d_fanin_adjncy,
     //       d_fanin_wgts,
@@ -2503,18 +2494,18 @@ void CpGen::report_paths(
     //}
   }
 
- 
+  cudaDeviceSynchronize();
 	timer_cpg.stop();
   // copy distance vector back to host
-  std::vector<int> h_dists(num_verts);
+  std::vector<int> h_dists(N);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
 	prop_time = timer_cpg.get_elapsed_time();
 
   // get successors of each vertex (the next hop on the shortest path) 
   update_successors
-    <<<ROUNDUPBLOCKS(num_verts, BLOCKSIZE), BLOCKSIZE>>>(
-      num_verts, 
-      num_edges,
+    <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+      N, 
+      M,
       d_fanin_adjp,
       d_fanin_adjncy,
       d_fanin_wgts,
@@ -2571,9 +2562,6 @@ void CpGen::report_paths(
   auto tail_long = thrust::device_new<int>();
   thrust::fill(tail_long, tail_long+1, 0);
 
-  auto prev_tail_short = thrust::device_new<int>();
-  thrust::fill(prev_tail_short, prev_tail_short+1, 0);
-
 	timer_cpg.start();
   if (pe_method == PfxtExpMethod::BASIC) {
     while (curr_lvl < max_dev_lvls) {
@@ -2588,8 +2576,8 @@ void CpGen::report_paths(
 
       compute_path_counts
         <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
-            num_verts,
-            num_edges,
+            N,
+            M,
             d_fanout_adjp,
             d_succs,
             d_pfxt_nodes,
@@ -2627,8 +2615,8 @@ void CpGen::report_paths(
       // level preparation is completed
       // now invoke the inter-level expansion kernel
       expand_new_pfxt_level<<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
-          num_verts,
-          num_edges,
+          N,
+          M,
           d_fanout_adjp,
           d_fanout_adjncy,
           d_fanout_wgts,
@@ -2692,8 +2680,8 @@ void CpGen::report_paths(
  
       populate_path_counts
         <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
-            num_verts,
-            num_edges,
+            N,
+            M,
             d_pfxt_nodes,
             d_lvl_offsets,
             curr_lvl, 
@@ -2729,8 +2717,8 @@ void CpGen::report_paths(
       // level preparation is completed
       // now invoke the inter-level expansion kernel
       expand_new_pfxt_level<<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
-          num_verts,
-          num_edges,
+          N,
+          M,
           d_fanout_adjp,
           d_fanout_adjncy,
           d_fanout_wgts,
@@ -2796,8 +2784,8 @@ void CpGen::report_paths(
 
       compute_path_counts
         <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
-            num_verts,
-            num_edges,
+            N,
+            M,
             d_fanout_adjp,
             d_succs,
             d_pfxt_nodes,
@@ -2826,8 +2814,8 @@ void CpGen::report_paths(
 
       expand_new_pfxt_level_atomic_enq
         <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>
-        (num_verts,
-         num_edges,
+        (N,
+         M,
          d_fanout_adjp,
          d_fanout_adjncy,
          d_fanout_wgts,
@@ -2888,21 +2876,17 @@ void CpGen::report_paths(
     float h_split;
     
     // initialize current tail of the long pile (zero)
-    thrust::fill(tail_long, tail_long+1, 0);
+    cudaMemset(tail_long.get(), 0, sizeof(int));
 
     // sort the initial paths by slack (use a tmp storage, don't affect the original path storage)
-    thrust::device_vector<PfxtNode> tmp_paths(short_pile); 
+    thrust::host_vector<PfxtNode> tmp_paths(short_pile); 
     thrust::sort(tmp_paths.begin(), tmp_paths.end(), pfxt_node_comp());
-    auto d_tmp_paths = thrust::raw_pointer_cast(&tmp_paths[0]);
     
     // determine the initial split by picking the slack at the top N percentile
     // (default=0.005 --> top 0.5%)
-    pick_init_split<<<1, 1>>>(d_tmp_paths, split.get(), short_pile_size,
-        init_split_perc);
-    cudaMemcpy(&h_split, split.get(), sizeof(float),
-        cudaMemcpyDeviceToHost);
-    std::cout << "init_split=" << h_split << '\n';
-    
+    h_split = tmp_paths[short_pile_size*init_split_perc].slack;   
+    // std::cout << "init_split=" << h_split << '\n';
+
     // count the slacks that are greater/less equal to the split value
     int h_num_short_paths = short_pile_size * init_split_perc + 1;
     int h_num_long_paths = short_pile_size - h_num_short_paths;
@@ -2956,26 +2940,24 @@ void CpGen::report_paths(
       // if expansion window size > 0, we have short paths to expand
       if (curr_expansion_window_size > 0) {
         // initialize number of long and short paths to 0
-        thrust::fill(num_long_paths, num_long_paths+1, 0);
-        thrust::fill(num_short_paths, num_short_paths+1, 0);
+        cudaMemset(num_long_paths.get(), 0, sizeof(int));
+        cudaMemset(num_short_paths.get(), 0, sizeof(int));
         
         // count the long paths and short paths that we are about to
         // generate
         compute_long_path_counts
-          <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>
-          (num_verts,
-           num_edges,
-           d_fanout_adjp,
-           d_fanout_adjncy,
-           d_fanout_wgts,
-           d_succs,
-           d_dists_cache,
-           d_short_pile,
-           h_window_start,
-           h_window_end,
-           num_long_paths.get(),
-           num_short_paths.get(),
-           split.get());
+          <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>(
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_succs,
+            d_dists_cache,
+            d_short_pile,
+            h_window_start,
+            h_window_end,
+            num_long_paths.get(),
+            num_short_paths.get(),
+            h_split);
         
         // resize the long pile and short pile
         cudaMemcpy(&h_num_long_paths, num_long_paths.get(), sizeof(int),
@@ -2995,24 +2977,22 @@ void CpGen::report_paths(
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
 
-        // run the actual  expansion on the short pile
+        // run the actual expansion on the short pile
         // assign paths to the short pile and long pile
         expand_short_pile
-          <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>
-          (num_verts,
-           num_edges,
-           d_fanout_adjp,
-           d_fanout_adjncy,
-           d_fanout_wgts,
-           d_succs,
-           d_dists_cache,
-           d_short_pile,
-           d_long_pile,
-           h_window_start,
-           h_window_end,
-           tail_short.get(),
-           tail_long.get(),
-           split.get());
+          <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>(
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_succs,
+            d_dists_cache,
+            d_short_pile,
+            d_long_pile,
+            h_window_start,
+            h_window_end,
+            tail_short.get(),
+            tail_long.get(),
+            h_split);
       
         // update window start and end
         h_window_start += curr_expansion_window_size;
@@ -3036,28 +3016,22 @@ void CpGen::report_paths(
         }
         
         while (h_num_short_paths < BLOCKSIZE) {
-          // update the split value on gpu
-          update_split_mult<<<1, 1>>>(split.get(), 1.1f);
-          
-          cudaMemcpy(&h_split, split.get(), sizeof(float),
-              cudaMemcpyDeviceToHost);
-          // std::cout << "updated_split=" << h_split << '\n';
+          // update the split value
+          h_split *= 1.1f;
           
           // now some paths in the long pile
           // must be transferred to the short pile
           // we calculate the long path count
           // (the path count to be transferred can be calculated too)
-          thrust::fill(num_long_paths, num_long_paths+1, 0);
-          count_long_paths
-            <<<ROUNDUPBLOCKS(long_pile_size, BLOCKSIZE), BLOCKSIZE>>>
-            (d_long_pile,
-             long_pile_size,
-             num_long_paths.get(),
-             split.get());
-          
-          // copy the long path count back to host
-          cudaMemcpy(&h_num_long_paths, num_long_paths.get(), sizeof(int),
-              cudaMemcpyDeviceToHost);
+          cudaMemset(num_long_paths.get(), 0, sizeof(int));
+         
+          // count the paths that have slacks larger than split
+          h_num_long_paths = 
+            thrust::count_if(long_pile.begin(), long_pile.end(),
+              [h_split] __host__ __device__ (const PfxtNode& n) {
+                return n.slack > h_split;
+              });
+
           h_num_short_paths = long_pile_size - h_num_long_paths;
         }
 
@@ -3066,9 +3040,10 @@ void CpGen::report_paths(
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
         
-        auto is_short_path = [h_split] __host__ __device__ (const PfxtNode& n) {
-          return n.slack <= h_split;
-        };
+        auto is_short_path = 
+          [h_split] __host__ __device__ (const PfxtNode& n) {
+            return n.slack <= h_split;
+          };
 
         // add the short paths in the long pile to the short pile
         // and mark them as removed in the long pile
@@ -3097,12 +3072,13 @@ void CpGen::report_paths(
       steps++;
     }
 
+    thrust::device_free(num_long_paths);
+    thrust::device_free(num_short_paths);
+    thrust::device_free(tail_long);
+    thrust::device_free(tail_short);
     std::cout << "short-long expansion executed " << steps << " steps.\n";
   }
   else if (pe_method == PfxtExpMethod::SEQUENTIAL) {
-    
-    auto M = static_cast<int>(num_edges);
-    auto N = static_cast<int>(num_verts);
     
     // initialize a priority queue of src nodes
     auto cmp = [](const PfxtNode& a, const PfxtNode& b) {
@@ -3121,7 +3097,7 @@ void CpGen::report_paths(
     // just to validate the generated slacks
     std::vector<PfxtNode> paths;
     std::vector<int> h_succs;
-    h_succs.resize(num_verts);
+    h_succs.resize(N);
     thrust::copy(successors.begin(), successors.end(), h_succs.begin());
     for (int i = 0; i < k; i++) {
       const auto& node = pfxt_pq.top();
@@ -3526,6 +3502,8 @@ int CpGen::_get_expansion_window_size(int* p_start, int* p_end) {
 
 void CpGen::bfs_hybrid_privatized(
   const float alpha,
+  int N,
+  int M,
   int* ivs,
   int* ies,
   float* iwgts,
@@ -3542,12 +3520,11 @@ void CpGen::bfs_hybrid_privatized(
   int* deps,
   int* depths,
   const bool enable_runtime_log_file) {
-  const int M{static_cast<int>(num_edges())};
-  const int N{static_cast<int>(num_verts())};
-  const int num_sinks{static_cast<int>(_sinks.size())};
+  const int num_sinks = _sinks.size();
 
-  int num_frontiers{num_sinks}, curr_depth{0};
-  int num_remainders{N};
+  // std::cout << "alpha=" << alpha << '\n';
+  int num_curr_frontiers{num_sinks}, curr_depth{0};
+  int num_curr_remainders{N};
   
   // separate the tracking of:
   // we separate the tracking of bu_scans and num_remainders
@@ -3556,60 +3533,107 @@ void CpGen::bfs_hybrid_privatized(
   double bu_scans = N;
   
   bool should_update_num_remainders{false};
-  while (num_frontiers) {
+  while (num_curr_frontiers) {
     bu_scans -= td_scans;
     if (should_update_num_remainders) {
       should_update_num_remainders = false;
-
-      if (num_remainders == N) {
-        // we are just done with the first bu_step
-        // curr_remainder is already populated
-        // we do not need to copy from next_remainder
-        num_remainders = bu_scans;
-      }
-      else {
-        num_remainders = bu_scans;
-        // copy the next_remainders to curr_remainders
-        // we don't need to copy all N elements
-        // just the num_remainders
-        thrust::copy(
-          thrust::device,
-          next_remainders,
-          next_remainders+num_remainders,
-          curr_remainders); 
+      // if what we just ran was not the first bu_step
+      // we need to update the curr_remainders
+      if (num_curr_remainders < N) {
+        std::swap(curr_remainders, next_remainders);
       }
       
+      num_curr_remainders = bu_scans;
     }
 
     if (td_scans*alpha < bu_scans) {
       // run top-down step
+      int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE);
+      prop_distance_bfs_td_step_privatized
+        <<<num_blks, BLOCKSIZE>>>(
+            ivs,
+            ies,
+            iwgts,
+            dists,
+            curr_frontiers,
+            next_frontiers,
+            num_curr_frontiers,
+            next_ftr_tail,
+            deps,
+            depths,
+            curr_depth);
     }
     else {
-      if (num_remainders == N) {
-        std::cout << "first bu_step @ depth " << curr_depth << '\n';
+      if (num_curr_remainders == N) {
+        // std::cout << "first bu_step @ depth " << curr_depth << '\n';
+        
         // we need to do a first pass to scan all the N vertices
         // and get the current remainder vertices
         
+        // NOTE: here although there's more vertices to scan in curr_remainders
+        // than in curr_frontiers, we don't want to launch a lot more threads
+        // than if we were to scan curr_frontiers; we launch the exact same
+        // number of threads and let each thread scan multiple vertices 
+       
+        // compute the number of threads needed such that 
+        // each thread scans PER_THREAD_WORK_ITEMS vertices
+        int num_threads = ROUNDUPBLOCKS(N, PER_THREAD_WORK_ITEMS);
+        int num_blks = ROUNDUPBLOCKS(num_threads, BLOCKSIZE);
+        prop_distance_bfs_bu_step_privatized_no_curr_remainders
+          <<<num_blks, BLOCKSIZE>>>(
+              N,
+              ovs,
+              oes,
+              owgts,
+              dists,
+              curr_remainders,
+              next_rem_tail,
+              next_frontiers,
+              next_ftr_tail,
+              deps,
+              depths,
+              curr_depth);
 
         // update the number of remainders
         should_update_num_remainders = true;
       }
       else {
         // run bottom-up step
-        
 
-        // update the number of remainders
-        should_update_num_remainders = true;
+        int num_blks = ROUNDUPBLOCKS(num_curr_remainders, BLOCKSIZE);
+        prop_distance_bfs_bu_step_privatized
+          <<<num_blks, BLOCKSIZE>>>(
+              ovs,
+              oes,
+              owgts,
+              dists,
+              curr_remainders,
+              num_curr_remainders,
+              next_remainders,
+              next_rem_tail,
+              next_frontiers,
+              next_ftr_tail,
+              deps,
+              depths,
+              curr_depth); 
       }
-
-      // reset the tail of the next remainders
-      thrust::fill(next_rem_tail, next_rem_tail+1, 0);
+      
+      // signal the next iteration to
+      // update the number of curr_remainders
+      // reason doing this is to avoid another cudaMemcpy call
+      should_update_num_remainders = true;
+      
+      // reset the curr_remainder tail
+      cudaMemset(next_rem_tail, 0, sizeof(int));
     }
     
-    // TODO: swap curr / next here
-    // and copy the num_tails to host
+    // update curr_num_frontiers
+    cudaMemcpy(&num_curr_frontiers, next_ftr_tail, sizeof(int),
+        cudaMemcpyDeviceToHost);
     
-    td_scans = num_frontiers;
+    cudaMemset(next_ftr_tail, 0, sizeof(int));
+    std::swap(curr_frontiers, next_frontiers);
+    td_scans = num_curr_frontiers;
     
     // increment depth
     curr_depth++;

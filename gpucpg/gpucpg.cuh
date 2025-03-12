@@ -100,6 +100,8 @@ public:
 
   void bfs_hybrid_privatized(
     const float alpha,
+    int N,
+    int M,
     int* ivs,
     int* ies,
     float* iwgts,
