@@ -23,9 +23,11 @@ enum class PropDistMethod {
   LEVELIZED,
   LEVELIZED_SHAREDMEM,
   BFS_TOP_DOWN_PRIVATIZED,
+  BFS_TOP_DOWN,
   BFS_PRIVATIZED_MERGED,
   BFS_HYBRID,
-  BFS_HYBRID_PRIVATIZED
+  BFS_HYBRID_PRIVATIZED,
+  TEST_COUNT_MF
 };
 
 enum class PfxtExpMethod {
@@ -117,7 +119,8 @@ public:
     int* next_rem_tail,
     int* deps,
     int* depths,
-    const bool enable_runtime_log_file
+    const bool enable_runtime_log_file,
+    const int per_thread_work_items
   );
 
   void report_paths(
@@ -128,7 +131,9 @@ public:
     const PfxtExpMethod pe_method,
     const bool enable_runtime_log_file = false,
     const float init_split_perc = 0.005f,
-    const float alpha = 2.0f);
+    const float alpha = 5.0f,
+    const int per_thread_work_items = 8,
+    const int in_deg_trhd = 1);
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);

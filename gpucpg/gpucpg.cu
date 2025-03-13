@@ -24,7 +24,7 @@ namespace cg = cooperative_groups;
 #define S_FRONTIER_CAPACITY 4096 
 #define W_FRONTIER_CAPACITY 64
 #define S_PFXT_CAPACITY 1024 
-#define PER_THREAD_WORK_ITEMS 4
+#define PER_THREAD_WORK_ITEMS 8 
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -609,49 +609,6 @@ __global__ void set_kernel(int* val, int n) {
   }
 }
 
-__global__ void prop_distance_bfs_td_step(
-    int num_verts, 
-    int num_edges,
-    int* verts,
-    int* edges,
-    float* wgts,
-    int* distances_cache,
-    int* queue,
-    int* qhead,
-    int* qtail,
-    int qsize,
-    int* deps,
-    int* depths,
-    int curr_depth) {
-
-  const int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (tid >= qsize) {
-    return;
-  }
-
-  // process a vertex from the queue
-  const auto vid = queue[*qhead+tid];
-  const auto edge_start = verts[vid];
-  const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
-  
-  for (int eid = edge_start; eid < edge_end; eid++) {
-    const auto neighbor = edges[eid];
-    const int wgt = wgts[eid] * SCALE_UP;
-    const auto new_distance = distances_cache[vid] + wgt;
-    atomicMin(&distances_cache[neighbor], new_distance);
-   
-    // decrement the dependency counter for this neighbor
-    if (atomicSub(&deps[neighbor], 1) == 1) {
-      depths[neighbor] = curr_depth + 1;
-      // if this thread releases the last dependency
-      // it should add this neighbor to the queue
-      enqueue(neighbor, queue, qtail);
-    }
-  }
-} 
-
-
-
 __global__ void prop_distance_bfs_td_step_no_atomic_min(
   int num_verts,
   int num_edges,
@@ -736,14 +693,12 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
   __shared__ int local_curr_remainders[S_BUFF_CAPACITY];
   __shared__ int num_local_curr_remainders;
 
-  auto this_block = cg::this_thread_block();
-  
   // let one thread initialize the counters 
-  if (this_block.thread_rank() == 0) {
+  if (threadIdx.x == 0) {
     num_local_next_frontiers = 0;
     num_local_curr_remainders = 0;
   }
-  this_block.sync();
+  __syncthreads();
 
   int u = threadIdx.x + blockIdx.x * blockDim.x;  
   while (u < num_verts) {
@@ -803,20 +758,31 @@ __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
     }
     u += blockDim.x * gridDim.x;
   }
-  
-  this_block.sync();
+  __syncthreads();  
+
 
   // now we commit the local frontiers and local remainders to global memory
   __shared__ int next_ftr_beg, curr_rem_beg;
-  if (this_block.thread_rank() == 0) {
+  if (threadIdx.x == 0) {
     next_ftr_beg = atomicAdd(next_ftr_tail, num_local_next_frontiers);
     curr_rem_beg = atomicAdd(curr_rem_tail, num_local_curr_remainders);
   }
-  this_block.sync();
+  __syncthreads();
 
   // commit local frontiers and local remainders to the global memory
-  commit_local_to_global(this_block, next_frontiers, next_ftr_beg, num_local_next_frontiers, local_next_frontiers);
-  commit_local_to_global(this_block, curr_remainders, curr_rem_beg, num_local_curr_remainders, local_curr_remainders);
+  for (auto local_idx = threadIdx.x; 
+    local_idx < num_local_next_frontiers; 
+    local_idx += blockDim.x) {
+    auto global_idx = next_ftr_beg + local_idx;
+    next_frontiers[global_idx] = local_next_frontiers[local_idx]; 
+  }
+
+  for (auto local_idx = threadIdx.x; 
+    local_idx < num_local_curr_remainders; 
+    local_idx += blockDim.x) {
+    auto global_idx = curr_rem_beg + local_idx;
+    curr_remainders[global_idx] = local_curr_remainders[local_idx]; 
+  }
 }
 
 __global__ void prop_distance_bfs_bu_step_privatized(
@@ -838,14 +804,12 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   __shared__ int local_next_remainders[S_BUFF_CAPACITY];
   __shared__ int num_local_next_remainders;
 
-  auto this_block = cg::this_thread_block();
-  
   // let one thread initialize the counters 
-  if (this_block.thread_rank() == 0) {
+  if (threadIdx.x == 0) {
     num_local_next_frontiers = 0;
     num_local_next_remainders = 0;
   }
-  this_block.sync();
+  __syncthreads();
 
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   while (tid < num_curr_remainders) {
@@ -904,59 +868,31 @@ __global__ void prop_distance_bfs_bu_step_privatized(
     }
     tid += blockDim.x * gridDim.x;
   }
-  this_block.sync();
+  __syncthreads();
 
   // now we commit the local frontiers and local remainders to global memory
   __shared__ int next_ftr_beg, next_rem_beg;
-  if (this_block.thread_rank() == 0) {
+  if (threadIdx.x == 0) {
     next_ftr_beg = atomicAdd(next_ftr_tail, num_local_next_frontiers);
     next_rem_beg = atomicAdd(next_rem_tail, num_local_next_remainders);
   }
-  this_block.sync();
+  __syncthreads();
 
   // commit local frontiers and local remainders to global memory
-  commit_local_to_global(this_block, next_frontiers, next_ftr_beg, num_local_next_frontiers, local_next_frontiers);
-  commit_local_to_global(this_block, next_remainders, next_rem_beg, num_local_next_remainders, local_next_remainders);
+  for (int local_idx = threadIdx.x;
+    local_idx < num_local_next_frontiers; 
+    local_idx += blockDim.x) {
+    int global_idx = next_ftr_beg + local_idx;
+    next_frontiers[global_idx] = local_next_frontiers[local_idx]; 
+  }
+
+  for (int local_idx = threadIdx.x;
+    local_idx < num_local_next_remainders; 
+    local_idx += blockDim.x) {
+    int global_idx = next_rem_beg + local_idx;
+    next_remainders[global_idx] = local_next_remainders[local_idx]; 
+  }
 }
-
-__global__ void prop_distance_bfs_bu_step(
-    int num_verts, 
-    int num_edges,
-    int* overts,
-    int* oedges,
-    float* owgts,
-    int* distances_cache,
-    int* untouched_verts,
-    int num_untouched,
-    int* deps) {
-    
-  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (gid < num_untouched) {
-    const auto v = untouched_verts[gid];
-    const auto edge_beg = overts[v];
-    const auto edge_end = (v == num_verts-1) ? num_edges : overts[v+1]; 
-    
-		for (auto eid = edge_beg; eid < edge_end; eid++) {
-      // in the bottom-up step, we let v find its parent
-      const auto neighbor = oedges[eid];
-      if (deps[neighbor] > 0) {
-        return;
-      }
-    }
-
-		auto min_dist{::cuda::std::numeric_limits<int>::max()};
-    for (auto eid = edge_beg; eid < edge_end; eid++) {
-      const auto neighbor = oedges[eid];
-      const int wgt = owgts[eid] * SCALE_UP;
-      int new_dist = distances_cache[neighbor] + wgt;
-      min_dist = min(min_dist, new_dist); 
-    }
-
-		distances_cache[v] = min_dist;
-    deps[v] = 0;
-	}
-}
-
 
 __global__ void prop_distance_bfs_td_step_single_block(
     int num_verts, 
@@ -1050,94 +986,43 @@ __global__ void prop_distance_bfs_td_step_single_block(
   } 
 }
 
+__global__ void prop_distance_bfs_td_step(
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* distances_cache,
+  int* curr_ftrs,
+  int* next_ftrs,
+  int num_curr_ftrs,
+  int* num_next_ftrs,
+  int* deps,
+  int* depths,
+  int curr_depth) {
 
-//__global__ void prop_distance_bfs_td_step_privatized_multi_work(
-//  int num_verts, 
-//  int num_edges,
-//  int* verts,
-//  int* edges,
-//  float* wgts,
-//  int* distances_cache,
-//  int* glob_queue,
-//  int* qhead,
-//  int* qtail,
-//  int qsize,
-//  int* deps,
-//  int* depths,
-//  int current_depth) {
-//  // initialize privatized frontiers
-//  __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
-//
-//  // shared counter to count fontiers in this block
-//  __shared__ int s_num_curr_frontiers;
-//  if (threadIdx.x == 0) {
-//    // let tid 0 initialize the counter
-//    s_num_curr_frontiers = 0;
-//  }
-//  __syncthreads();
-//
-//  // perform BFS
-//  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
-//
-//  while (gid < qsize) {
-//    const auto vid = glob_queue[*qhead+gid];
-//    const auto edge_start = verts[vid];
-//    const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
-//    for (int eid = edge_start; eid < edge_end; eid++) {
-//      const auto neighbor = edges[eid];
-//      
-//      const int wgt = wgts[eid] * SCALE_UP;
-//      const int new_distance = distances_cache[vid] + wgt;
-//      atomicMin(&distances_cache[neighbor], new_distance);
-//    
-//      // decrement the dependency counter for this neighbor
-//      if (atomicSub(&deps[neighbor], 1) == 1) {
-//        // update the depth of this neighbor
-//        depths[neighbor] = current_depth + 1;
-//        
-//        // if this thread releases the last dependency
-//        // it should add this neighbor to the frontier queue
-//        
-//        // we check if there's more space in the shared frontier storage
-//        const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
-//        if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
-//          // if we have space, store to the shared frontier storage
-//          s_curr_frontiers[s_curr_frontier_idx] = neighbor;
-//        }
-//        else {
-//          // if not, we have no choice but to store directly
-//          // back to glob mem
-//          s_num_curr_frontiers = S_FRONTIER_CAPACITY;
-//          enqueue(neighbor, glob_queue, qtail);
-//        }
-//      }
-//    }
-//    gid += blockDim.x * gridDim.x;
-//  }
-//  __syncthreads();
-//
-//  // calculate the index to start placing frontiers
-//  // in the global queue
-//  __shared__ int curr_frontier_beg;
-//  if (threadIdx.x == 0) {
-//    curr_frontier_beg = atomicAdd(qtail, s_num_curr_frontiers);
-//  }
-//  __syncthreads();
-//
-//  // commit local frontiers to the global queue
-//  // each thread will handle the frontiers in a strided fashion
-//  // NOTE: I think this is to ensure coalesced access on glob mem?
-//  // e.g., blocksize = 4, 8 local frontiers
-//  // tid 0 will handle frontier idx 0 and 0 + 4
-//  // tid 1 will handle frontier idx 1 and 1 + 4
-//  // etc.
-//  for (auto s_curr_frontier_idx = threadIdx.x; 
-//      s_curr_frontier_idx < s_num_curr_frontiers; 
-//      s_curr_frontier_idx += blockDim.x) {
-//    auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
-//    glob_queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
-//  }
-//} 
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+
+  if (tid < num_curr_ftrs) {
+    // process a vertex from the queue
+    const auto vid = curr_ftrs[tid];
+    const auto edge_start = verts[vid];
+    const auto edge_end = verts[vid+1]; 
+
+    for (int eid = edge_start; eid < edge_end; eid++) {
+      const auto neighbor = edges[eid];
+      const int wgt = wgts[eid] * SCALE_UP;
+      const auto new_distance = distances_cache[vid] + wgt;
+      atomicMin(&distances_cache[neighbor], new_distance);
+  
+      // decrement the dependency counter for this neighbor
+      if (atomicSub(&deps[neighbor], 1) == 1) {
+        depths[neighbor] = curr_depth + 1;
+        // if this thread releases the last dependency
+        // it should add this neighbor to the queue
+        enqueue(neighbor, next_ftrs, num_next_ftrs);
+      }
+    }
+  }
+} 
 
 __global__ void prop_distance_bfs_td_step_privatized(
   int* verts,
@@ -1221,96 +1106,6 @@ __global__ void prop_distance_bfs_td_step_privatized(
     next_ftrs[next_frontier_idx] = s_next_frontiers[s_next_frontier_idx]; 
   }
 } 
-
-
-//__global__ void prop_distance_bfs_td_step_privatized(
-//  int num_verts, 
-//  int num_edges,
-//  int* verts,
-//  int* edges,
-//  float* wgts,
-//  int* distances_cache,
-//  int* glob_queue,
-//  int* qhead,
-//  int* qtail,
-//  int qsize,
-//  int* deps,
-//  int* depths,
-//  int current_depth) {
-//  // initialize privatized frontiers
-//  __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
-//
-//  // shared counter to count fontiers in this block
-//  __shared__ int s_num_curr_frontiers;
-//  if (threadIdx.x == 0) {
-//    // let tid 0 initialize the counter
-//    s_num_curr_frontiers = 0;
-//  }
-//  __syncthreads();
-//
-//  // perform BFS
-//  int gid = threadIdx.x + blockIdx.x * blockDim.x;  
-//
-//  // dequeue a vertex from the global queue
-//  if (gid < qsize) {
-//    const auto vid = glob_queue[*qhead+gid];
-//    const auto edge_start = verts[vid];
-//    const auto edge_end = (vid == num_verts-1) ? num_edges : verts[vid+1]; 
-//    for (int eid = edge_start; eid < edge_end; eid++) {
-//      const auto neighbor = edges[eid];
-//      
-//      const int wgt = wgts[eid] * SCALE_UP;
-//      const int new_distance = distances_cache[vid] + wgt;
-//      atomicMin(&distances_cache[neighbor], new_distance);
-//    
-//      // decrement the dependency counter for this neighbor
-//      if (atomicSub(&deps[neighbor], 1) == 1) {
-//        // update the depth of this neighbor
-//        depths[neighbor] = current_depth + 1;
-//        
-//        // if this thread releases the last dependency
-//        // it should add this neighbor to the frontier queue
-//        
-//        // we check if there's more space in the shared frontier storage
-//        const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
-//        if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
-//          // if we have space, store to the shared frontier storage
-//          s_curr_frontiers[s_curr_frontier_idx] = neighbor;
-//        }
-//        else {
-//          // if not, we have no choice but to store directly
-//          // back to glob mem
-//          s_num_curr_frontiers = S_FRONTIER_CAPACITY;
-//          enqueue(neighbor, glob_queue, qtail);
-//        }
-//      }
-//    }
-//  }
-//  __syncthreads();
-//
-//  // calculate the index to start placing frontiers
-//  // in the global queue
-//  __shared__ int curr_frontier_beg;
-//  if (threadIdx.x == 0) {
-//    // let tid = 0 handle the calculation
-//    curr_frontier_beg = atomicAdd(qtail, s_num_curr_frontiers);
-//  }
-//  __syncthreads();
-//
-//  // commit local frontiers to the global queue
-//  // each thread will handle the frontiers in a strided fashion
-//  // NOTE: I think this is to ensure coalesced access on glob mem?
-//  // e.g., blocksize = 4, 8 local frontiers
-//  // tid 0 will handle frontier idx 0 and 0 + 4
-//  // tid 1 will handle frontier idx 1 and 1 + 4
-//  // etc.
-//  for (auto s_curr_frontier_idx = threadIdx.x; 
-//      s_curr_frontier_idx < s_num_curr_frontiers; 
-//      s_curr_frontier_idx += blockDim.x) {
-//    auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
-//    glob_queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
-//  }
-//} 
 
 // NOTE: to precompute spurs, we also need to decide successor
 // while doing BFS
@@ -1552,13 +1347,13 @@ __global__ void condition_queue_empty(
 
 
 __global__ void update_successors(
-    int num_verts, 
-    int num_edges,
-    int* vertices,
-    int* edges,
-    float* wgts,
-    int* distances_cache,
-    int* d_succs) {
+  int num_verts, 
+  int num_edges,
+  int* vertices,
+  int* edges,
+  float* wgts,
+  int* distances_cache,
+  int* d_succs) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
   if (tid >= num_verts) {
     return;
@@ -1901,8 +1696,9 @@ __global__ void expand_new_pfxt_level_atomic_enq(
   __shared__ PfxtNode s_pfxt_nodes[S_PFXT_CAPACITY];
   __shared__ int s_num_pfxt_nodes;
   __shared__ float s_slack_sum;
-  for (auto s_pfxt_node_idx = threadIdx.x; s_pfxt_node_idx < S_PFXT_CAPACITY;
-      s_pfxt_node_idx += blockDim.x) {
+  for (auto s_pfxt_node_idx = threadIdx.x;
+    s_pfxt_node_idx < S_PFXT_CAPACITY;
+    s_pfxt_node_idx += blockDim.x) {
     // initialize shared mem
     s_pfxt_nodes[s_pfxt_node_idx] = PfxtNode();
   }
@@ -1964,7 +1760,6 @@ __global__ void expand_new_pfxt_level_atomic_enq(
             slack + dist_neighbor + wgt - dist_v;
           atomicAdd(&s_slack_sum, new_path.slack);
         }
-
       } 
 
       // traverse to next successor
@@ -1982,16 +1777,17 @@ __global__ void expand_new_pfxt_level_atomic_enq(
   }
   __syncthreads();
 
-  for (auto s_pfxt_node_idx = threadIdx.x; s_pfxt_node_idx < s_num_pfxt_nodes;
-      s_pfxt_node_idx += blockDim.x) {
+  for (auto s_pfxt_node_idx = threadIdx.x;
+    s_pfxt_node_idx < s_num_pfxt_nodes;
+    s_pfxt_node_idx += blockDim.x) {
     // the location to write on glob mem
     const auto g_pfxt_node_idx = s_pfxt_beg + s_pfxt_node_idx;
-
     // write to glob mem
     pfxt_nodes[g_pfxt_node_idx] = s_pfxt_nodes[s_pfxt_node_idx]; 
   }
 }
 
+// TODO: cache local pfxt nodes with shared memory
 __global__ void expand_short_pile(
   int* verts,
   int* edges,
@@ -2123,12 +1919,14 @@ void CpGen::report_paths(
   const PfxtExpMethod pe_method,
   const bool enable_runtime_log_file,
   const float init_split_perc,
-  const float alpha) {
+  const float alpha,
+  const int per_thread_work_items,
+  const int in_deg_trhd) {
 
   // set cache configuration
-  cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
-  cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized_no_curr_remainders, cudaFuncCachePreferShared);
-  cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized, cudaFuncCachePreferShared);
+  // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
+  // cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized_no_curr_remainders, cudaFuncCachePreferShared);
+  // cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized, cudaFuncCachePreferShared);
 
 
   const int N = num_verts();
@@ -2335,7 +2133,8 @@ void CpGen::report_paths(
       next_rem_tail,
       d_deps,
       d_depths,
-      enable_runtime_log_file);
+      enable_runtime_log_file,
+      per_thread_work_items);
   }
   else if (pd_method == PropDistMethod::CUDA_GRAPH) {
     cudaGraph_t cug;
@@ -2448,6 +2247,93 @@ void CpGen::report_paths(
       std::swap(d_curr_frontiers, d_next_frontiers);
       curr_depth++;
     }
+  }
+  else if (pd_method == PropDistMethod::TEST_COUNT_MF) {
+    int curr_depth{0};
+    int num_curr_frontiers{static_cast<int>(_sinks.size())};
+
+    std::ofstream mf_log("mf.csv");
+    std::string filename = "big_in_deg_perc-trhd=" + std::to_string(in_deg_trhd) + ".csv";
+    std::ofstream big_in_degs_log(filename); 
+    
+    mf_log << "depth,mf\n";
+    big_in_degs_log << "depth, big_in_deg_perc\n"; 
+    while (num_curr_frontiers) {
+      // sum up the in-degrees of the current frontiers (mf)
+      // e.g., curr_frontiers = [0, 2, 6]
+      // mf = indeg[0] + indeg[2] + indeg[6] 
+      // auto indeg = [d_in_degs] __device__ __host__ (int v) {
+      //   return d_in_degs[v];
+      // };
+      
+      // int mf = thrust::transform_reduce(
+      //   thrust::device,
+      //   d_curr_frontiers,
+      //   d_curr_frontiers + num_curr_frontiers,
+      //   indeg,
+      //   0,
+      //   thrust::plus<int>());
+      // mf_log << curr_depth << ',' << mf << '\n';
+
+      // count the frontiers with in-degree > in_deg_trhd
+      // int num_big_in_degs = 
+      //   thrust::count_if(
+      //     thrust::device,
+      //     d_curr_frontiers,
+      //     d_curr_frontiers + num_curr_frontiers,
+      //     [d_in_degs, in_deg_trhd] __device__ __host__ (int v) {
+      //       return d_in_degs[v] > in_deg_trhd;
+      //     });
+      
+      // float big_in_deg_perc = (float)num_big_in_degs / num_curr_frontiers;
+      // big_in_degs_log << curr_depth << ',' << big_in_deg_perc*100.0f << '\n';
+
+      int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE);
+      prop_distance_bfs_td_step_privatized
+        <<<num_blks, BLOCKSIZE>>>(
+          d_fanin_adjp,
+          d_fanin_adjncy,
+          d_fanin_wgts,
+          d_dists_cache,
+          d_curr_frontiers,
+          d_next_frontiers,
+          num_curr_frontiers,
+          next_ftr_tail,
+          d_deps,
+          d_depths,
+          curr_depth);
+      cudaMemcpy(&num_curr_frontiers, next_ftr_tail, sizeof(int), cudaMemcpyDeviceToHost);
+      cudaMemset(next_ftr_tail, 0, sizeof(int));
+      std::swap(d_curr_frontiers, d_next_frontiers);
+      curr_depth++;
+    }
+  }
+  else if (pd_method == PropDistMethod::BFS_TOP_DOWN) {
+    int curr_depth{0};
+    int num_curr_frontiers{static_cast<int>(_sinks.size())};
+   
+    while (num_curr_frontiers) {
+      int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE);
+      prop_distance_bfs_td_step
+        <<<num_blks, BLOCKSIZE>>>(
+          d_fanin_adjp,
+          d_fanin_adjncy,
+          d_fanin_wgts,
+          d_dists_cache,
+          d_curr_frontiers,
+          d_next_frontiers,
+          num_curr_frontiers,
+          next_ftr_tail,
+          d_deps,
+          d_depths,
+          curr_depth);
+      cudaMemcpy(&num_curr_frontiers, next_ftr_tail, sizeof(int), cudaMemcpyDeviceToHost);
+      cudaMemset(next_ftr_tail, 0, sizeof(int));
+      std::swap(d_curr_frontiers, d_next_frontiers);
+      curr_depth++;
+    }
+    std::cout << "curr_depth=" << curr_depth << '\n';
+
   }
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
     //int qsize{static_cast<int>(_sinks.size())}; 
@@ -2872,9 +2758,6 @@ void CpGen::report_paths(
     }
   }
   else if (pe_method == PfxtExpMethod::SHORT_LONG) {
-    // host variable to store the split value
-    float h_split;
-    
     // initialize current tail of the long pile (zero)
     cudaMemset(tail_long.get(), 0, sizeof(int));
 
@@ -2884,7 +2767,7 @@ void CpGen::report_paths(
     
     // determine the initial split by picking the slack at the top N percentile
     // (default=0.005 --> top 0.5%)
-    h_split = tmp_paths[short_pile_size*init_split_perc].slack;   
+    auto h_split = tmp_paths[short_pile_size*init_split_perc].slack;   
     // std::cout << "init_split=" << h_split << '\n';
 
     // count the slacks that are greater/less equal to the split value
@@ -3140,6 +3023,11 @@ void CpGen::report_paths(
     _h_pfxt_nodes = std::move(paths);
   }
 
+  // can remove if not timing code
+  cudaDeviceSynchronize();
+	timer_cpg.stop();
+	expand_time = timer_cpg.get_elapsed_time();
+
   if (pe_method == PfxtExpMethod::BASIC ||
       pe_method == PfxtExpMethod::PRECOMP_SPURS ||
       pe_method == PfxtExpMethod::ATOMIC_ENQ) {
@@ -3165,8 +3053,6 @@ void CpGen::report_paths(
     thrust::copy(short_pile.begin(), short_pile.end(), _h_pfxt_nodes.begin());
   }
 
-	timer_cpg.stop();
-	expand_time = timer_cpg.get_elapsed_time();
 
   // free gpu memory
   cudaFree(next_ftr_tail);
@@ -3519,7 +3405,8 @@ void CpGen::bfs_hybrid_privatized(
   int* next_rem_tail,
   int* deps,
   int* depths,
-  const bool enable_runtime_log_file) {
+  const bool enable_runtime_log_file,
+  const int per_thread_work_items) {
   const int num_sinks = _sinks.size();
 
   // std::cout << "alpha=" << alpha << '\n';
@@ -3531,6 +3418,8 @@ void CpGen::bfs_hybrid_privatized(
   // because num_remainders should not be affected by the heuristic information update
   double td_scans = num_sinks;
   double bu_scans = N;
+ 
+  bool switched_to_bu{false};
   
   bool should_update_num_remainders{false};
   while (num_curr_frontiers) {
@@ -3546,7 +3435,7 @@ void CpGen::bfs_hybrid_privatized(
       num_curr_remainders = bu_scans;
     }
 
-    if (td_scans*alpha < bu_scans) {
+    if (td_scans*alpha < bu_scans && !switched_to_bu) {
       // run top-down step
       int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE);
       prop_distance_bfs_td_step_privatized
@@ -3564,8 +3453,9 @@ void CpGen::bfs_hybrid_privatized(
             curr_depth);
     }
     else {
+      switched_to_bu = true;
       if (num_curr_remainders == N) {
-        // std::cout << "first bu_step @ depth " << curr_depth << '\n';
+        std::cout << "first bu_step @ depth " << curr_depth << '\n';
         
         // we need to do a first pass to scan all the N vertices
         // and get the current remainder vertices
@@ -3574,11 +3464,7 @@ void CpGen::bfs_hybrid_privatized(
         // than in curr_frontiers, we don't want to launch a lot more threads
         // than if we were to scan curr_frontiers; we launch the exact same
         // number of threads and let each thread scan multiple vertices 
-       
-        // compute the number of threads needed such that 
-        // each thread scans PER_THREAD_WORK_ITEMS vertices
-        int num_threads = ROUNDUPBLOCKS(N, PER_THREAD_WORK_ITEMS);
-        int num_blks = ROUNDUPBLOCKS(num_threads, BLOCKSIZE);
+        int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE);
         prop_distance_bfs_bu_step_privatized_no_curr_remainders
           <<<num_blks, BLOCKSIZE>>>(
               N,
@@ -3599,8 +3485,9 @@ void CpGen::bfs_hybrid_privatized(
       }
       else {
         // run bottom-up step
-
-        int num_blks = ROUNDUPBLOCKS(num_curr_remainders, BLOCKSIZE);
+        int num_threads = (per_thread_work_items == 0) ? num_curr_frontiers :
+          ROUNDUPBLOCKS(num_curr_remainders, per_thread_work_items);
+        int num_blks = ROUNDUPBLOCKS(num_threads, BLOCKSIZE);
         prop_distance_bfs_bu_step_privatized
           <<<num_blks, BLOCKSIZE>>>(
               ovs,
