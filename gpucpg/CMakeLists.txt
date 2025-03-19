@@ -1,5 +1,8 @@
 add_library(gpucpg gpucpg.cu)
 
+# include the moderngpu path
+# include_directories(${GPUCPG_3RDPARTY_DIR}/moderngpu/src)
+
 # find the pthreads library
 find_package(Threads REQUIRED)
 

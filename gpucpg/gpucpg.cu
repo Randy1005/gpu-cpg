@@ -13,6 +13,8 @@
 #include <cuda_runtime_api.h>
 #include <cooperative_groups.h>
 #include <iomanip>
+// #include <moderngpu/kernel_segsort.hxx>
+// #include <moderngpu/transform.hxx>
 
 namespace cg = cooperative_groups;
 
@@ -231,9 +233,8 @@ void CpGen::read_input(const std::string& filename) {
     std::getline(infile, line);
   }
 
-  // Temporary storage to count fanin and fanout edges
-  std::unordered_map<int, std::vector<std::pair<int, double>>> fanin_edges;
-  std::unordered_map<int, std::vector<std::pair<int, double>>> fanout_edges;
+  // std::unordered_map<int, std::vector<std::pair<int, double>>> fanin_edges;
+  // std::unordered_map<int, std::vector<std::pair<int, double>>> fanout_edges;
 
   // Parse edges
   while (std::getline(infile, line)) {
@@ -258,25 +259,25 @@ void CpGen::read_input(const std::string& filename) {
     }
 
     // Add edges to temporary storage
-    fanout_edges[from].emplace_back(to, weight);
-    fanin_edges[to].emplace_back(from, weight);
+    _h_fanout_edges[from].emplace_back(to, weight);
+    _h_fanin_edges[to].emplace_back(from, weight);
   }
 
   // Build CSR for fanout
   for (int i = 0; i < vertex_count; ++i) {
-    _h_fanout_adjp[i + 1] = _h_fanout_adjp[i] + fanout_edges[i].size();
+    _h_fanout_adjp[i+1] = _h_fanout_adjp[i] + _h_fanout_edges[i].size();
     
     // record out degrees for later topological sort
-    _h_out_degrees[i] = fanout_edges[i].size();
+    _h_out_degrees[i] = _h_fanout_edges[i].size();
 
     // record the maximum out degree of this graph 
     _h_max_odeg = std::max(_h_out_degrees[i], _h_max_odeg);
 
-    if (fanout_edges[i].size() == 0) {
+    if (_h_fanout_edges[i].size() == 0) {
       _sinks.emplace_back(i);
     }
 
-    for (const auto& [to, weight] : fanout_edges[i]) {
+    for (const auto& [to, weight] : _h_fanout_edges[i]) {
       _h_fanout_adjncy.push_back(to);
       _h_fanout_wgts.push_back(weight);
     }
@@ -284,20 +285,143 @@ void CpGen::read_input(const std::string& filename) {
 
   // Build CSR for fanin
   for (int i = 0; i < vertex_count; ++i) {
-    _h_fanin_adjp[i + 1] = _h_fanin_adjp[i] + fanin_edges[i].size();
-    _h_in_degrees[i] = fanin_edges[i].size();     
+    _h_fanin_adjp[i+1] = _h_fanin_adjp[i] + _h_fanin_edges[i].size();
+    _h_in_degrees[i] = _h_fanin_edges[i].size();     
 
-    if (fanin_edges[i].size() == 0) {
+    if (_h_fanin_edges[i].size() == 0) {
       _srcs.emplace_back(i);
     }
 
-    for (const auto& [from, weight] : fanin_edges[i]) {
+    for (const auto& [from, weight] : _h_fanin_edges[i]) {
       _h_fanin_adjncy.push_back(from);
       _h_fanin_wgts.push_back(weight);
     }
   }
 }
 
+void CpGen::segsort_adjncy() {
+  // use moderngpu to segment sort
+  // the adjacency lists, and make sure
+  // the weights are sorted accordingly
+  // mgpu::standard_context_t context;
+  // mgpu::segmented_sort_indices(
+  //     _h_fanout_adjncy.data().get(),
+  //     _h_fanout_wgts.data().get(),
+  //     num_verts(),
+  //     _h_fanout_adjp.data().get(),
+  //     mgpu::less_t<int>(),
+  //     context);
+  // mgpu::transform([]MGPU_DEVICE(int idx) {
+  //   printf("hello from thread %d\n", idx);
+  // }, 5, context);
+
+  // context.synchronize();
+
+  const int N = num_verts();
+
+  // use static scheduling policy
+  #pragma omp parallel for schedule(static)
+  for (int i = 0; i < N; i++) {
+    auto e_beg = _h_fanout_adjp[i];
+    auto e_end = _h_fanout_adjp[i+1];
+    std::vector<std::pair<int, float>> seg;
+    for (int j = e_beg; j < e_end; j++) {
+      seg.emplace_back(_h_fanout_adjncy[j], _h_fanout_wgts[j]);
+    }
+
+    std::sort(seg.begin(), seg.end(), [](const auto& a, const auto& b) {
+      return a.first < b.first;
+    });
+
+    // update the original adjacency list
+    for (int j = e_beg, k = 0; j < e_end; j++, k++) {
+      _h_fanout_adjncy[j] = seg[k].first;
+      _h_fanout_wgts[j] = seg[k].second;
+    }
+  }
+
+  // print the adjacency list
+  // for (int i = 0; i < N; i++) {
+  //   auto e_beg = _h_fanout_adjp[i];
+  //   auto e_end = _h_fanout_adjp[i+1];
+  //   std::cout << i << ": ";
+  //   for (int j = e_beg; j < e_end; j++) {
+  //     std::cout << _h_fanout_adjncy[j] << " ";
+  //   }
+  //   std::cout << '\n';
+  // }
+
+}
+
+void CpGen::densify_graph(const int desired_avg_degree) {
+  // levelize first to prevent cycles
+  levelize(); 
+  
+  // the levelized vertex order is starting from the sinks
+  // reverse it
+  std::reverse(_h_verts_by_lvl.begin(), _h_verts_by_lvl.end());
+
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  const int N = num_verts();
+  const int M = num_edges();
+  std::uniform_int_distribution<int> dis_vert(0, N-1);
+  std::uniform_real_distribution<double> dis_wgt(0.1, 50.0);
+
+  int num_edges_needed = desired_avg_degree * N - M;
+  std::cout << "num_edges_needed=" << num_edges_needed << '\n';
+  while (num_edges_needed) {
+    auto u = dis_vert(gen);
+    auto v = dis_vert(gen);
+    if (u != v) {
+      // check if this edge exists
+      bool found = false;
+      for (const auto& [to, _] : _h_fanout_edges.at(u)) {
+        if (to == v) {
+          found = true;
+          break;
+        }
+      }
+
+      auto u_idx = std::find(_h_verts_by_lvl.begin(), _h_verts_by_lvl.end(), u) - _h_verts_by_lvl.begin();
+      auto v_idx = std::find(_h_verts_by_lvl.begin(), _h_verts_by_lvl.end(), v) - _h_verts_by_lvl.begin();
+      
+      if (!found && u_idx < v_idx) {
+        _h_fanout_edges[u].emplace_back(v, dis_wgt(gen));
+        _h_fanin_edges[v].emplace_back(u, dis_wgt(gen));
+        num_edges_needed--;
+        // std::cout << "num_edges_needed=" << num_edges_needed << '\n';
+      }
+    }
+  }
+  std::cout << "densification done.\n";
+}
+
+void CpGen::export_to_benchmark(const std::string& filename) const{
+  std::ofstream ofs(filename);
+  if (!ofs) {
+    throw std::runtime_error("Unable to open file: " + filename);
+  }
+
+  // write number of vertices
+  const int N = num_verts();
+  ofs << N << '\n';
+
+  // write placeholder IDs 
+  for (int i = 0; i < N; i++) {
+    ofs << "\"Placeholder\"\n";
+  }
+  
+  // iterate through _h_fanout_edges and write edges
+  for (int i = 0; i < N; i++) {
+    for (const auto& [to, weight] : _h_fanout_edges.at(i)) {
+      ofs << "\"" << i << "\"" << " -> " << "\"" << to << "\", " << weight
+        << ";\n"; 
+    }
+  }
+
+  ofs.close();
+}
 
 __device__ void enqueue(
     const int vid, 
@@ -1928,7 +2052,6 @@ void CpGen::report_paths(
   // cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized_no_curr_remainders, cudaFuncCachePreferShared);
   // cudaFuncSetCacheConfig(prop_distance_bfs_bu_step_privatized, cudaFuncCachePreferShared);
 
-
   const int N = num_verts();
   const int M = num_edges();
  
@@ -1963,6 +2086,10 @@ void CpGen::report_paths(
   // record level of each vertex
   thrust::device_vector<int> vert_lvls(N, std::numeric_limits<int>::max());
   int* d_vert_lvls = thrust::raw_pointer_cast(&vert_lvls[0]);
+
+  // segsort the adjacency list for coalesced access
+  segsort_adjncy();
+  std::cout << "segsort_adjncy complete.\n";
 
   // copy host csr to device
   thrust::device_vector<int> fanin_adjncy(_h_fanin_adjncy);
@@ -3419,8 +3546,6 @@ void CpGen::bfs_hybrid_privatized(
   double td_scans = num_sinks;
   double bu_scans = N;
  
-  bool switched_to_bu{false};
-  
   bool should_update_num_remainders{false};
   while (num_curr_frontiers) {
     bu_scans -= td_scans;
@@ -3435,7 +3560,7 @@ void CpGen::bfs_hybrid_privatized(
       num_curr_remainders = bu_scans;
     }
 
-    if (td_scans*alpha < bu_scans && !switched_to_bu) {
+    if (td_scans*alpha < bu_scans) {
       // run top-down step
       int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE);
       prop_distance_bfs_td_step_privatized
@@ -3453,9 +3578,8 @@ void CpGen::bfs_hybrid_privatized(
             curr_depth);
     }
     else {
-      switched_to_bu = true;
       if (num_curr_remainders == N) {
-        std::cout << "first bu_step @ depth " << curr_depth << '\n';
+        // std::cout << "first bu_step @ depth " << curr_depth << '\n';
         
         // we need to do a first pass to scan all the N vertices
         // and get the current remainder vertices

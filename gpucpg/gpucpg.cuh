@@ -11,6 +11,7 @@
 #include <random>
 #include <queue>
 #include <functional>
+#include <unordered_map>
 #include "timer.hpp"
 
 namespace gpucpg {
@@ -143,6 +144,11 @@ public:
       const std::string& filename,
       std::ostream& os, 
       int multiplier) const;
+
+  void densify_graph(const int desired_avg_degree);
+  void export_to_benchmark(const std::string& filename) const;
+  void segsort_adjncy();
+
   void dump_csrs(std::ostream& os) const;
   void dump_lvls(std::ostream& os) const;
  
@@ -166,7 +172,11 @@ private:
 
   // convergence condition
   bool* _d_converged;
-  
+ 
+  // unordered map for internal storage
+  std::unordered_map<int, std::vector<std::pair<int, double>>> _h_fanin_edges;
+  std::unordered_map<int, std::vector<std::pair<int, double>>> _h_fanout_edges;
+
   // fanin CSR storage
   std::vector<int> _h_fanin_adjp;
   std::vector<int> _h_fanin_adjncy;

@@ -31,7 +31,7 @@ set(CMAKE_CUDA_ARCHITECTURES 86)
 # compile and link CUDA code separately from the rest of your code to
 # speed up the build process and reduce the size of your final executable.
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CXX_FLAGS} -Wall --extended-lambda")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CXX_FLAGS} -Wall --expt-extended-lambda -use_fast_math -gencode arch=compute_${CMAKE_CUDA_ARCHITECTURES},code=compute_${CMAKE_CUDA_ARCHITECTURES} -gencode arch=compute_${CMAKE_CUDA_ARCHITECTURES},code=sm_${CMAKE_CUDA_ARCHITECTURES} -Xcompiler -fopenmp")
 
 # set compilation flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
@@ -74,4 +74,4 @@ set(CMAKE_CTEST_ARGUMENTS "--output-on-failure")
 add_subdirectory(gpucpg)
 add_subdirectory(examples)
 add_subdirectory(unittests)
-
+add_subdirectory(3rd-party)

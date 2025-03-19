@@ -1,14 +1,15 @@
 #include "gpucpg.cuh"
 
 int main(int argc, char* argv[]) {
-  if (argc != 3) {
-    std::cerr << "usage: ./a.out [benchmark] [alpha]\n";
+  if (argc != 4) {
+    std::cerr << "usage: ./a.out [benchmark] [alpha] [per_thread_work_items]\n";
     std::exit(1);
   }
 
   std::string benchmark = argv[1];
   float alpha = std::stof(argv[2]);
-  int num_paths{10000};
+  int per_thread_work_items = std::stoi(argv[3]);
+  int num_paths{1000};
   int max_dev_lvls{5};
   bool enable_compress{true};
   auto pe_method = gpucpg::PfxtExpMethod::SEQUENTIAL;
@@ -28,7 +29,7 @@ int main(int argc, char* argv[]) {
   std::cout << "num_verts=" << cpgen_hybrid.num_verts() << '\n';
   std::cout << "num_edges=" << cpgen_hybrid.num_edges() << '\n';
   cpgen_hybrid.report_paths(num_paths, max_dev_lvls, enable_compress,
-      gpucpg::PropDistMethod::BFS_HYBRID_PRIVATIZED, pe_method, false, 0.005f, alpha); 
+      gpucpg::PropDistMethod::BFS_HYBRID_PRIVATIZED, pe_method, false, 0.005f, alpha, per_thread_work_items); 
  
   // cpgen_td.report_paths(num_paths, max_dev_lvls, enable_compress,
   //     gpucpg::PropDistMethod::BFS_TOP_DOWN_PRIVATIZED, pe_method);
