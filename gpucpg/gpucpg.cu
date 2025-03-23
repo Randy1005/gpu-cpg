@@ -233,9 +233,6 @@ void CpGen::read_input(const std::string& filename) {
     std::getline(infile, line);
   }
 
-  // std::unordered_map<int, std::vector<std::pair<int, double>>> fanin_edges;
-  // std::unordered_map<int, std::vector<std::pair<int, double>>> fanout_edges;
-
   // Parse edges
   while (std::getline(infile, line)) {
     std::istringstream iss(line);
@@ -297,6 +294,9 @@ void CpGen::read_input(const std::string& filename) {
       _h_fanin_wgts.push_back(weight);
     }
   }
+
+  // segsort the csr to get better coalesced access
+  segsort_adjncy();
 }
 
 void CpGen::segsort_adjncy() {
@@ -365,33 +365,48 @@ void CpGen::densify_graph(const int desired_avg_degree) {
   std::mt19937 gen(rd());
   const int N = num_verts();
   const int M = num_edges();
-  std::uniform_int_distribution<int> dis_vert(0, N-1);
+  const int num_levels = _h_verts_lvlp.size()-1;
+  std::cout << "num_levels=" << num_levels << '\n';
+  std::cout << "N=" << N << ", M=" << M << '\n';
+  std::uniform_int_distribution<int> dis_lvl(0, num_levels-2);
   std::uniform_real_distribution<double> dis_wgt(0.1, 50.0);
 
   int num_edges_needed = desired_avg_degree * N - M;
   std::cout << "num_edges_needed=" << num_edges_needed << '\n';
   while (num_edges_needed) {
-    auto u = dis_vert(gen);
-    auto v = dis_vert(gen);
-    if (u != v) {
-      // check if this edge exists
-      bool found = false;
-      for (const auto& [to, _] : _h_fanout_edges.at(u)) {
-        if (to == v) {
-          found = true;
-          break;
-        }
-      }
-
-      auto u_idx = std::find(_h_verts_by_lvl.begin(), _h_verts_by_lvl.end(), u) - _h_verts_by_lvl.begin();
-      auto v_idx = std::find(_h_verts_by_lvl.begin(), _h_verts_by_lvl.end(), v) - _h_verts_by_lvl.begin();
-      
-      if (!found && u_idx < v_idx) {
-        _h_fanout_edges[u].emplace_back(v, dis_wgt(gen));
-        _h_fanin_edges[v].emplace_back(u, dis_wgt(gen));
-        num_edges_needed--;
-        // std::cout << "num_edges_needed=" << num_edges_needed << '\n';
-      }
+    // pick a level randomly
+    auto u_lvl = dis_lvl(gen);
+    auto v_lvl = u_lvl+1;
+    // std::cout << "u_lvl=" << u_lvl << '\n';
+    // pick a vertex from the level
+    auto u_idx = std::uniform_int_distribution<int>(_h_verts_lvlp[u_lvl], _h_verts_lvlp[u_lvl+1]-1)(gen);
+    // auto v_idx = u_idx + std::uniform_int_distribution<int>(1, N-1-u_idx)(gen);
+    auto v_idx = std::uniform_int_distribution<int>(_h_verts_lvlp[v_lvl], _h_verts_lvlp[v_lvl+1]-1)(gen);
+    // std::cout << "u_idx=" << u_idx << ", v_idx=" << v_idx << '\n';
+    assert(u_idx < N);
+    assert(v_idx < N);
+    assert(u_idx < v_idx);
+    auto u = _h_verts_by_lvl[u_idx];
+    auto v = _h_verts_by_lvl[v_idx];
+    assert(u < _h_fanout_edges.size());
+    // check if this edge exists
+    bool found = false;
+    for (const auto& [to, _] : _h_fanout_edges.at(u)) {
+     if (to == v) {
+       found = true;
+       break;
+     }
+    }
+    
+    if (found) {
+     continue;
+    }
+    
+    _h_fanout_edges[u].emplace_back(v, dis_wgt(gen));
+    _h_fanin_edges[v].emplace_back(u, dis_wgt(gen));
+    num_edges_needed--;
+    if (num_edges_needed % 100000 == 0) {
+      std::cout << "num_edges_needed=" << num_edges_needed << '\n';
     }
   }
   std::cout << "densification done.\n";
@@ -783,18 +798,26 @@ __global__ void prop_distance_bfs_td_step_no_atomic_min(
   }
 }
 
-
-__device__ void commit_local_to_global(
-  cg::thread_block this_block,
-  int* global_data,
-  int global_start_idx,
-  int num_local_data,
-  int* local_data) {
-  for (auto local_idx = this_block.thread_rank(); 
-    local_idx < num_local_data; 
-    local_idx += this_block.size()) {
-    auto global_idx = global_start_idx + local_idx;
-    global_data[global_idx] = local_data[local_idx]; 
+__global__ void relax_bu_step(
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* distances,
+  int* lvlized_verts,
+  int curr_depth_size,
+  int depth_beg) {
+  const int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  if (tid < curr_depth_size) {
+    const auto v = lvlized_verts[depth_beg+tid];
+    const auto e_beg = ovs[v];
+    const auto e_end = ovs[v+1];
+    auto min_dist{distances[v]};
+    for (int e = e_beg; e < e_end; e++) {
+      const auto neighbor = oes[e];
+      const int wgt = owgts[e]*SCALE_UP;
+      min_dist = min(min_dist, distances[neighbor]+wgt);
+    }
+    distances[v] = min_dist;
   }
 }
 
@@ -1019,17 +1042,17 @@ __global__ void prop_distance_bfs_bu_step_privatized(
 }
 
 __global__ void prop_distance_bfs_td_step_single_block(
-    int num_verts, 
-    int num_edges,
-    int* verts,
-    int* edges,
-    float* wgts,
-    int* distances_cache,
-    int* glob_queue,
-    int* qhead,
-    int* qtail,
-    int* deps,
-    int qsize_threshold) {
+  int num_verts, 
+  int num_edges,
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* distances_cache,
+  int* glob_queue,
+  int* qhead,
+  int* qtail,
+  int* deps,
+  int qsize_threshold) {
   // initialize privatized frontiers
   __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
 
@@ -1147,6 +1170,70 @@ __global__ void prop_distance_bfs_td_step(
     }
   }
 } 
+
+__global__ void bfs_td_step_privatized(
+  int* ivs,
+  int* ies,
+  int* queue,
+  int* ftr_beg,
+  int* ftr_end,
+  int num_curr_ftrs,
+  int* deps) {
+  // initialize privatized frontiers
+  __shared__ int s_next_frontiers[S_FRONTIER_CAPACITY];
+
+  // shared counter to count fontiers in this block
+  __shared__ int s_num_next_frontiers;
+  if (threadIdx.x == 0) {
+    // let tid 0 initialize the counter
+    s_num_next_frontiers = 0;
+  }
+  __syncthreads();
+
+  const int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  if (tid < num_curr_ftrs) {
+    // get a frontier from the queue
+    const auto v = queue[*ftr_beg+tid];
+    const auto e_beg = ivs[v];
+    const auto e_end = ivs[v+1];
+    for (auto e = e_beg; e < e_end; e++) {
+      const auto neighbor = ies[e];
+      // decrement the dependency counter for this neighbor
+      if (atomicSub(&deps[neighbor], 1) == 1) {
+        // we check if there's more space in the shared frontier storage
+        const auto s_curr_frontier_idx = atomicAdd(&s_num_next_frontiers, 1);
+        if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
+          // if we have space, store to the shared frontier storage
+          s_next_frontiers[s_curr_frontier_idx] = neighbor;
+        }
+        else {
+          // if not, we have no choice but to store directly
+          // back to glob mem
+          s_num_next_frontiers = S_FRONTIER_CAPACITY;
+          enqueue(neighbor, queue, ftr_end);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // calculate the index to start placing frontiers
+  // in the global frontier queue
+  __shared__ int next_frontier_beg;
+  if (threadIdx.x == 0) {
+    // let tid = 0 handle the calculation
+    next_frontier_beg = atomicAdd(ftr_end, s_num_next_frontiers);
+  }
+  __syncthreads();
+  // commit local frontiers to the global frontier queue
+  // each thread will handle the frontiers in a strided fashion
+  for (auto s_next_frontier_idx = threadIdx.x; 
+      s_next_frontier_idx < s_num_next_frontiers; 
+      s_next_frontier_idx += blockDim.x) {
+    auto next_frontier_idx = next_frontier_beg + s_next_frontier_idx;
+    queue[next_frontier_idx] = s_next_frontiers[s_next_frontier_idx]; 
+  }
+}
 
 __global__ void prop_distance_bfs_td_step_privatized(
   int* verts,
@@ -1468,11 +1555,40 @@ __global__ void condition_queue_empty(
     cudaGraphSetConditional(handle, 0);
   }
 }
+__global__ void update_successors(
+  int num_verts, 
+  int* vertices,
+  int* edges,
+  float* wgts,
+  float* distances,
+  int* d_succs) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+  if (tid >= num_verts) {
+    return;
+  }
+
+  auto edge_start = vertices[tid];
+  auto edge_end = vertices[tid+1]; 
+
+  for (int eid = edge_start; eid < edge_end; eid++) {
+    auto neighbor = edges[eid];
+    int new_distance = distances[tid] + wgts[eid];
+
+    // match weights to decide successor
+    if (distances[neighbor] == new_distance) {
+      // use atomic max to make sure if 
+      // encountered neighbor with same distance
+      // we always pick the neighbor with
+      // the largest vertex id
+      atomicMax(&d_succs[neighbor], tid);  
+    }
+  }
+}
+
 
 
 __global__ void update_successors(
   int num_verts, 
-  int num_edges,
   int* vertices,
   int* edges,
   float* wgts,
@@ -1484,8 +1600,7 @@ __global__ void update_successors(
   }
 
   auto edge_start = vertices[tid];
-  auto edge_end = (tid == num_verts - 1) ? num_edges : vertices[tid+1]; 
-
+  auto edge_end = vertices[tid+1]; 
   for (int eid = edge_start; eid < edge_end; eid++) {
     auto neighbor = edges[eid];
     int wgt = wgts[eid] * SCALE_UP;
@@ -1639,17 +1754,17 @@ __global__ void populate_path_counts(
 }
 
 __global__ void expand_new_pfxt_level(
-    int num_verts,
-    int num_edges,
-    int* vertices,
-    int* edges,
-    float* wgts,
-    int* succs,
-    int* dists,
-    PfxtNode* pfxt_nodes,
-    int* lvl_offsets,
-    int curr_lvl,
-    int* path_prefix_sums) {
+  int num_verts,
+  int num_edges,
+  int* vertices,
+  int* edges,
+  float* wgts,
+  int* succs,
+  int* dists,
+  PfxtNode* pfxt_nodes,
+  int* lvl_offsets,
+  int curr_lvl,
+  int* path_prefix_sums) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   auto lvl_start = lvl_offsets[curr_lvl];
   auto lvl_end = lvl_offsets[curr_lvl+1];
@@ -1693,17 +1808,17 @@ __global__ void expand_new_pfxt_level(
 }
 
 __global__ void expand_new_pfxt_level_atomic_enq(
-    int num_verts,
-    int num_edges,
-    int* vertices,
-    int* edges,
-    float* wgts,
-    int* succs,
-    int* dists,
-    PfxtNode* pfxt_nodes,
-    int* lvl_offsets,
-    int curr_lvl,
-    int* pfxt_tail) {
+  int num_verts,
+  int num_edges,
+  int* vertices,
+  int* edges,
+  float* wgts,
+  int* succs,
+  int* dists,
+  PfxtNode* pfxt_nodes,
+  int* lvl_offsets,
+  int curr_lvl,
+  int* pfxt_tail) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   auto lvl_start = lvl_offsets[curr_lvl];
   auto lvl_end = lvl_offsets[curr_lvl+1];
@@ -2066,8 +2181,8 @@ void CpGen::report_paths(
   thrust::device_vector<int> in_degs(_h_in_degrees);
   thrust::device_vector<int> accum_spurs(N, 0);
 
-  checkError_t(cudaMalloc(&_d_qhead, sizeof(int)), "malloc qhead failed.");
-  checkError_t(cudaMalloc(&_d_qtail, sizeof(int)), "malloc qtail failed.");
+  checkError_t(cudaHostAlloc(&_d_qhead, sizeof(int), cudaHostAllocDefault), "malloc qhead failed.");
+  checkError_t(cudaHostAlloc(&_d_qtail, sizeof(int), cudaHostAllocDefault), "malloc qtail failed.");
   checkError_t(cudaMemset(_d_qhead, 0, sizeof(int)), "memset qhead failed.");
   checkError_t(cudaMemset(_d_qtail, 0, sizeof(int)), "memset qtail failed.");
   int* d_queue = thrust::raw_pointer_cast(&queue[0]);
@@ -2087,10 +2202,6 @@ void CpGen::report_paths(
   thrust::device_vector<int> vert_lvls(N, std::numeric_limits<int>::max());
   int* d_vert_lvls = thrust::raw_pointer_cast(&vert_lvls[0]);
 
-  // segsort the adjacency list for coalesced access
-  segsort_adjncy();
-  std::cout << "segsort_adjncy complete.\n";
-
   // copy host csr to device
   thrust::device_vector<int> fanin_adjncy(_h_fanin_adjncy);
   thrust::device_vector<int> fanin_adjp(_h_fanin_adjp);
@@ -2103,6 +2214,9 @@ void CpGen::report_paths(
   // shortest distances cache
   thrust::device_vector<int> dists_cache(N,
       std::numeric_limits<int>::max());
+
+  // shortest distances cache (float)
+  thrust::device_vector<float> dists_float(N, std::numeric_limits<float>::max());
 
   // indicator of whether the distance of a vertex is updated
   thrust::device_vector<bool> dists_updated(N, false);
@@ -2119,6 +2233,7 @@ void CpGen::report_paths(
   float* d_fanout_wgts = thrust::raw_pointer_cast(&fanout_wgts[0]);
 
   int* d_dists_cache = thrust::raw_pointer_cast(&dists_cache[0]);
+  auto d_dists_float = thrust::raw_pointer_cast(dists_float.data());
   bool* d_dists_updated = thrust::raw_pointer_cast(&dists_updated[0]);
   int* d_succs = thrust::raw_pointer_cast(&successors[0]);
 
@@ -2170,8 +2285,6 @@ void CpGen::report_paths(
   int* next_ftr_tail = new int(0);
   cudaHostAlloc(&next_ftr_tail, sizeof(int), cudaHostAllocDefault);
 
-  std::cout << "data init complete.\n";
-
 	Timer timer_cpg;
 	timer_cpg.start();
   if (pd_method == PropDistMethod::BASIC) { 
@@ -2203,28 +2316,50 @@ void CpGen::report_paths(
       steps++;
     }
 
-  } 
-  else if (pd_method == PropDistMethod::LEVELIZED) {
-    //thrust::device_vector<int> t_verts_lvlp(_h_verts_lvlp);
-    //int* d_verts_lvlp = thrust::raw_pointer_cast(&t_verts_lvlp[0]);
-    //
-    //for (size_t l = 0; l < total_lvls; l++) {
-    //  // get level size to determine how many blocks to launch
-    //  const auto v_beg = _h_verts_lvlp[l];
-    //  const auto v_end = _h_verts_lvlp[l+1];
-    //  const auto lvl_size = v_end - v_beg;
-    //   
-    //  prop_distance_levelized<<<ROUNDUPBLOCKS(lvl_size, BLOCKSIZE), BLOCKSIZE>>>
-    //    (v_beg,
-    //     v_end,
-    //     N,
-    //     M,
-    //     d_fanin_adjp,
-    //     d_fanin_adjncy,
-    //     d_fanin_wgts,
-    //     d_dists_cache);
-    //}
+  }
+  else if (pd_method == PropDistMethod::LEVELIZE_THEN_RELAX) {
+    int curr_depth{0};
+    int num_curr_ftrs = _sinks.size();
+    _h_verts_lvlp.emplace_back(0);
 
+    // levelize
+    while (num_curr_ftrs) {
+      // record the depth offset
+      _h_verts_lvlp.emplace_back(_h_verts_lvlp.back()+num_curr_ftrs);
+      
+      int num_blks = ROUNDUPBLOCKS(num_curr_ftrs, BLOCKSIZE);
+      bfs_td_step_privatized
+        <<<num_blks, BLOCKSIZE>>>(
+          d_fanin_adjp,
+          d_fanin_adjncy,
+          d_queue,
+          _d_qhead,
+          _d_qtail,
+          num_curr_ftrs,
+          d_deps);
+
+      inc_kernel<<<1, 1>>>(_d_qhead, num_curr_ftrs);
+      num_curr_ftrs = _get_qsize();
+      curr_depth++;
+    }
+    // std::cout << "total depths=" << curr_depth << '\n';
+ 
+    // relaxation
+    for (int d = 1; d < curr_depth; d++) {
+      const auto d_beg = _h_verts_lvlp[d];
+      const auto d_end = _h_verts_lvlp[d+1];
+      const auto d_size = d_end-d_beg;
+      int num_blks = ROUNDUPBLOCKS(d_size, BLOCKSIZE);
+      relax_bu_step
+        <<<num_blks, BLOCKSIZE>>>(
+          d_fanout_adjp,
+          d_fanout_adjncy,
+          d_fanout_wgts,
+          d_dists_cache,
+          d_queue,
+          d_size,
+          d_beg);      
+    }
   } 
   else if (pd_method == PropDistMethod::BFS_HYBRID) {
     //bfs_hybrid(
@@ -2374,6 +2509,7 @@ void CpGen::report_paths(
       std::swap(d_curr_frontiers, d_next_frontiers);
       curr_depth++;
     }
+    // std::cout << "total depths=" << curr_depth << '\n';
   }
   else if (pd_method == PropDistMethod::TEST_COUNT_MF) {
     int curr_depth{0};
@@ -2459,8 +2595,6 @@ void CpGen::report_paths(
       std::swap(d_curr_frontiers, d_next_frontiers);
       curr_depth++;
     }
-    std::cout << "curr_depth=" << curr_depth << '\n';
-
   }
   else if (pd_method == PropDistMethod::BFS_PRIVATIZED_MERGED) {
     //int qsize{static_cast<int>(_sinks.size())}; 
@@ -2507,18 +2641,19 @@ void CpGen::report_paths(
     //}
   }
 
+  // for performance measurement only
   cudaDeviceSynchronize();
 	timer_cpg.stop();
+	prop_time = timer_cpg.get_elapsed_time();
+ 
   // copy distance vector back to host
   std::vector<int> h_dists(N);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
-	prop_time = timer_cpg.get_elapsed_time();
 
   // get successors of each vertex (the next hop on the shortest path) 
   update_successors
     <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
       N, 
-      M,
       d_fanin_adjp,
       d_fanin_adjncy,
       d_fanin_wgts,
@@ -2554,8 +2689,8 @@ void CpGen::report_paths(
   int* d_lvl_offsets = thrust::raw_pointer_cast(&lvl_offsets[0]);
 
   int pfxt_size{curr_lvl_size}, 
-      short_pile_size{curr_lvl_size},
-      long_pile_size{0};
+    short_pile_size{curr_lvl_size},
+    long_pile_size{0};
 
   // prepare short and long pile
   thrust::device_vector<PfxtNode> short_pile(_h_pfxt_nodes);
@@ -2565,11 +2700,7 @@ void CpGen::report_paths(
   auto d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
   auto d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
   
-  // initialize split value
-  auto split = thrust::device_new<float>();
-  thrust::fill(split, split+1, std::numeric_limits<float>::max());
-  
-  // initialize tail pointers
+  // initialize tail pointers for short and long piles
   auto tail_short = thrust::device_new<int>();
   thrust::fill(tail_short, tail_short+1, 0);
   auto tail_long = thrust::device_new<int>();
@@ -2903,8 +3034,7 @@ void CpGen::report_paths(
 
     // !!!! note that the short pile still has a mix of long/short paths
     // at this point, so we split the paths into short and long piles now
-    // we can use stream compaction to move the long paths to the 
-    // long pile 
+    // we can use stream compaction to move the long paths to the long pile 
     auto is_long_path = [h_split] __host__ __device__ (const PfxtNode& n) {
       return n.slack > h_split;
     };
@@ -3220,8 +3350,10 @@ void CpGen::levelize() {
       // write next level size
       // and update counter
       lvl_size = q.size();
-      const auto prev_lvlp = _h_verts_lvlp.back();
-      _h_verts_lvlp.emplace_back(prev_lvlp+q.size());
+      if (lvl_size) {
+        const auto prev_lvlp = _h_verts_lvlp.back();
+        _h_verts_lvlp.emplace_back(prev_lvlp+q.size());
+      }
     }
   }
 }
@@ -3397,10 +3529,9 @@ void CpGen::_free() {
 } 
 
 int CpGen::_get_qsize() {
-  int head, tail;
-  cudaMemcpy(&head, _d_qhead, sizeof(int), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&tail, _d_qtail, sizeof(int), cudaMemcpyDeviceToHost);
-  int size = tail - head;
+  cudaMemcpy(&_h_qhead, _d_qhead, sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&_h_qtail, _d_qtail, sizeof(int), cudaMemcpyDeviceToHost);
+  int size = _h_qtail - _h_qhead;
   //printf("_get_queue_size head = %d, tail = %d, q_sz = %d\n", head, tail, size);
   return size;
 }

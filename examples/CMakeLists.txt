@@ -9,6 +9,7 @@ add_executable(cpg-mteps ${GPUCPG_EXAMPLE_DIR}/cpg-mteps.cu)
 add_executable(bfs_hybrid ${GPUCPG_EXAMPLE_DIR}/bfs_hybrid.cu)
 add_executable(bfs_td ${GPUCPG_EXAMPLE_DIR}/bfs_td.cu)
 add_executable(densify ${GPUCPG_EXAMPLE_DIR}/densify.cu)
+add_executable(lvlize_then_relax ${GPUCPG_EXAMPLE_DIR}/lvlize_then_relax.cu)
 
 list(APPEND GPUCPG_EXAMPLES
   #cpg
@@ -22,6 +23,7 @@ list(APPEND GPUCPG_EXAMPLES
   bfs_hybrid
   bfs_td
   densify
+  lvlize_then_relax
 )
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)

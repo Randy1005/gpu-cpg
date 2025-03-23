@@ -21,14 +21,13 @@ class CpGen;
 enum class PropDistMethod {
   BASIC = 0,
   CUDA_GRAPH,
-  LEVELIZED,
-  LEVELIZED_SHAREDMEM,
   BFS_TOP_DOWN_PRIVATIZED,
   BFS_TOP_DOWN,
   BFS_PRIVATIZED_MERGED,
   BFS_HYBRID,
   BFS_HYBRID_PRIVATIZED,
-  TEST_COUNT_MF
+  TEST_COUNT_MF,
+  LEVELIZE_THEN_RELAX
 };
 
 enum class PfxtExpMethod {
@@ -209,6 +208,8 @@ private:
   // queue head and tail
   int* _d_qhead;
   int* _d_qtail;
+  int _h_qhead;
+  int _h_qtail;
 
   // max out degree
   int _h_max_odeg{0};
