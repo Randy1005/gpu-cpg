@@ -2061,38 +2061,6 @@ __global__ void update_successors_bu(
   }
 }
 
-
-__global__ void update_successors(
-  int num_verts, 
-  int* vertices,
-  int* edges,
-  float* wgts,
-  int* distances,
-  int* succs) {
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (tid >= num_verts) {
-    return;
-  }
-
-  auto edge_start = vertices[tid];
-  auto edge_end = vertices[tid+1]; 
-  for (int eid = edge_start; eid < edge_end; eid++) {
-    auto neighbor = edges[eid];
-    int wgt = wgts[eid]*SCALE_UP;
-    int new_distance = distances[tid]+wgt;
-
-    // match weights to decide successor
-    if (distances[neighbor] == new_distance) {
-      // use atomic max to make sure if 
-      // encountered neighbor with same distance
-      // we always pick the neighbor with
-      // the largest vertex id
-      atomicMax(&succs[neighbor], tid);  
-    }
-  }
-}
-
-
 __global__ void compute_long_path_counts(
   int* verts,
   int* edges,
@@ -2132,10 +2100,10 @@ __global__ void compute_long_path_counts(
           continue;
         }
         auto wgt = wgts[eid];
-        auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
-        auto dist_v = (float)dists[v] / SCALE_UP;
+        auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+        auto dist_v = (float)dists[v]/SCALE_UP;
         auto new_path_slack = 
-          slack + dist_neighbor + wgt - dist_v;
+          slack+dist_neighbor+wgt-dist_v;
 
         if (new_path_slack > split) {
           //printf("slack=%f, > split=%f\n", new_path_slack, *split);
@@ -2158,19 +2126,18 @@ __global__ void compute_long_path_counts(
     atomicAdd(num_long_paths, s_num_long_paths);
     atomicAdd(num_short_paths, s_num_short_paths);
   }
-
 }
 
 
 __global__ void compute_path_counts(
-    int num_verts,
-    int num_edges,
-    int* verts,
-    int* succs,
-    PfxtNode* pfxt_nodes,
-    int* lvl_offsets,
-    int curr_lvl,
-    int* path_prefix_sums) {
+  int num_verts,
+  int num_edges,
+  int* verts,
+  int* succs,
+  PfxtNode* pfxt_nodes,
+  int* lvl_offsets,
+  int curr_lvl,
+  int* path_prefix_sums) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   auto lvl_start = lvl_offsets[curr_lvl];
   auto lvl_end = lvl_offsets[curr_lvl+1];
@@ -2267,11 +2234,11 @@ __global__ void expand_new_pfxt_level(
         new_path.parent = pfxt_node_idx;
         new_path.num_children = 0;
 
-        auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
-        auto dist_v = (float)dists[v] / SCALE_UP;
+        auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+        auto dist_v = (float)dists[v]/SCALE_UP;
 
         new_path.slack = 
-          slack + dist_neighbor + wgt - dist_v;
+          slack+dist_neighbor+wgt-dist_v;
         offset++;
       } 
 
@@ -2337,10 +2304,10 @@ __global__ void expand_new_pfxt_level_atomic_enq(
           new_path.to = neighbor;
           new_path.parent = pfxt_node_idx;
           new_path.num_children = 0;
-          auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
-          auto dist_v = (float)dists[v] / SCALE_UP;
+          auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+          auto dist_v = (float)dists[v]/SCALE_UP;
           new_path.slack = 
-            slack + dist_neighbor + wgt - dist_v;
+            slack+dist_neighbor+wgt-dist_v;
         }
         else {
           s_num_pfxt_nodes = S_PFXT_CAPACITY;
@@ -2355,14 +2322,12 @@ __global__ void expand_new_pfxt_level_atomic_enq(
           new_path.to = neighbor;
           new_path.parent = pfxt_node_idx;
           new_path.num_children = 0;
-          auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
-          auto dist_v = (float)dists[v] / SCALE_UP;
+          auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+          auto dist_v = (float)dists[v]/SCALE_UP;
           new_path.slack = 
-            slack + dist_neighbor + wgt - dist_v;
+            slack+dist_neighbor+wgt-dist_v;
         }
-
       } 
-
       // traverse to next successor
       v = succs[v];
     }
@@ -2380,12 +2345,11 @@ __global__ void expand_new_pfxt_level_atomic_enq(
   for (auto s_pfxt_node_idx = threadIdx.x; s_pfxt_node_idx < s_num_pfxt_nodes;
       s_pfxt_node_idx += blockDim.x) {
     // the location to write on glob mem
-    const auto g_pfxt_node_idx = s_pfxt_beg + s_pfxt_node_idx;
+    const auto g_pfxt_node_idx = s_pfxt_beg+s_pfxt_node_idx;
 
     // write to glob mem
     pfxt_nodes[g_pfxt_node_idx] = s_pfxt_nodes[s_pfxt_node_idx]; 
   }
-
 }
 
 __global__ void expand_new_pfxt_level_atomic_enq(
@@ -2535,17 +2499,17 @@ __global__ void expand_short_pile(
         }
         
         auto wgt = wgts[eid];
-        auto dist_neighbor = (float)dists[neighbor] / SCALE_UP;
-        auto dist_v = (float)dists[v] / SCALE_UP;
+        auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+        auto dist_v = (float)dists[v]/SCALE_UP;
         auto new_slack = 
-          slack + dist_neighbor + wgt - dist_v;
+          slack+dist_neighbor+wgt-dist_v;
 
         if (new_slack <= split) {
           // this path belongs to the short pile
           auto new_node_idx = atomicAdd(curr_tail_short, 1);
           //printf("new idx (short)=%d\n", new_node_idx);
           auto& new_path = short_pile[new_node_idx];
-          new_path.level = level + 1;
+          new_path.level = level+1;
           new_path.from = v;
           new_path.to = neighbor;
           new_path.parent = node_idx;
@@ -2557,72 +2521,19 @@ __global__ void expand_short_pile(
           auto new_node_idx = atomicAdd(curr_tail_long, 1);
           //printf("new idx (long)=%d\n", new_node_idx);
           auto& new_path = long_pile[new_node_idx];
-          new_path.level = level + 1;
+          new_path.level = level+1;
           new_path.from = v;
           new_path.to = neighbor;
           new_path.parent = node_idx;
           new_path.num_children = 0;
           new_path.slack = new_slack;
         }
-        
       }
-
       // traverse to next successor
       v = succs[v];
     }
   }
 }
-
-__global__ void update_split_mult(float* split, float mult) {
-  if (threadIdx.x == 0) {
-    *split *= mult;
-  }
-}
-
-__global__ void update_split_add(float* split, float add) {
-  if (threadIdx.x == 0) {
-    *split += add;
-  }
-}
-
-
-__global__ void count_long_paths(
-    PfxtNode* long_pile,
-    int long_pile_size,
-    int* num_long_paths,
-    float* split) {
-
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  __shared__ int s_num_long_paths;
-  if (threadIdx.x == 0) {
-    s_num_long_paths = 0;
-  }
-  __syncthreads();
-  
-  if (tid < long_pile_size) {
-    if (long_pile[tid].slack >= *split) {
-      atomicAdd(&s_num_long_paths, 1); 
-    }
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    atomicAdd(num_long_paths, s_num_long_paths); 
-  }
-
-}
-
-
-__global__ void pick_init_split(PfxtNode* short_pile, float* split, 
-    int short_pile_size, float percentile) {
-  if (threadIdx.x == 0) {
-    int idx = short_pile_size * percentile;
-    *split = short_pile[idx].slack;
-    //printf("the init split is at short_pile[%d]=%f\n", idx, *split);
-  }
-}
-
-
 
 void CpGen::report_paths(
   const int k, 
