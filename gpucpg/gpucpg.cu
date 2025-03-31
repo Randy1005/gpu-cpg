@@ -277,6 +277,9 @@ void CpGen::read_input(const std::string& filename) {
     for (const auto& [to, weight] : _h_fanout_edges[i]) {
       _h_fanout_adjncy.push_back(to);
       _h_fanout_wgts.push_back(weight);
+      
+      // update the inversed fanout edges
+      _h_inv_fanout_adjncy.push_back(i);
     }
   }
 
@@ -296,7 +299,7 @@ void CpGen::read_input(const std::string& filename) {
   }
 
   // segsort the csr to get better coalesced access
-  segsort_adjncy();
+  // segsort_adjncy();
 }
 
 void CpGen::segsort_adjncy() {
@@ -438,13 +441,15 @@ void CpGen::export_to_benchmark(const std::string& filename) const{
   ofs.close();
 }
 
-__device__ void enqueue(
+__device__ int enqueue(
     const int vid, 
     int* queue, 
     int* qtail) {
   auto pos = atomicAdd(qtail, 1);
   queue[pos] = vid;
+  return pos;
 }
+
 
 __device__ int dequeue(
     int* queue,
@@ -748,28 +753,39 @@ __global__ void set_kernel(int* val, int n) {
   }
 }
 
-__global__ void prop_distance_bfs_td_step_no_atomic_min(
-  int num_verts,
-  int num_edges,
+__global__ void prop_distance_bfs_td_relax_bu_step_privatized(
   int* ivs,
   int* ies,
   int* ovs,
   int* oes,
   float* owgts,
   int* distances,
-  int* queue,
-  int* qhead,
-  int* qtail,
-  int qsize,
-  int* deps) {
+  int* curr_ftrs,
+  int* next_ftrs,
+  int num_curr_ftrs,
+  int* num_next_ftrs,
+  int* deps,
+  int* depths,
+  int curr_depth) {
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid < qsize) {
+  
+  __shared__ int local_next_frontiers[S_FRONTIER_CAPACITY];
+  __shared__ int num_local_next_frontiers;
+
+  // let one thread initialize the counters
+  if (threadIdx.x == 0) {
+    num_local_next_frontiers = 0;
+  }
+  __syncthreads();
+  
+  
+  if (tid < num_curr_ftrs) {
     // get a frontier from the queue
-    const auto v = queue[*qhead+tid];
-    
+    const auto v = curr_ftrs[tid];
     const auto oe_beg = ovs[v];
-    const auto oe_end = (v == num_verts-1) ? num_edges : ovs[v+1];
-    const auto odeg{oe_end-oe_beg};
+    const auto oe_end = ovs[v+1];
+    const auto odeg = oe_end-oe_beg;
+
     // run relaxation first
     if (odeg > 0) {
       int min_dist{::cuda::std::numeric_limits<int>::max()};
@@ -784,17 +800,43 @@ __global__ void prop_distance_bfs_td_step_no_atomic_min(
     }
     // now visit v's fanins to update their dependency counters
     const auto ie_beg = ivs[v];
-    const auto ie_end = (v == num_verts-1) ? num_edges : ivs[v+1];
+    const auto ie_end = ivs[v+1];
     for (auto e = ie_beg; e < ie_end; e++) {
       const auto i_neighbor = ies[e];
       // decrement the dependency counter for this neighbor
       if (atomicSub(&deps[i_neighbor], 1) == 1) {
-        // if this thread releases the last dependency
-        // it should add this neighbor to the queue
-        enqueue(i_neighbor, queue, qtail);
+        // update depth
+        depths[i_neighbor] = curr_depth+1;
+
+        // add i_neighbor to the local frontier buffer
+        // we check if there's more space in the shared frontier storage
+        const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
+        if (local_frontier_idx < S_FRONTIER_CAPACITY) {
+          // if we have more space, store to the local frontier buffer
+          local_next_frontiers[local_frontier_idx] = i_neighbor;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_next_frontiers = S_FRONTIER_CAPACITY;
+          enqueue(i_neighbor, next_ftrs, num_next_ftrs);
+        }
+      
       }
     }
-  
+  }
+  __syncthreads();
+  // now we commit the local frontiers to global memory
+  __shared__ int next_ftr_beg;
+  if (threadIdx.x == 0) {
+    next_ftr_beg = atomicAdd(num_next_ftrs, num_local_next_frontiers);
+  }
+  __syncthreads();
+  // commit local frontiers to the global memory
+  for (auto local_idx = threadIdx.x; 
+    local_idx < num_local_next_frontiers; 
+    local_idx += blockDim.x) {
+    auto global_idx = next_ftr_beg + local_idx;
+    next_ftrs[global_idx] = local_next_frontiers[local_idx]; 
   }
 }
 
@@ -811,7 +853,7 @@ __global__ void relax_bu_step(
     const auto v = lvlized_verts[depth_beg+tid];
     const auto e_beg = ovs[v];
     const auto e_end = ovs[v+1];
-    auto min_dist{distances[v]};
+    auto min_dist{::cuda::std::numeric_limits<int>::max()};
     for (int e = e_beg; e < e_end; e++) {
       const auto neighbor = oes[e];
       const int wgt = owgts[e]*SCALE_UP;
@@ -820,6 +862,211 @@ __global__ void relax_bu_step(
     distances[v] = min_dist;
   }
 }
+
+__global__ void bfs_bu_step_privatized_without_remainders(
+  int num_verts,
+  int* overts,
+  int* oedges,
+  float* owgts,
+  int* distances,
+  int* curr_remainders,
+  int* curr_rem_tail,
+  int* queue,
+  int* qhead,
+  int* qtail,
+  int* deps,
+  int* depths,
+  int current_depth) {
+  __shared__ int local_next_frontiers[S_BUFF_CAPACITY];
+  __shared__ int num_local_next_frontiers;
+  __shared__ int local_curr_remainders[S_BUFF_CAPACITY];
+  __shared__ int num_local_curr_remainders;
+
+  // let one thread initialize the counters 
+  if (threadIdx.x == 0) {
+    num_local_next_frontiers = 0;
+    num_local_curr_remainders = 0;
+  }
+  __syncthreads();
+
+  int u = threadIdx.x + blockIdx.x * blockDim.x;  
+  while (u < num_verts) {
+    if (depths[u] == -1) {
+      const auto e_beg = overts[u];
+      const auto e_end = overts[u+1];
+
+      auto u_deps{deps[u]};
+      for (auto e = e_beg; e < e_end; e++) {
+        const auto v = oedges[e];
+        if (depths[v] == current_depth) {
+          // v is a frontier
+          u_deps--;
+        }
+      }
+      
+      deps[u] = u_deps;
+
+      if (u_deps == 0) {
+        // u is now a frontier
+        depths[u] = current_depth+1;
+        // we check if there's more space in the shared frontier storage
+        const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
+        if (local_frontier_idx < S_BUFF_CAPACITY) {
+          // if we have more space, store to the local frontier buffer
+          local_next_frontiers[local_frontier_idx] = u;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_next_frontiers = S_BUFF_CAPACITY;
+          enqueue(u, queue, qtail);
+        }
+      }
+      else {
+        // u stays in the remainder list
+        // add u to the local remainder buffer
+        // we check if there's more space in the shared remainder storage
+        const auto local_rem_idx = atomicAdd(&num_local_curr_remainders, 1);
+        if (local_rem_idx < S_BUFF_CAPACITY) {
+          // if we have more space, store to the local remainder buffer
+          local_curr_remainders[local_rem_idx] = u;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_curr_remainders = S_BUFF_CAPACITY;
+          enqueue(u, curr_remainders, curr_rem_tail);
+        }
+      }    
+    }
+    u += blockDim.x*gridDim.x;
+  }
+  __syncthreads();  
+
+  __shared__ int next_ftr_beg, curr_rem_beg;
+  if (threadIdx.x == 0) {
+    next_ftr_beg = atomicAdd(qtail, num_local_next_frontiers);
+    curr_rem_beg = atomicAdd(curr_rem_tail, num_local_curr_remainders);
+  }
+  __syncthreads();
+
+  // commit local frontiers and local remainders to the global memory
+  for (auto local_idx = threadIdx.x; 
+    local_idx < num_local_next_frontiers; 
+    local_idx += blockDim.x) {
+    auto global_idx = next_ftr_beg + local_idx;
+    queue[global_idx] = local_next_frontiers[local_idx]; 
+  }
+  for (auto local_idx = threadIdx.x; 
+    local_idx < num_local_curr_remainders; 
+    local_idx += blockDim.x) {
+    auto global_idx = curr_rem_beg + local_idx;
+    curr_remainders[global_idx] = local_curr_remainders[local_idx]; 
+  }
+
+}
+
+__global__ void bfs_bu_step_privatized(
+  int num_verts,
+  int* overts,
+  int* oedges,
+  float* owgts,
+  int* distances,
+  int* curr_remainders,
+  int num_curr_remainders,
+  int* next_remainders,
+  int* num_next_remainders,
+  int* queue,
+  int* qhead,
+  int* qtail,
+  int* deps,
+  int* depths,
+  int current_depth) {
+  __shared__ int local_next_frontiers[S_BUFF_CAPACITY];
+  __shared__ int num_local_next_frontiers;
+  __shared__ int local_next_remainders[S_BUFF_CAPACITY];
+  __shared__ int num_local_next_remainders;
+
+  // let one thread initialize the counters 
+  if (threadIdx.x == 0) {
+    num_local_next_frontiers = 0;
+    num_local_next_remainders = 0;
+  }
+  __syncthreads();
+
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+  while (tid < num_curr_remainders) {
+    auto u = curr_remainders[tid];
+    if (depths[u] == -1) {
+      const auto e_beg = overts[u];
+      const auto e_end = overts[u+1];
+
+      auto u_deps{deps[u]};
+      for (auto e = e_beg; e < e_end; e++) {
+        const auto v = oedges[e];
+        if (depths[v] == current_depth) {
+          // v is a frontier
+          u_deps--;
+        }
+      }
+      deps[u] = u_deps;
+
+      if (u_deps == 0) {
+        // u is now a frontier
+        depths[u] = current_depth+1;
+        // we check if there's more space in the shared frontier storage
+        const auto local_frontier_idx = atomicAdd(&num_local_next_frontiers, 1);
+        if (local_frontier_idx < S_BUFF_CAPACITY) {
+          // if we have more space, store to the local frontier buffer
+          local_next_frontiers[local_frontier_idx] = u;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_next_frontiers = S_BUFF_CAPACITY;
+          enqueue(u, queue, qtail);
+        }
+      }
+      else {
+        // u stays in the remainder list
+        // add u to the local remainder buffer
+        // we check if there's more space in the shared remainder storage
+        const auto local_rem_idx = atomicAdd(&num_local_next_remainders, 1);
+        if (local_rem_idx < S_BUFF_CAPACITY) {
+          // if we have more space, store to the local remainder buffer
+          local_next_remainders[local_rem_idx] = u;
+        }
+        else {
+          // if not, write back to global memory
+          num_local_next_remainders = S_BUFF_CAPACITY;
+          enqueue(u, next_remainders, num_next_remainders);
+        }
+      }    
+    }
+    tid += blockDim.x*gridDim.x;
+  }
+  __syncthreads();  
+
+  __shared__ int next_ftr_beg, next_rem_beg;
+  if (threadIdx.x == 0) {
+    next_ftr_beg = atomicAdd(qtail, num_local_next_frontiers);
+    next_rem_beg = atomicAdd(num_next_remainders, num_local_next_remainders);
+  }
+  __syncthreads();
+
+  // commit local frontiers and local remainders to the global memory
+  for (auto local_idx = threadIdx.x; 
+    local_idx < num_local_next_frontiers; 
+    local_idx += blockDim.x) {
+    auto global_idx = next_ftr_beg + local_idx;
+    queue[global_idx] = local_next_frontiers[local_idx]; 
+  }
+  for (auto local_idx = threadIdx.x; 
+    local_idx < num_local_next_remainders; 
+    local_idx += blockDim.x) {
+    auto global_idx = next_rem_beg + local_idx;
+    next_remainders[global_idx] = local_next_remainders[local_idx]; 
+  }
+
+}
+
 
 
 __global__ void prop_distance_bfs_bu_step_privatized_no_curr_remainders(
@@ -1171,14 +1418,24 @@ __global__ void prop_distance_bfs_td_step(
   }
 } 
 
-__global__ void bfs_td_step_privatized(
+
+__global__ void bfs_td_step_privatized_reindex(
   int* ivs,
   int* ies,
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* reidx_map,
+  int* reordered_ovs,
+  int* reordered_oes,
+  float* reordered_owgts,
   int* queue,
   int* ftr_beg,
   int* ftr_end,
   int num_curr_ftrs,
-  int* deps) {
+  int* deps,
+  int* depths,
+  int curr_depth) {
   // initialize privatized frontiers
   __shared__ int s_next_frontiers[S_FRONTIER_CAPACITY];
 
@@ -1198,8 +1455,222 @@ __global__ void bfs_td_step_privatized(
     const auto e_end = ivs[v+1];
     for (auto e = e_beg; e < e_end; e++) {
       const auto neighbor = ies[e];
+      
       // decrement the dependency counter for this neighbor
       if (atomicSub(&deps[neighbor], 1) == 1) {
+        // update depth
+        depths[neighbor] = curr_depth+1;
+
+        // we check if there's more space in the shared frontier storage
+        const auto s_curr_frontier_idx = atomicAdd(&s_num_next_frontiers, 1);
+        if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
+          // if we have space, store to the shared frontier storage
+          s_next_frontiers[s_curr_frontier_idx] = neighbor;
+        }
+        else {
+          // if not, we have no choice but to store directly
+          // back to glob mem
+          s_num_next_frontiers = S_FRONTIER_CAPACITY;
+          auto pos = enqueue(neighbor, queue, ftr_end);
+
+          // store the reindex pattern
+          reidx_map[neighbor] = pos;
+            
+          // record the num of fanouts for this frontier
+          const auto oe_beg = ovs[neighbor];
+          const auto oe_end = ovs[neighbor+1];
+          reordered_ovs[pos+1] = oe_end-oe_beg;
+        }
+
+                
+      }
+    }
+  }
+  __syncthreads();
+
+  // calculate the index to start placing frontiers
+  // in the global frontier queue
+  __shared__ int next_frontier_beg;
+  if (threadIdx.x == 0) {
+    // let tid = 0 handle the calculation
+    next_frontier_beg = atomicAdd(ftr_end, s_num_next_frontiers);
+  }
+  __syncthreads();
+  
+  // commit local frontiers to the global frontier queue
+  for (auto s_next_frontier_idx = threadIdx.x; 
+      s_next_frontier_idx < s_num_next_frontiers; 
+      s_next_frontier_idx += blockDim.x) {
+    auto ftr = s_next_frontiers[s_next_frontier_idx];
+    auto next_frontier_idx = next_frontier_beg + s_next_frontier_idx;
+    queue[next_frontier_idx] = ftr;
+
+    // store the reindex pattern
+    reidx_map[ftr] = next_frontier_idx;
+   
+    // record the num of fanouts for this frontier
+    const auto oe_beg = ovs[ftr];
+    const auto oe_end = ovs[ftr+1];
+    reordered_ovs[next_frontier_idx+1] = oe_end-oe_beg;
+  }
+}
+
+
+__global__ void reorder_adjncy(
+  int num_adjncies,
+  int old_e_beg,
+  int new_e_beg,
+  int* oes,
+  float* owgts,
+  int* reidx_map,
+  int* reordered_oes,
+  float* reordered_owgts) {
+  int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  // for (int tid = threadIdx.x; tid < num_adjncies; tid += blockDim.x) {
+  if (tid < num_adjncies) {
+    // get the old edge index
+    const auto old_edge_idx = old_e_beg+tid;
+    const auto new_edge_idx = new_e_beg+tid;
+
+    // find the new neighbor using the reindex map
+    const auto old_neighbor = oes[old_edge_idx];
+    const auto new_neighbor = reidx_map[old_neighbor];
+    const auto wgt = owgts[old_edge_idx];
+    // store the new neighbor in the reordered edges array
+    reordered_oes[new_edge_idx] = new_neighbor;
+    // store the weight in the reordered weights array
+    reordered_owgts[new_edge_idx] = wgt;
+  }
+}
+
+__global__ void reorder_csr_cdp(
+  int num_verts,
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* reordered_ovs,
+  int* reordered_oes,
+  float* reordered_owgts,
+  int* reidx_map) {
+  const int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  if (tid < num_verts) {
+    const auto reidxed_vid = reidx_map[tid];
+    auto new_e_beg = reordered_ovs[reidxed_vid];
+    const auto old_e_beg = ovs[tid];
+    const auto old_e_end = ovs[tid+1];
+    const auto num_neighbors = old_e_end-old_e_beg;
+    reorder_adjncy
+      <<<1, 256>>>(
+        num_neighbors,         
+        old_e_beg,             
+        new_e_beg,             
+        oes,                   
+        owgts,                 
+        reidx_map,             
+        reordered_oes,         
+        reordered_owgts);       
+  }
+}
+
+
+__global__ void reorder_csr_e_oriented(
+  int num_edges,
+  int* ovs,
+  int* oes,
+  int* inv_oes,
+  float* owgts,
+  int* reordered_ovs,
+  int* reordered_oes,
+  float* reordered_owgts,
+  int* reidx_map) {
+  int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  while (tid < num_edges) {
+    
+    // u: from, v: to
+    // eid: the index of v in the adjncy list of u
+    const auto v = oes[tid];
+    const auto u = inv_oes[tid];
+    const auto eid = tid-ovs[u];
+    const auto wgt = owgts[tid];
+
+    // get the reindexed u
+    const auto new_u = reidx_map[u];
+
+    // get the edge beginning of reindexed u
+    const auto new_e_beg = reordered_ovs[new_u];
+    const auto new_v = reidx_map[v];
+
+    // update the reordered edge and wgts
+    reordered_oes[new_e_beg+eid] = new_v;
+    reordered_owgts[new_e_beg+eid] = wgt;
+  
+    tid += blockDim.x*gridDim.x;
+  }
+
+}
+
+__global__ void reorder_csr_v_oriented(
+  int num_verts,
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* reordered_ovs,
+  int* reordered_oes,
+  float* reordered_owgts,
+  int* reidx_map) {
+  const int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  if (tid < num_verts) {
+    const auto reidxed_vid = reidx_map[tid];
+    auto new_e_beg = reordered_ovs[reidxed_vid];
+    const auto old_e_beg = ovs[tid];
+    const auto old_e_end = ovs[tid+1];
+    for (auto old_e = old_e_beg; old_e < old_e_end; old_e++) {
+      const auto old_neighbor = oes[old_e];
+      const auto old_wgt = owgts[old_e];
+      const auto new_neighbor = reidx_map[old_neighbor];
+      reordered_oes[new_e_beg] = new_neighbor;
+      reordered_owgts[new_e_beg] = old_wgt;
+      new_e_beg++; 
+    } 
+  
+  }
+}
+
+__global__ void bfs_td_step_privatized(
+  int* ivs,
+  int* ies,
+  int* queue,
+  int* ftr_beg,
+  int* ftr_end,
+  int num_curr_ftrs,
+  int* deps,
+  int* depths,
+  int curr_depth) {
+  // initialize privatized frontiers
+  __shared__ int s_next_frontiers[S_FRONTIER_CAPACITY];
+
+  // shared counter to count fontiers in this block
+  __shared__ int s_num_next_frontiers;
+  if (threadIdx.x == 0) {
+    // let tid 0 initialize the counter
+    s_num_next_frontiers = 0;
+  }
+  __syncthreads();
+
+  const int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  if (tid < num_curr_ftrs) {
+    // get a frontier from the queue
+    const auto v = queue[*ftr_beg+tid];
+    const auto e_beg = ivs[v];
+    const auto e_end = ivs[v+1];
+    for (auto e = e_beg; e < e_end; e++) {
+      const auto neighbor = ies[e];
+      
+      // decrement the dependency counter for this neighbor
+      if (atomicSub(&deps[neighbor], 1) == 1) {
+        // update depth
+        depths[neighbor] = curr_depth+1;
+        
         // we check if there's more space in the shared frontier storage
         const auto s_curr_frontier_idx = atomicAdd(&s_num_next_frontiers, 1);
         if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
@@ -1586,37 +2057,62 @@ __global__ void update_successors(
 }
 
 
+__global__ void update_successors_bu(
+  int num_verts,
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* distances,
+  int* succs) {
+  int tid = threadIdx.x + blockIdx.x*blockDim.x;
 
-__global__ void update_successors(
-  int num_verts, 
-  int* vertices,
-  int* edges,
-  float* wgts,
-  int* distances_cache,
-  int* d_succs) {
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;  
-  if (tid >= num_verts) {
-    return;
-  }
-
-  auto edge_start = vertices[tid];
-  auto edge_end = vertices[tid+1]; 
-  for (int eid = edge_start; eid < edge_end; eid++) {
-    auto neighbor = edges[eid];
-    int wgt = wgts[eid] * SCALE_UP;
-    int new_distance = distances_cache[tid] + wgt;
-
-    // match weights to decide successor
-    if (distances_cache[neighbor] == new_distance) {
-      // use atomic max to make sure if 
-      // encountered neighbor with same distance
-      // we always pick the neighbor with
-      // the largest vertex id
-      atomicMax(&d_succs[neighbor], tid);  
-    }
+  if (tid < num_verts) {
+    const auto e_beg = ovs[tid];
+    const auto e_end = ovs[tid+1];
+    auto succ{::cuda::std::numeric_limits<int>::min()};
+    for (int e = e_beg; e < e_end; e++) {
+      const auto neighbor = oes[e];
+      const auto wgt = owgts[e];
+      const auto new_distance = distances[tid] + wgt;
+      if (distances[neighbor] == new_distance) {
+        succ = max(succ, neighbor);    
+      }
+    } 
   }
 
 }
+
+
+// __global__ void update_successors(
+//   int num_verts, 
+//   int* vertices,
+//   int* edges,
+//   float* wgts,
+//   int* distances_cache,
+//   int* d_succs) {
+//   int tid = threadIdx.x + blockIdx.x * blockDim.x;  
+//   if (tid >= num_verts) {
+//     return;
+//   }
+
+//   auto edge_start = vertices[tid];
+//   auto edge_end = vertices[tid+1]; 
+//   for (int eid = edge_start; eid < edge_end; eid++) {
+//     auto neighbor = edges[eid];
+//     int wgt = wgts[eid] * SCALE_UP;
+//     int new_distance = distances_cache[tid] + wgt;
+
+//     // match weights to decide successor
+//     if (distances_cache[neighbor] == new_distance) {
+//       // use atomic max to make sure if 
+//       // encountered neighbor with same distance
+//       // we always pick the neighbor with
+//       // the largest vertex id
+//       atomicMax(&d_succs[neighbor], tid);  
+//     }
+//   }
+
+// }
 
 
 __global__ void compute_long_path_counts(
@@ -2158,9 +2654,10 @@ void CpGen::report_paths(
   const PfxtExpMethod pe_method,
   const bool enable_runtime_log_file,
   const float init_split_perc,
-  const float alpha,
+  float alpha,
   const int per_thread_work_items,
-  const int in_deg_trhd) {
+  bool enable_reindex_cpu,
+  bool enable_reindex_gpu) {
 
   // set cache configuration
   // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
@@ -2210,13 +2707,17 @@ void CpGen::report_paths(
   thrust::device_vector<int> fanout_adjp(_h_fanout_adjp);
   thrust::device_vector<float> fanout_wgts(_h_fanout_wgts);
 
+  thrust::device_vector<int> inv_fanout_adjncy(_h_inv_fanout_adjncy);
 
-  // shortest distances cache
-  thrust::device_vector<int> dists_cache(N,
-      std::numeric_limits<int>::max());
+  // shortest distances
+  thrust::device_vector<int> dists_cache(
+    N,
+    std::numeric_limits<int>::max());
 
   // shortest distances cache (float)
-  thrust::device_vector<float> dists_float(N, std::numeric_limits<float>::max());
+  thrust::device_vector<float> dists_float(
+    N, 
+    std::numeric_limits<float>::max());
 
   // indicator of whether the distance of a vertex is updated
   thrust::device_vector<bool> dists_updated(N, false);
@@ -2231,6 +2732,8 @@ void CpGen::report_paths(
   int* d_fanout_adjp = thrust::raw_pointer_cast(&fanout_adjp[0]);
   int* d_fanout_adjncy = thrust::raw_pointer_cast(&fanout_adjncy[0]);
   float* d_fanout_wgts = thrust::raw_pointer_cast(&fanout_wgts[0]);
+
+  auto d_inv_fanout_adjncy = thrust::raw_pointer_cast(inv_fanout_adjncy.data());
 
   int* d_dists_cache = thrust::raw_pointer_cast(&dists_cache[0]);
   auto d_dists_float = thrust::raw_pointer_cast(dists_float.data());
@@ -2285,6 +2788,32 @@ void CpGen::report_paths(
   int* next_ftr_tail = new int(0);
   cudaHostAlloc(&next_ftr_tail, sizeof(int), cudaHostAllocDefault);
 
+
+  thrust::device_vector<int> reidx_map(N);
+  thrust::device_vector<int> reordered_fanout_adjp(_h_fanout_adjp.size());
+  thrust::device_vector<int> reordered_fanout_adjncy(_h_fanout_adjncy.size());
+  thrust::device_vector<float> reordered_fanout_wgts(_h_fanout_wgts.size());
+  auto d_reidx_map = thrust::raw_pointer_cast(reidx_map.data());
+  auto d_reordered_fanout_adjp = thrust::raw_pointer_cast(reordered_fanout_adjp.data());
+  auto d_reordered_fanout_adjncy = thrust::raw_pointer_cast(reordered_fanout_adjncy.data());
+  auto d_reordered_fanout_wgts = thrust::raw_pointer_cast(reordered_fanout_wgts.data());
+  
+  reordered_fanout_adjp[0] = 0;
+  int num_sinks = _sinks.size();
+  for (int i = 0; i < num_sinks; i++) {
+    reidx_map[_sinks[i]] = i;
+    reordered_fanout_adjp[i+1] = 0;
+  }
+
+  if (enable_reindex_gpu) {
+    // initialize sinks
+    for (int s = 0; s < num_sinks; s++) {
+      _sinks[s] = s;
+      dists_cache[s] = 0;
+    }
+  }
+
+
 	Timer timer_cpg;
 	timer_cpg.start();
   if (pd_method == PropDistMethod::BASIC) { 
@@ -2319,31 +2848,309 @@ void CpGen::report_paths(
   }
   else if (pd_method == PropDistMethod::LEVELIZE_THEN_RELAX) {
     int curr_depth{0};
-    int num_curr_ftrs = _sinks.size();
+    auto num_curr_ftrs{num_sinks};
     _h_verts_lvlp.emplace_back(0);
 
+    // print_range("fanout_adjncy", fanout_adjncy.begin(), fanout_adjncy.end());
+    // print_range("inv_fanout_adjncy", inv_fanout_adjncy.begin(), inv_fanout_adjncy.end());
+
+    Timer timer;
+    timer.start();
     // levelize
     while (num_curr_ftrs) {
       // record the depth offset
       _h_verts_lvlp.emplace_back(_h_verts_lvlp.back()+num_curr_ftrs);
       
       int num_blks = ROUNDUPBLOCKS(num_curr_ftrs, BLOCKSIZE);
-      bfs_td_step_privatized
+      if (enable_reindex_gpu) {
+        bfs_td_step_privatized_reindex
+          <<<num_blks,BLOCKSIZE>>>(
+            d_fanin_adjp,
+            d_fanin_adjncy,
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_reidx_map,
+            d_reordered_fanout_adjp,
+            d_reordered_fanout_adjncy,
+            d_reordered_fanout_wgts,
+            d_queue,
+            _d_qhead,
+            _d_qtail,
+            num_curr_ftrs,
+            d_deps,
+            d_depths,
+            curr_depth);
+      }
+      else {
+        bfs_td_step_privatized
+          <<<num_blks, BLOCKSIZE>>>(
+            d_fanin_adjp,
+            d_fanin_adjncy,
+            d_queue,
+            _d_qhead,
+            _d_qtail,
+            num_curr_ftrs,
+            d_deps,
+            d_depths,
+            curr_depth);
+      }
+      inc_kernel<<<1, 1>>>(_d_qhead, num_curr_ftrs);
+      num_curr_ftrs = _get_num_ftrs();
+      curr_depth++;
+    }
+    timer.stop();
+    std::cout << "levelize time=" << timer.get_elapsed_time()/1ms << " ms\n";
+
+    if (enable_reindex_gpu) {
+      // timer.start();
+      thrust::inclusive_scan(
+        thrust::device,
+        reordered_fanout_adjp.begin(), 
+        reordered_fanout_adjp.end(), 
+        reordered_fanout_adjp.begin());
+      // timer.stop();
+      // std::cout << "prefix scan time=" << timer.get_elapsed_time()/1ms << " ms\n";
+    
+      // timer.start();
+      int num_blks = ROUNDUPBLOCKS(M, BLOCKSIZE);
+      // reorder_csr_v_oriented
+      //   <<<num_blks, BLOCKSIZE>>>(
+      //     N,
+      //     d_fanout_adjp,
+      //     d_fanout_adjncy,
+      //     d_fanout_wgts,
+      //     d_reordered_fanout_adjp,
+      //     d_reordered_fanout_adjncy,
+      //     d_reordered_fanout_wgts,
+      //     d_reidx_map);
+      
+      reorder_csr_e_oriented
+        <<<num_blks, BLOCKSIZE>>>(
+          M,
+          d_fanout_adjp,
+          d_fanout_adjncy,
+          d_inv_fanout_adjncy,
+          d_fanout_wgts,
+          d_reordered_fanout_adjp,
+          d_reordered_fanout_adjncy,
+          d_reordered_fanout_wgts,
+          d_reidx_map); 
+      
+      // cudaDeviceSynchronize();
+      // timer.stop();
+      // std::cout << "reorder csr time=" << timer.get_elapsed_time()/1ms << " ms\n";
+      
+      thrust::sequence(
+        thrust::device,
+        queue.begin(),
+        queue.end());
+    }
+
+
+    // reindex on CPU
+    if (enable_reindex_cpu) {
+      std::vector<int> h_verts_by_lvl(N);
+      timer.start();
+      thrust::copy(queue.begin(), queue.end(), h_verts_by_lvl.begin());
+      timer.stop();
+      std::cout << "d->h copy time=" << timer.get_elapsed_time()/1ms << " ms\n";
+
+      timer.start();
+      reindex_verts(h_verts_by_lvl);
+      timer.stop();
+      std::cout << "reindex time=" << timer.get_elapsed_time()/1ms << " ms\n";
+
+      // set the sink dists to 0
+      for (const auto sink : _sinks) {
+        dists_cache[sink] = 0;
+      }
+      
+      timer.start();
+      // copy the CSRs to GPU
+      fanout_adjncy = _h_fanout_adjncy;
+      fanout_adjp = _h_fanout_adjp;
+      fanout_wgts = _h_fanout_wgts;
+      thrust::sequence(queue.begin(), queue.end());
+      timer.stop();
+      std::cout << "h->d copy time=" << timer.get_elapsed_time()/1ms << " ms\n";
+    }
+
+
+    // relaxation
+    timer.start();
+    for (int d = 1; d < curr_depth; d++) {
+      const auto d_beg = _h_verts_lvlp[d];
+      const auto d_end = _h_verts_lvlp[d+1];
+      const auto d_size = d_end-d_beg;
+      int num_blks = ROUNDUPBLOCKS(d_size, BLOCKSIZE);
+      if (enable_reindex_gpu) {
+        relax_bu_step
+          <<<num_blks, BLOCKSIZE>>>(
+            d_reordered_fanout_adjp,
+            d_reordered_fanout_adjncy,
+            d_reordered_fanout_wgts,
+            d_dists_cache,
+            d_queue,
+            d_size,
+            d_beg);
+      }
+      else {
+        relax_bu_step
+          <<<num_blks, BLOCKSIZE>>>(
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_dists_cache,
+            d_queue,
+            d_size,
+            d_beg);
+      }
+    }
+    cudaDeviceSynchronize();
+    timer.stop();
+    std::cout << "relaxation time=" << timer.get_elapsed_time()/1ms << " ms\n";
+
+    // print_range("dists", dists_cache.begin(), dists_cache.end());
+  } 
+  else if (pd_method == PropDistMethod::BFS_TD_RELAX_BU_PRIVATIZED) {
+    int curr_depth{0};
+    int num_curr_ftrs = _sinks.size();
+    while (num_curr_ftrs) {
+      int num_blks = ROUNDUPBLOCKS(num_curr_ftrs, BLOCKSIZE);
+      prop_distance_bfs_td_relax_bu_step_privatized
         <<<num_blks, BLOCKSIZE>>>(
           d_fanin_adjp,
           d_fanin_adjncy,
-          d_queue,
-          _d_qhead,
-          _d_qtail,
+          d_fanout_adjp,
+          d_fanout_adjncy,
+          d_fanout_wgts,
+          d_dists_cache,
+          d_curr_frontiers,
+          d_next_frontiers,
           num_curr_ftrs,
-          d_deps);
-
-      inc_kernel<<<1, 1>>>(_d_qhead, num_curr_ftrs);
-      num_curr_ftrs = _get_qsize();
+          next_ftr_tail,
+          d_deps,
+          d_depths,
+          curr_depth);
+      cudaMemcpy(&num_curr_ftrs, next_ftr_tail, sizeof(int), cudaMemcpyDeviceToHost);
+      cudaMemset(next_ftr_tail, 0, sizeof(int));
+      std::swap(d_curr_frontiers, d_next_frontiers);
       curr_depth++;
     }
     // std::cout << "total depths=" << curr_depth << '\n';
+  }
+  else if (pd_method == PropDistMethod::LEVELIZE_HYBRID_THEN_RELAX) {
+    
+    // set alpha to the average degree of this graph
+    alpha = static_cast<double>(M)/N;
+    // std::cout << "alpha=" << alpha << '\n';
+    
+    int num_sinks = _sinks.size();
+    int num_curr_frontiers{num_sinks}, curr_depth{0};
+    int num_curr_remainders{N};
+  
+    // separate the tracking of:
+    // we separate the tracking of bu_scans and num_remainders
+    // because num_remainders should not be affected by the heuristic information update
+    double td_scans = num_sinks;
+    double bu_scans = N;
  
+    bool should_update_num_remainders{false};
+    _h_verts_lvlp.emplace_back(0);
+    while (num_curr_frontiers && num_curr_remainders) {
+      _h_verts_lvlp.emplace_back(_h_verts_lvlp.back()+num_curr_frontiers);
+      bu_scans -= td_scans;
+      if (should_update_num_remainders) {
+        should_update_num_remainders = false;
+        // if what we just ran was not the first bu_step
+        // we need to update the curr_remainders
+        if (num_curr_remainders < N) {
+          std::swap(d_curr_remainders, d_next_remainders);
+        }
+        num_curr_remainders = bu_scans;
+      }
+
+      if (td_scans*alpha < bu_scans) {
+        // run top-down step
+        int num_blks = ROUNDUPBLOCKS(num_curr_frontiers, BLOCKSIZE);
+        bfs_td_step_privatized
+          <<<num_blks, BLOCKSIZE>>>(
+              d_fanin_adjp,
+              d_fanin_adjncy,
+              d_queue,
+              _d_qhead,
+              _d_qtail,
+              num_curr_frontiers,
+              d_deps,
+              d_depths,
+              curr_depth);
+      }
+      else {
+        if (num_curr_remainders == N) {
+          // std::cout << "first bu_step @ depth " << curr_depth << '\n';
+          
+          // we need to do a first pass to scan all the N vertices
+          // and get the current remainder vertices
+          int num_blks = ROUNDUPBLOCKS(N, BLOCKSIZE);
+          bfs_bu_step_privatized_without_remainders
+            <<<num_blks, BLOCKSIZE>>>(
+              N,
+              d_fanout_adjp,
+              d_fanout_adjncy,
+              d_fanout_wgts,
+              d_dists_cache,
+              d_curr_remainders,
+              next_rem_tail,
+              d_queue,
+              _d_qhead,
+              _d_qtail,
+              d_deps,
+              d_depths,
+              curr_depth);    
+        }
+        else {
+          // run bottom-up step
+          int num_blks = ROUNDUPBLOCKS(num_curr_remainders, BLOCKSIZE);
+          bfs_bu_step_privatized
+            <<<num_blks, BLOCKSIZE>>>(
+              num_curr_remainders,
+              d_fanout_adjp,
+              d_fanout_adjncy,
+              d_fanout_wgts,
+              d_dists_cache,
+              d_curr_remainders,
+              num_curr_remainders,
+              d_next_remainders,
+              next_rem_tail,
+              d_queue,
+              _d_qhead,
+              _d_qtail,
+              d_deps,
+              d_depths,
+              curr_depth);   
+        }
+        
+        // signal the next iteration to
+        // update the number of curr_remainders
+        // reason doing this is to avoid another cudaMemcpy call
+        should_update_num_remainders = true;
+        
+        // reset the remainder tail
+        cudaMemset(next_rem_tail, 0, sizeof(int));
+      }
+      
+      // update curr_num_frontiers
+      inc_kernel<<<1, 1>>>(_d_qhead, num_curr_frontiers);
+      num_curr_frontiers = _get_num_ftrs();
+      td_scans = num_curr_frontiers;
+      
+      // increment depth
+      curr_depth++;
+    }
+
+    std::cout << "total depths=" << curr_depth << '\n';
+
     // relaxation
     for (int d = 1; d < curr_depth; d++) {
       const auto d_beg = _h_verts_lvlp[d];
@@ -2358,22 +3165,9 @@ void CpGen::report_paths(
           d_dists_cache,
           d_queue,
           d_size,
-          d_beg);      
+          d_beg);
     }
-  } 
-  else if (pd_method == PropDistMethod::BFS_HYBRID) {
-    //bfs_hybrid(
-    //  alpha,
-    //  d_fanin_adjp, 
-    //  d_fanin_adjncy,
-    //  d_fanin_wgts,
-    //  d_fanout_adjp,
-    //  d_fanout_adjncy,
-    //  d_fanout_wgts,
-    //  d_dists_cache,
-    //  d_queue,
-    //  d_deps,
-    //  enable_runtime_log_file);
+
   }
   else if (pd_method == PropDistMethod::BFS_HYBRID_PRIVATIZED) {
     bfs_hybrid_privatized(
@@ -2515,12 +3309,12 @@ void CpGen::report_paths(
     int curr_depth{0};
     int num_curr_frontiers{static_cast<int>(_sinks.size())};
 
-    std::ofstream mf_log("mf.csv");
-    std::string filename = "big_in_deg_perc-trhd=" + std::to_string(in_deg_trhd) + ".csv";
-    std::ofstream big_in_degs_log(filename); 
+    // std::ofstream mf_log("mf.csv");
+    // std::string filename = "big_in_deg_perc-trhd=" + std::to_string(in_deg_trhd) + ".csv";
+    // std::ofstream big_in_degs_log(filename); 
     
-    mf_log << "depth,mf\n";
-    big_in_degs_log << "depth, big_in_deg_perc\n"; 
+    // mf_log << "depth,mf\n";
+    // big_in_degs_log << "depth, big_in_deg_perc\n"; 
     while (num_curr_frontiers) {
       // sum up the in-degrees of the current frontiers (mf)
       // e.g., curr_frontiers = [0, 2, 6]
@@ -2649,14 +3443,34 @@ void CpGen::report_paths(
   // copy distance vector back to host
   std::vector<int> h_dists(N);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
+  
+  // temporary implementation to make sure pfxt expansion
+  // also uses the reordered csr, we do not actually need
+  // to copy, we can just tell pfxt to use the reordered csr
+  // directly
+  if (enable_reindex_gpu) {
+    fanout_adjp = reordered_fanout_adjp;
+    fanout_adjncy = reordered_fanout_adjncy;
+    fanout_wgts = reordered_fanout_wgts;
 
+    // update the host side storages too
+    thrust::copy(reordered_fanout_adjp.begin(), reordered_fanout_adjp.end(), _h_fanout_adjp.begin());
+    thrust::copy(reordered_fanout_adjncy.begin(), reordered_fanout_adjncy.end(), _h_fanout_adjncy.begin());
+    thrust::copy(reordered_fanout_wgts.begin(), reordered_fanout_wgts.end(), _h_fanout_wgts.begin());
+  
+    // update srcs
+    for (auto& src: _srcs) {
+      src = reidx_map[src];
+    }
+  }
   // get successors of each vertex (the next hop on the shortest path) 
-  update_successors
-    <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
+  int num_blks = ROUNDUPBLOCKS(N, BLOCKSIZE);
+  update_successors_bu
+    <<<num_blks, BLOCKSIZE>>>(
       N, 
-      d_fanin_adjp,
-      d_fanin_adjncy,
-      d_fanin_wgts,
+      d_fanout_adjp,
+      d_fanout_adjncy,
+      d_fanout_wgts,
       d_dists_cache,
       d_succs);
   
@@ -2728,7 +3542,6 @@ void CpGen::report_paths(
             d_lvl_offsets,
             curr_lvl, 
             d_path_prefix_sums); 
-
 
       // prefix sum
       thrust::inclusive_scan(
@@ -3155,9 +3968,9 @@ void CpGen::report_paths(
           break;
         }
         
-        while (h_num_short_paths < BLOCKSIZE) {
+        while (h_num_short_paths < BLOCKSIZE/2) {
           // update the split value
-          h_split *= 1.1f;
+          h_split *= 1.01f;
           
           // now some paths in the long pile
           // must be transferred to the short pile
@@ -3226,19 +4039,19 @@ void CpGen::report_paths(
     };
     std::priority_queue<PfxtNode, std::vector<PfxtNode>, decltype(cmp)>
      pfxt_pq(cmp); 
-   
+  
     for (const auto& src : _srcs) {
       float dist = (float)h_dists[src] / SCALE_UP;
       pfxt_pq.emplace(0, -1, src, -1, 0, dist);
     }
 
-    
     // run sequential pfxt expansion
     // just to validate the generated slacks
     std::vector<PfxtNode> paths;
     std::vector<int> h_succs;
     h_succs.resize(N);
     thrust::copy(successors.begin(), successors.end(), h_succs.begin());
+
     for (int i = 0; i < k; i++) {
       const auto& node = pfxt_pq.top();
       // record the top node in another container
@@ -3251,7 +4064,7 @@ void CpGen::report_paths(
       auto slack = node.slack;
       while (v != -1) {
         auto edge_start = _h_fanout_adjp[v];
-        auto edge_end = (v == N-1) ? M : _h_fanout_adjp[v+1];
+        auto edge_end = _h_fanout_adjp[v+1];
         for (auto eid = edge_start; eid < edge_end; eid++) {
           auto neighbor = _h_fanout_adjncy[eid];
           if (neighbor == h_succs[v]) {
@@ -3278,9 +4091,10 @@ void CpGen::report_paths(
     // copy paths to host pfxt nodes
     _h_pfxt_nodes.clear();
     _h_pfxt_nodes = std::move(paths);
+
   }
 
-  // can remove if not timing code
+  // can remove if not measuring runtime
   cudaDeviceSynchronize();
 	timer_cpg.stop();
 	expand_time = timer_cpg.get_elapsed_time();
@@ -3437,15 +4251,14 @@ void CpGen::dump_lvls(std::ostream& os) const {
   }
 }
 
-void CpGen::reindex_verts() {
-  auto vs = num_verts();
-  auto es = num_edges();
+void CpGen::reindex_verts(std::vector<int>& verts_by_lvl) {
+  int vs = num_verts();
   _reindex_map.resize(vs);
 
   // traverse the level list
   // and record the new id to map to
-  for (size_t i = 0; i < vs; i++) {
-    auto old_id = _h_verts_by_lvl[i];
+  for (auto i = 0; i < vs; i++) {
+    auto old_id = verts_by_lvl[i];
     // update id
     _reindex_map[old_id] = i;
   }
@@ -3455,70 +4268,30 @@ void CpGen::reindex_verts() {
     sink = _reindex_map[sink];
   }
   
-  for (auto& src : _srcs) {
-    src = _reindex_map[src];
-  }
-
   // iterate through the level list
   // rebuild csr
-  std::vector<int> _h_fanin_adjp_by_lvl;
-  std::vector<int> _h_fanin_adjncy_by_lvl;
-  std::vector<float> _h_fanin_wgts_by_lvl;
   std::vector<int> _h_fanout_adjp_by_lvl;
   std::vector<int> _h_fanout_adjncy_by_lvl;
   std::vector<float> _h_fanout_wgts_by_lvl;
 
-  _h_fanin_adjp_by_lvl.emplace_back(0);
   _h_fanout_adjp_by_lvl.emplace_back(0);
 
-  for (const auto vid : _h_verts_by_lvl) {
-    const auto edge_start = _h_fanin_adjp[vid];
-    const auto edge_end = _h_fanin_adjp[vid+1];
-    const auto num_fanin = edge_end - edge_start;
-    auto prev_p = _h_fanin_adjp_by_lvl.back();
-    _h_fanin_adjp_by_lvl.emplace_back(prev_p+num_fanin);
-    _h_in_degrees[_reindex_map[vid]] = num_fanin;
-    for (auto eid = edge_start; eid < edge_end; eid++) {
-      const auto neighbor = _h_fanin_adjncy[eid];
-      const auto wgt = _h_fanin_wgts[eid];
-      _h_fanin_adjncy_by_lvl.emplace_back(_reindex_map[neighbor]);
-      _h_fanin_wgts_by_lvl.emplace_back(wgt);
-    }
-  }
-  
-  for (const auto vid : _h_verts_by_lvl) {
-    const auto edge_start = _h_fanout_adjp[vid];
-    const auto edge_end = _h_fanout_adjp[vid+1];
-    const auto num_fanout = edge_end - edge_start;
-    auto prev_p = _h_fanout_adjp_by_lvl.back();
-    _h_fanout_adjp_by_lvl.emplace_back(prev_p+num_fanout);
-    _h_out_degrees[_reindex_map[vid]] = num_fanout;
-    for (auto eid = edge_start; eid < edge_end; eid++) {
-      const auto neighbor = _h_fanout_adjncy[eid];
-      const auto wgt = _h_fanout_wgts[eid];
+  for (const auto vid : verts_by_lvl) {
+    const auto oe_beg = _h_fanout_adjp[vid];
+    const auto oe_end = _h_fanout_adjp[vid+1];
+    const auto num_fanout = oe_end-oe_beg;
+    _h_fanout_adjp_by_lvl.emplace_back(_h_fanout_adjp_by_lvl.back()+num_fanout);
+    for (auto e = oe_beg; e < oe_end; e++) {
+      const auto neighbor = _h_fanout_adjncy[e];
+      const auto wgt = _h_fanout_wgts[e];
       _h_fanout_adjncy_by_lvl.emplace_back(_reindex_map[neighbor]);
       _h_fanout_wgts_by_lvl.emplace_back(wgt);
     }
   }
-
-  _h_fanin_adjp.clear();
-  _h_fanin_adjp = std::move(_h_fanin_adjp_by_lvl);
-  _h_fanin_adjncy.clear();
-  _h_fanin_adjncy = std::move(_h_fanin_adjncy_by_lvl);
-  _h_fanin_wgts.clear();
-  _h_fanin_wgts = std::move(_h_fanin_wgts_by_lvl);
-
-  _h_fanout_adjp.clear();
+ 
   _h_fanout_adjp = std::move(_h_fanout_adjp_by_lvl);
-  _h_fanout_adjncy.clear();
   _h_fanout_adjncy = std::move(_h_fanout_adjncy_by_lvl);
-  _h_fanout_wgts.clear();
   _h_fanout_wgts = std::move(_h_fanout_wgts_by_lvl);
-  
-  // update level list
-  _h_verts_by_lvl.clear();
-  _h_verts_by_lvl.resize(vs);
-  std::iota(_h_verts_by_lvl.begin(), _h_verts_by_lvl.end(), 0);
 }
 
 void CpGen::_free() {
@@ -3528,12 +4301,12 @@ void CpGen::_free() {
   cudaFree(_d_pfxt_tail);
 } 
 
-int CpGen::_get_qsize() {
+int CpGen::_get_num_ftrs() {
   cudaMemcpy(&_h_qhead, _d_qhead, sizeof(int), cudaMemcpyDeviceToHost);
   cudaMemcpy(&_h_qtail, _d_qtail, sizeof(int), cudaMemcpyDeviceToHost);
-  int size = _h_qtail - _h_qhead;
-  //printf("_get_queue_size head = %d, tail = %d, q_sz = %d\n", head, tail, size);
-  return size;
+  int num_ftrs = _h_qtail-_h_qhead;
+  // printf("_get_queue_size head = %d, tail = %d, q_sz = %d\n", _h_qhead, _h_qtail, num_ftrs);
+  return num_ftrs;
 }
 
 int CpGen::_get_expansion_window_size(int* p_start, int* p_end) {
@@ -3780,104 +4553,6 @@ void CpGen::bfs_hybrid_privatized(
     // increment depth
     curr_depth++;
   }
-
-  // TODO: make this into a unit test
-  //while (num_frontiers > 0) {
-  //  if (curr_depth == 1) {
-  //    prop_distance_bfs_bu_step_privatized_no_curr_remainders
-  //      <<<ROUNDUPBLOCKS(N, BLOCKSIZE), BLOCKSIZE>>>(
-  //          N,
-  //          M,
-  //          ovs,
-  //          oes,
-  //          owgts,
-  //          dists,
-  //          curr_remainders,
-  //          next_rem_tail,
-  //          frontiers,
-  //          _d_qtail,
-  //          deps,
-  //          depths,
-  //          curr_depth);
-  //    
-  //    // copy num_remainder from device
-  //    cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-  //        cudaMemcpyDeviceToHost);
-  //    
-  //    std::cout << "num_remainders=" << num_remainders << '\n';
-  //    set_kernel<<<1, 1>>>(next_rem_tail, 0);
-
-  //  }
-  //  else if (curr_depth == 4 || curr_depth == 5) {
-  //    
-  //    prop_distance_bfs_bu_step_privatized
-  //      <<<ROUNDUPBLOCKS(num_remainders, BLOCKSIZE), BLOCKSIZE>>>(
-  //          N,
-  //          M,
-  //          ovs,
-  //          oes,
-  //          owgts,
-  //          dists,
-  //          curr_remainders,
-  //          num_remainders,
-  //          next_remainders,
-  //          next_rem_tail,
-  //          frontiers,
-  //          _d_qtail,
-  //          deps,
-  //          depths,
-  //          curr_depth);
-  //    
-  //    // copy num_remainder from device
-  //    cudaMemcpy(&num_remainders, next_rem_tail, sizeof(int),
-  //        cudaMemcpyDeviceToHost);
-  //    
-  //    std::cout << "num_remainders=" << num_remainders << '\n';
-  //    // reset the tail of the next remainders
-  //    set_kernel<<<1, 1>>>(next_rem_tail, 0);
-  //    
-  //    
-  //    thrust::copy(
-  //      thrust::device,
-  //      next_remainders,
-  //      next_remainders+num_remainders,
-  //      curr_remainders);
-  //  
-  //  }
-  //  else {
-  //    prop_distance_bfs_td_step_privatized
-  //      <<<ROUNDUPBLOCKS(num_frontiers, BLOCKSIZE), BLOCKSIZE>>>(
-  //          N,
-  //          M,
-  //          ivs,
-  //          ies,
-  //          iwgts,
-  //          dists,
-  //          frontiers,
-  //          _d_qhead,
-  //          _d_qtail,
-  //          num_frontiers,
-  //          deps,
-  //          depths,
-  //          curr_depth);
-  //  
-  //  }
-
-  //  inc_kernel<<<1, 1>>>(_d_qhead, num_frontiers);
-  //  num_frontiers = _get_qsize();
-  //  
-  //  
-  //  //std::cout << "===============\n";
-  //  //std::cout << "depth " << curr_depth << '\n';
-  //  //print_range("frontiers", frontiers, frontiers+N);
-  //  //print_range("curr_remainders", curr_remainders, curr_remainders+N);
-  //  //print_range("next_remainders", next_remainders, next_remainders+N);
-  //  //print_range("deps", deps, deps+N);
-  //  //print_range("distances", dists, dists+N);
-  //  //print_range("depths", depths, depths+N);
-
-  //  curr_depth++;
-  //}
 }
 
 

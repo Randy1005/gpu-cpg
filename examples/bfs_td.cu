@@ -26,7 +26,7 @@ int main(int argc, char* argv[]) {
   std::cout << "num_verts=" << cpgen_td.num_verts() << '\n';
   std::cout << "num_edges=" << cpgen_td.num_edges() << '\n';
   cpgen_td.report_paths(num_paths, max_dev_lvls, enable_compress,
-      gpucpg::PropDistMethod::BFS_TOP_DOWN_PRIVATIZED, pe_method, false, 0.005f, 5.0f, 4);
+      gpucpg::PropDistMethod::BFS_TOP_DOWN_PRIVATIZED, pe_method);
 
   auto slks_td = cpgen_td.get_slacks(num_paths);
   std::cout << "BFS_TOP_DOWN_PRIVATIZED: " << num_paths << "-th slack=" << slks_td.back() << "\n";

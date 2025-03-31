@@ -27,7 +27,9 @@ enum class PropDistMethod {
   BFS_HYBRID,
   BFS_HYBRID_PRIVATIZED,
   TEST_COUNT_MF,
-  LEVELIZE_THEN_RELAX
+  LEVELIZE_THEN_RELAX,
+  LEVELIZE_HYBRID_THEN_RELAX,
+  BFS_TD_RELAX_BU_PRIVATIZED
 };
 
 enum class PfxtExpMethod {
@@ -133,7 +135,8 @@ public:
     const float init_split_perc = 0.005f,
     const float alpha = 5.0f,
     const int per_thread_work_items = 8,
-    const int in_deg_trhd = 1);
+    bool enable_reindex_cpu = false,
+    bool enable_reindex_gpu = false);
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
@@ -151,11 +154,7 @@ public:
   void dump_csrs(std::ostream& os) const;
   void dump_lvls(std::ostream& os) const;
  
-  // re-assign index after levelization
-  // this is to save the trouble of
-  // maintaining messy mapping on GPU
-  // shared memory
-  void reindex_verts();
+  void reindex_verts(std::vector<int>& verts_by_lvl);
 
   size_t num_verts() const;
   size_t num_edges() const;
@@ -165,7 +164,7 @@ public:
 private:
   void _free();
  
-  int _get_qsize();
+  int _get_num_ftrs();
 
   int _get_expansion_window_size(int* p_start, int* p_end);
 
@@ -185,6 +184,9 @@ private:
   std::vector<int> _h_fanout_adjp;
   std::vector<int> _h_fanout_adjncy;
   std::vector<float> _h_fanout_wgts;
+
+  // inversed fanout CSR storage
+  std::vector<int> _h_inv_fanout_adjncy;
 
   // store source and sink vertices
   std::vector<int> _srcs;

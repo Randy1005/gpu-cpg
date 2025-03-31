@@ -10,7 +10,6 @@ int main(int argc, char* argv[]) {
   std::cout << "num_edges=" << cpgen.num_edges() << '\n';
   
   cpgen.levelize();
-  cpgen.reindex_verts();
   cpgen.dump_csrs(std::cout);
   return 0;
 }
