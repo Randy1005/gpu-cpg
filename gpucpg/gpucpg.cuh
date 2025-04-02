@@ -37,6 +37,7 @@ enum class PfxtExpMethod {
   PRECOMP_SPURS,
   ATOMIC_ENQ,
   SHORT_LONG,
+  LONG_PILE_ON_HOST,
   SEQUENTIAL
 };
 
@@ -136,7 +137,9 @@ public:
     const float alpha = 5.0f,
     const int per_thread_work_items = 8,
     bool enable_reindex_cpu = false,
-    bool enable_reindex_gpu = false);
+    bool enable_reindex_gpu = false,
+    bool enable_fuse_steps = false,
+    bool enable_interm_perf_log = false); // enables runtime log on intermidiate steps (csr_reorder, etc.)
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
@@ -159,8 +162,35 @@ public:
   size_t num_verts() const;
   size_t num_edges() const;
 
+  void reset() {
+    _h_verts_lvlp.clear();
+    // reset sinks
+    _sinks.clear();
+    _sinks.shrink_to_fit();
+    _srcs.clear();
+    _srcs.shrink_to_fit();
+    // loop through the fanout adjps and find the sinks again
+    int N = num_verts();
+    for (int i = 0; i < N; i++) {
+      if (_h_out_degrees[i] == 0) {
+        // this is a sink
+        _sinks.emplace_back(i);
+      }
+
+      if (_h_in_degrees[i] == 0) {
+        // this is a source
+        _srcs.emplace_back(i);
+      }
+    }
+
+  }
+
   std::chrono::duration<double, std::micro> prop_time;
   std::chrono::duration<double, std::micro> expand_time;
+  std::chrono::duration<double, std::micro> lvlize_time;
+  std::chrono::duration<double, std::micro> prefix_scan_time;
+  std::chrono::duration<double, std::micro> csr_reorder_time;
+  std::chrono::duration<double, std::micro> relax_time;
 private:
   void _free();
  
@@ -195,7 +225,7 @@ private:
   // prefix tree nodes
   std::vector<PfxtNode> _h_pfxt_nodes;
   
-  // prefix tree level offsets
+  // prefix tree level ets
   std::vector<int> _h_lvl_offsets;
 
   // levelized vertices storage
@@ -218,6 +248,12 @@ private:
 
   // pfxt nodes tail
   int* _d_pfxt_tail;
+
+  // expansion window size
+  int* _d_window_beg;
+  int* _d_window_end;
+  int _h_window_beg;
+  int _h_window_end;
 };
 
 } // namespace gpucpg

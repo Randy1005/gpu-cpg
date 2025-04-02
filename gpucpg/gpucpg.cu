@@ -19,7 +19,7 @@
 namespace cg = cooperative_groups;
 
 #define MAX_INTS_ON_SMEM 12288
-#define BLOCKSIZE 512
+#define BLOCKSIZE 768 
 #define WARPS_PER_BLOCK 32
 #define WARP_SIZE 32
 #define S_BUFF_CAPACITY 4096 
@@ -27,6 +27,7 @@ namespace cg = cooperative_groups;
 #define W_FRONTIER_CAPACITY 64
 #define S_PFXT_CAPACITY 1024 
 #define PER_THREAD_WORK_ITEMS 8 
+#define EXP_WINDOW_SIZE_THRD 128
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -313,23 +314,6 @@ void CpGen::read_input(const std::string& filename) {
 }
 
 void CpGen::segsort_adjncy() {
-  // use moderngpu to segment sort
-  // the adjacency lists, and make sure
-  // the weights are sorted accordingly
-  // mgpu::standard_context_t context;
-  // mgpu::segmented_sort_indices(
-  //     _h_fanout_adjncy.data().get(),
-  //     _h_fanout_wgts.data().get(),
-  //     num_verts(),
-  //     _h_fanout_adjp.data().get(),
-  //     mgpu::less_t<int>(),
-  //     context);
-  // mgpu::transform([]MGPU_DEVICE(int idx) {
-  //   printf("hello from thread %d\n", idx);
-  // }, 5, context);
-
-  // context.synchronize();
-
   const int N = num_verts();
 
   // use static scheduling policy
@@ -352,18 +336,6 @@ void CpGen::segsort_adjncy() {
       _h_fanout_wgts[j] = seg[k].second;
     }
   }
-
-  // print the adjacency list
-  // for (int i = 0; i < N; i++) {
-  //   auto e_beg = _h_fanout_adjp[i];
-  //   auto e_end = _h_fanout_adjp[i+1];
-  //   std::cout << i << ": ";
-  //   for (int j = e_beg; j < e_end; j++) {
-  //     std::cout << _h_fanout_adjncy[j] << " ";
-  //   }
-  //   std::cout << '\n';
-  // }
-
 }
 
 void CpGen::densify_graph(const int desired_avg_degree) {
@@ -873,6 +845,55 @@ __global__ void relax_bu_step(
   }
 }
 
+__global__ void relax_bu_steps_fused(
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* distances,
+  int* lvlized_verts,
+  int* lvlp,
+  int beg_depth,
+  int end_depth,
+  int init_depth_sz,
+  int init_depth_beg) {
+  const int tid = threadIdx.x;
+  __shared__ int s_curr_depth_sz;
+  __shared__ int s_curr_depth_beg, s_next_depth_beg;
+  __shared__ int s_curr_depth;
+
+  if (tid == 0) {
+    s_curr_depth = beg_depth;
+    s_curr_depth_sz = init_depth_sz;
+    s_curr_depth_beg = init_depth_beg;
+  }
+  __syncthreads();
+
+  while (s_curr_depth < end_depth && s_curr_depth_sz < BLOCKSIZE) {
+    if (tid < s_curr_depth_sz) {
+      const auto v = lvlized_verts[s_curr_depth_beg+tid];
+      const auto e_beg = ovs[v];
+      const auto e_end = ovs[v+1];
+      auto min_dist{::cuda::std::numeric_limits<int>::max()};
+      for (int e = e_beg; e < e_end; e++) {
+        const auto neighbor = oes[e];
+        const int wgt = owgts[e]*SCALE_UP;
+        min_dist = min(min_dist, distances[neighbor]+wgt);
+      }
+      distances[v] = min_dist;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      s_curr_depth++;
+      s_curr_depth_beg = lvlp[s_curr_depth];
+      s_next_depth_beg = lvlp[s_curr_depth+1];
+      s_curr_depth_sz = s_next_depth_beg-s_curr_depth_beg;
+    }
+    __syncthreads();
+  }
+}
+
+
 __global__ void bfs_bu_step_privatized_without_remainders(
   int num_verts,
   int* overts,
@@ -1298,6 +1319,8 @@ __global__ void prop_distance_bfs_bu_step_privatized(
   }
 }
 
+
+
 __global__ void prop_distance_bfs_td_step_single_block(
   int num_verts, 
   int num_edges,
@@ -1429,16 +1452,105 @@ __global__ void prop_distance_bfs_td_step(
 } 
 
 
+// TODO: this kernel is not ready yet...
+// we need to record vert_lvlp when the steps are fused
+// I don't know how to do that yet
+__global__ void bfs_td_fused_steps_privatized_reindex(
+  int* ivs,
+  int* ies,
+  int* ovs,
+  int* reidx_map,
+  int* reordered_ovs,
+  int* queue,
+  int* ftr_beg,
+  int* ftr_end,
+  int* deps,
+  int* depths,
+  int curr_depth) {
+  // initialize privatized frontiers
+  __shared__ int s_curr_frontiers[S_FRONTIER_CAPACITY];
+
+  // shared counter to count fontiers in this block
+  __shared__ int s_num_curr_frontiers;
+  __shared__ int s_qsize;
+  if (threadIdx.x == 0) {
+    // let tid 0 initialize the counter
+    s_num_curr_frontiers = 0;
+    s_qsize = *ftr_end-*ftr_beg;
+  }
+  __syncthreads();
+
+  // perform BFS
+  // this kernel will be run only by one block
+  while (s_qsize <= blockDim.x && s_qsize > 0) {
+    if (threadIdx.x < s_qsize) {
+      const auto v = queue[*ftr_beg+threadIdx.x];
+      const auto e_beg = ivs[v];
+      const auto e_end = ivs[v+1];
+      for (int e = e_beg; e < e_end; e++) {
+        const auto neighbor = ies[e];
+       
+        // decrement the dependency counter for this neighbor
+        if (atomicSub(&deps[neighbor], 1) == 1) {
+          depths[neighbor] = curr_depth+1;
+          // we check if there's more space in the shared frontier storage
+          const auto s_curr_frontier_idx = atomicAdd(&s_num_curr_frontiers, 1);
+          if (s_curr_frontier_idx < S_FRONTIER_CAPACITY) {
+            // if we have space, store to the shared frontier storage
+            s_curr_frontiers[s_curr_frontier_idx] = neighbor;
+          }
+          else {
+            // if not, we have no choice but to store directly
+            // back to glob mem
+            s_num_curr_frontiers = S_FRONTIER_CAPACITY;
+            enqueue(neighbor, queue, ftr_end);
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // write the frontiers in smem back to glob mem
+    // calculate the index to start placing frontiers
+    // in the global queue
+    __shared__ int curr_frontier_beg;
+    if (threadIdx.x == 0) {
+      // let tid = 0 handle the calculation
+      curr_frontier_beg = atomicAdd(ftr_end, s_num_curr_frontiers);
+    }
+    __syncthreads();
+
+    // commit local frontiers to the global queue
+    // each thread will handle the frontiers in a strided fashion
+    // but consecutive threads write to consecutive locations
+    for (auto s_curr_frontier_idx = threadIdx.x; 
+        s_curr_frontier_idx < s_num_curr_frontiers; 
+        s_curr_frontier_idx += blockDim.x) {
+      auto curr_frontier_idx = curr_frontier_beg + s_curr_frontier_idx;
+      queue[curr_frontier_idx] = s_curr_frontiers[s_curr_frontier_idx]; 
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      // reset number of frontiers in smem
+      s_num_curr_frontiers = 0;
+
+      // update queue head
+      *ftr_beg += s_qsize;
+
+      // update queue size
+      s_qsize = *ftr_end-*ftr_beg;
+    }
+    __syncthreads();
+  } 
+}
+
 __global__ void bfs_td_step_privatized_reindex(
   int* ivs,
   int* ies,
   int* ovs,
-  int* oes,
-  float* owgts,
   int* reidx_map,
   int* reordered_ovs,
-  int* reordered_oes,
-  float* reordered_owgts,
   int* queue,
   int* ftr_beg,
   int* ftr_end,
@@ -1594,7 +1706,7 @@ __global__ void reorder_csr_e_oriented(
   float* reordered_owgts,
   int* reidx_map) {
   int tid = threadIdx.x + blockIdx.x*blockDim.x;
-  while (tid < num_edges) {
+  if (tid < num_edges) {
     
     // u: from, v: to
     // eid: the index of v in the adjncy list of u
@@ -1613,8 +1725,6 @@ __global__ void reorder_csr_e_oriented(
     // update the reordered edge and wgts
     reordered_oes[new_e_beg+eid] = new_v;
     reordered_owgts[new_e_beg+eid] = wgt;
-  
-    tid += blockDim.x*gridDim.x;
   }
 
 }
@@ -2546,7 +2656,9 @@ void CpGen::report_paths(
   float alpha,
   const int per_thread_work_items,
   bool enable_reindex_cpu,
-  bool enable_reindex_gpu) {
+  bool enable_reindex_gpu,
+  bool enable_fuse_steps,
+  bool enable_interm_perf_log) {
 
   // set cache configuration
   // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
@@ -2702,7 +2814,6 @@ void CpGen::report_paths(
     }
   }
 
-
 	Timer timer_cpg;
 	timer_cpg.start();
   if (pd_method == PropDistMethod::BASIC) { 
@@ -2740,16 +2851,15 @@ void CpGen::report_paths(
     auto num_curr_ftrs{num_sinks};
     _h_verts_lvlp.emplace_back(0);
 
-    // print_range("fanout_adjncy", fanout_adjncy.begin(), fanout_adjncy.end());
-    // print_range("inv_fanout_adjncy", inv_fanout_adjncy.begin(), inv_fanout_adjncy.end());
-
     Timer timer;
-    timer.start();
+
+    if (enable_interm_perf_log) {
+      timer.start();
+    }
     // levelize
     while (num_curr_ftrs) {
       // record the depth offset
       _h_verts_lvlp.emplace_back(_h_verts_lvlp.back()+num_curr_ftrs);
-      
       int num_blks = ROUNDUPBLOCKS(num_curr_ftrs, BLOCKSIZE);
       if (enable_reindex_gpu) {
         bfs_td_step_privatized_reindex
@@ -2757,12 +2867,8 @@ void CpGen::report_paths(
             d_fanin_adjp,
             d_fanin_adjncy,
             d_fanout_adjp,
-            d_fanout_adjncy,
-            d_fanout_wgts,
             d_reidx_map,
             d_reordered_fanout_adjp,
-            d_reordered_fanout_adjncy,
-            d_reordered_fanout_wgts,
             d_queue,
             _d_qhead,
             _d_qtail,
@@ -2788,22 +2894,32 @@ void CpGen::report_paths(
       num_curr_ftrs = _get_num_ftrs();
       curr_depth++;
     }
-    timer.stop();
-    std::cout << "================== runtime breakdown ==================\n";
-    std::cout << "levelize time=" << timer.get_elapsed_time()/1ms << " ms\n";
+    if (enable_interm_perf_log) {
+      timer.stop();
+      lvlize_time = timer.get_elapsed_time();
+      std::cout << "================== runtime breakdown ==================\n";
+      std::cout << "levelize time=" << lvlize_time/1ms << " ms\n";
+    }
 
     if (enable_reindex_gpu) {
-      timer.start();
+      if (enable_interm_perf_log) {
+        timer.start();
+      }
       thrust::inclusive_scan(
         thrust::device,
         reordered_fanout_adjp.begin(), 
         reordered_fanout_adjp.end(), 
         reordered_fanout_adjp.begin());
-      timer.stop();
-      std::cout << "prefix scan time=" << timer.get_elapsed_time()/1ms << " ms\n";
-    
-      timer.start();
-      int num_blks = ROUNDUPBLOCKS(M, BLOCKSIZE);
+      if (enable_interm_perf_log) {
+        timer.stop();
+        prefix_scan_time = timer.get_elapsed_time();
+        std::cout << "prefix scan time=" << prefix_scan_time/1ms << " ms\n";
+      }
+   
+      if (enable_interm_perf_log) {
+        timer.start();
+      }
+      // int num_blks = ROUNDUPBLOCKS(N, BLOCKSIZE);
       // reorder_csr_v_oriented
       //   <<<num_blks, BLOCKSIZE>>>(
       //     N,
@@ -2815,6 +2931,7 @@ void CpGen::report_paths(
       //     d_reordered_fanout_wgts,
       //     d_reidx_map);
       
+      int num_blks = ROUNDUPBLOCKS(M, BLOCKSIZE);
       reorder_csr_e_oriented
         <<<num_blks, BLOCKSIZE>>>(
           M,
@@ -2826,17 +2943,18 @@ void CpGen::report_paths(
           d_reordered_fanout_adjncy,
           d_reordered_fanout_wgts,
           d_reidx_map); 
-      
-      cudaDeviceSynchronize();
-      timer.stop();
-      std::cout << "reorder csr time=" << timer.get_elapsed_time()/1ms << " ms\n";
-      
+     
+      if (enable_interm_perf_log) {
+        cudaDeviceSynchronize();
+        timer.stop();
+        csr_reorder_time = timer.get_elapsed_time();
+        std::cout << "reorder csr time=" << csr_reorder_time/1ms << " ms\n";
+      }
       thrust::sequence(
         thrust::device,
         queue.begin(),
         queue.end());
     }
-
 
     // reindex on CPU
     if (enable_reindex_cpu) {
@@ -2866,39 +2984,150 @@ void CpGen::report_paths(
       std::cout << "h->d copy time=" << timer.get_elapsed_time()/1ms << " ms\n";
     }
 
+    const int total_depths = curr_depth;
     // relaxation
-    timer.start();
-    for (int d = 1; d < curr_depth; d++) {
-      const auto d_beg = _h_verts_lvlp[d];
-      const auto d_end = _h_verts_lvlp[d+1];
-      const auto d_size = d_end-d_beg;
-      int num_blks = ROUNDUPBLOCKS(d_size, BLOCKSIZE);
-      if (enable_reindex_gpu) {
-        relax_bu_step
-          <<<num_blks, BLOCKSIZE>>>(
-            d_reordered_fanout_adjp,
-            d_reordered_fanout_adjncy,
-            d_reordered_fanout_wgts,
-            d_dists_cache,
-            d_queue,
-            d_size,
-            d_beg);
-      }
-      else {
-        relax_bu_step
-          <<<num_blks, BLOCKSIZE>>>(
-            d_fanout_adjp,
-            d_fanout_adjncy,
-            d_fanout_wgts,
-            d_dists_cache,
-            d_queue,
-            d_size,
-            d_beg);
+    if (enable_interm_perf_log) {
+      timer.start();
+    }
+    if (enable_fuse_steps) {
+      thrust::device_vector<int> v_lvlp(_h_verts_lvlp);
+      auto d_v_lvlp = thrust::raw_pointer_cast(v_lvlp.data());
+      for (int d = 1; d < total_depths;) {
+        const auto d_beg = _h_verts_lvlp[d];
+        const auto d_end = _h_verts_lvlp[d+1];
+        const auto d_size = d_end-d_beg;
+        if (d_size < BLOCKSIZE) {
+          // look ahead to see how many consecutive steps
+          // we can fuse
+          int end_depth = d+1;
+          int next_d_size;
+          while (next_d_size = _h_verts_lvlp[end_depth+1]-_h_verts_lvlp[end_depth], 
+              next_d_size < BLOCKSIZE && end_depth < total_depths) {
+            end_depth++;
+          }
+          if (end_depth > d+1) {
+            // we can fuse the steps
+            if (enable_reindex_gpu) {
+              relax_bu_steps_fused
+                <<<1, BLOCKSIZE>>>(
+                  d_reordered_fanout_adjp,
+                  d_reordered_fanout_adjncy,
+                  d_reordered_fanout_wgts,
+                  d_dists_cache,
+                  d_queue,
+                  d_v_lvlp,
+                  d,
+                  end_depth,
+                  d_size,
+                  d_beg);
+            }
+            else {
+              relax_bu_steps_fused
+                <<<1, BLOCKSIZE>>>(
+                  d_fanout_adjp,
+                  d_fanout_adjncy,
+                  d_fanout_wgts,
+                  d_dists_cache,
+                  d_queue,
+                  d_v_lvlp,
+                  d,
+                  end_depth,
+                  d_size,
+                  d_beg);
+            }
+          }
+          else {
+            // only a single step has depth size < BLOCKSIZE
+            if (enable_reindex_gpu) {
+              relax_bu_step
+                <<<1, BLOCKSIZE>>>(
+                  d_reordered_fanout_adjp,
+                  d_reordered_fanout_adjncy,
+                  d_reordered_fanout_wgts,
+                  d_dists_cache,
+                  d_queue,
+                  d_size,
+                  d_beg);
+            }
+            else {
+              relax_bu_step
+                <<<1, BLOCKSIZE>>>(
+                  d_fanout_adjp,
+                  d_fanout_adjncy,
+                  d_fanout_wgts,
+                  d_dists_cache,
+                  d_queue,
+                  d_size,
+                  d_beg);
+            }
+          }
+          d = end_depth; 
+        }
+        else {
+          // need more than one block
+          int num_blks = ROUNDUPBLOCKS(d_size, BLOCKSIZE);
+          if (enable_reindex_gpu) {
+            relax_bu_step
+              <<<num_blks, BLOCKSIZE>>>(
+                d_reordered_fanout_adjp,
+                d_reordered_fanout_adjncy,
+                d_reordered_fanout_wgts,
+                d_dists_cache,
+                d_queue,
+                d_size,
+                d_beg);
+          }
+          else {
+            relax_bu_step
+              <<<num_blks, BLOCKSIZE>>>(
+                d_fanout_adjp,
+                d_fanout_adjncy,
+                d_fanout_wgts,
+                d_dists_cache,
+                d_queue,
+                d_size,
+                d_beg);
+          }
+          d++;
+        }
       }
     }
-    cudaDeviceSynchronize();
-    timer.stop();
-    std::cout << "relaxation time=" << timer.get_elapsed_time()/1ms << " ms\n";
+    else {
+      for (int d = 1; d < total_depths; d++) {
+        const auto d_beg = _h_verts_lvlp[d];
+        const auto d_end = _h_verts_lvlp[d+1];
+        const auto d_size = d_end-d_beg;
+        int num_blks = ROUNDUPBLOCKS(d_size, BLOCKSIZE);
+        if (enable_reindex_gpu) {
+          relax_bu_step
+            <<<num_blks, BLOCKSIZE>>>(
+              d_reordered_fanout_adjp,
+              d_reordered_fanout_adjncy,
+              d_reordered_fanout_wgts,
+              d_dists_cache,
+              d_queue,
+              d_size,
+              d_beg);
+        }
+        else {
+          relax_bu_step
+            <<<num_blks, BLOCKSIZE>>>(
+              d_fanout_adjp,
+              d_fanout_adjncy,
+              d_fanout_wgts,
+              d_dists_cache,
+              d_queue,
+              d_size,
+              d_beg);
+        }
+      }
+    }
+    if (enable_interm_perf_log) {
+      cudaDeviceSynchronize();
+      timer.stop();
+      relax_time = timer.get_elapsed_time();
+      std::cout << "relaxation time=" << relax_time/1ms << " ms\n";
+    }
   } 
   else if (pd_method == PropDistMethod::BFS_TD_RELAX_BU_PRIVATIZED) {
     int curr_depth{0};
@@ -3341,9 +3570,9 @@ void CpGen::report_paths(
     fanout_wgts = reordered_fanout_wgts;
 
     // update the host side storages too
-    thrust::copy(reordered_fanout_adjp.begin(), reordered_fanout_adjp.end(), _h_fanout_adjp.begin());
-    thrust::copy(reordered_fanout_adjncy.begin(), reordered_fanout_adjncy.end(), _h_fanout_adjncy.begin());
-    thrust::copy(reordered_fanout_wgts.begin(), reordered_fanout_wgts.end(), _h_fanout_wgts.begin());
+    // thrust::copy(reordered_fanout_adjp.begin(), reordered_fanout_adjp.end(), _h_fanout_adjp.begin());
+    // thrust::copy(reordered_fanout_adjncy.begin(), reordered_fanout_adjncy.end(), _h_fanout_adjncy.begin());
+    // thrust::copy(reordered_fanout_wgts.begin(), reordered_fanout_wgts.end(), _h_fanout_wgts.begin());
   
     // update srcs
     for (auto& src: _srcs) {
@@ -3738,10 +3967,10 @@ void CpGen::report_paths(
       return n.slack > h_split;
     };
 
-    // up-size long pile
+    
     long_pile_size = h_num_long_paths;
     long_pile.resize(long_pile_size);
-    d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
+    d_long_pile = thrust::raw_pointer_cast(long_pile.data());
 
     // update the tail of the long pile
     set_kernel<<<1, 1>>>(tail_long.get(), long_pile_size);
@@ -3762,7 +3991,7 @@ void CpGen::report_paths(
     // down-size short pile
     short_pile_size = h_num_short_paths;
     short_pile.resize(short_pile_size);
-    d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
+    d_short_pile = thrust::raw_pointer_cast(short_pile.data());
 
     // update the tail of the short pile
     set_kernel<<<1, 1>>>(tail_short.get(), short_pile_size);
@@ -3775,19 +4004,20 @@ void CpGen::report_paths(
 
     // initialize short/long path counts (host and device)
     h_num_short_paths = h_num_long_paths = 0;
-    auto num_long_paths = thrust::device_new<int>();
-    auto num_short_paths = thrust::device_new<int>();
-  
-    const int window_size_threshold = BLOCKSIZE/2;
+    int* d_num_long_paths;
+    int* d_num_short_paths;
+    cudaHostAlloc(&d_num_long_paths, sizeof(int), cudaHostAllocDefault);
+    cudaHostAlloc(&d_num_short_paths, sizeof(int), cudaHostAllocDefault);
+
     while (true) {
       // get current expansion window size
-      curr_expansion_window_size = h_window_end - h_window_start;
+      curr_expansion_window_size = h_window_end-h_window_start;
       
       // if expansion window size > 0, we have short paths to expand
       if (curr_expansion_window_size > 0) {
         // initialize number of long and short paths to 0
-        cudaMemset(num_long_paths.get(), 0, sizeof(int));
-        cudaMemset(num_short_paths.get(), 0, sizeof(int));
+        cudaMemset(d_num_long_paths, 0, sizeof(int));
+        cudaMemset(d_num_short_paths, 0, sizeof(int));
         
         // count the long paths and short paths
         // that we are about to generate
@@ -3801,30 +4031,29 @@ void CpGen::report_paths(
             d_short_pile,
             h_window_start,
             h_window_end,
-            num_long_paths.get(),
-            num_short_paths.get(),
+            d_num_long_paths,
+            d_num_short_paths,
             h_split);
         
         // resize the long pile and short pile
-        cudaMemcpy(&h_num_long_paths, num_long_paths.get(), sizeof(int),
+        cudaMemcpy(&h_num_long_paths, d_num_long_paths, sizeof(int),
             cudaMemcpyDeviceToHost);
      
-        cudaMemcpy(&h_num_short_paths, num_short_paths.get(), sizeof(int),
+        cudaMemcpy(&h_num_short_paths, d_num_short_paths, sizeof(int),
             cudaMemcpyDeviceToHost);
 
         // up-size long pile
         long_pile_size += h_num_long_paths;
         long_pile.resize(long_pile_size);
-        // !!! MUST re-obtain the raw pointer after every resize !!!
-        d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
+        d_long_pile = thrust::raw_pointer_cast(long_pile.data());
 
         // up-size short pile
         short_pile_size += h_num_short_paths;
         short_pile.resize(short_pile_size);
-        d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
-
+        d_short_pile = thrust::raw_pointer_cast(short_pile.data());
+        
         // run the actual expansion on the short pile
-        // assign paths to the short pile and long pile
+        // add paths to the short pile and long pile
         expand_short_pile
           <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>(
             d_fanout_adjp,
@@ -3839,7 +4068,7 @@ void CpGen::report_paths(
             tail_short.get(),
             tail_long.get(),
             h_split);
-      
+     
         // update window start and end
         h_window_start += curr_expansion_window_size;
         h_window_end += h_num_short_paths;
@@ -3861,7 +4090,7 @@ void CpGen::report_paths(
           break;
         }
         
-        while (h_num_short_paths < window_size_threshold) {
+        while (h_num_short_paths < EXP_WINDOW_SIZE_THRD) {
           // update the split value
           h_split *= 1.01f;
           
@@ -3869,7 +4098,7 @@ void CpGen::report_paths(
           // must be transferred to the short pile
           // we calculate the long path count
           // (the path count to be transferred can be calculated too)
-          cudaMemset(num_long_paths.get(), 0, sizeof(int));
+          cudaMemset(d_num_long_paths, 0, sizeof(int));
          
           // count the paths that have slacks larger than split
           h_num_long_paths = 
@@ -3918,11 +4147,273 @@ void CpGen::report_paths(
       steps++;
     }
 
-    thrust::device_free(num_long_paths);
-    thrust::device_free(num_short_paths);
+    cudaFree(d_num_long_paths);
+    cudaFree(d_num_short_paths);
     thrust::device_free(tail_long);
     thrust::device_free(tail_short);
-    // std::cout << "short-long expansion executed " << steps << " steps.\n";
+    std::cout << "short-long expansion executed " << steps << " steps.\n";
+  }
+  else if (pe_method == PfxtExpMethod::LONG_PILE_ON_HOST) {
+    // TODO: this is just too slow.. 
+    // copying data back and forth between device and host
+    thrust::host_vector<PfxtNode> host_long_pile;
+    
+    // sort the initial paths by slack (use a tmp storage, don't affect the original path storage)
+    thrust::host_vector<PfxtNode> tmp_paths(short_pile); 
+    thrust::sort(tmp_paths.begin(), tmp_paths.end(), pfxt_node_comp());
+    
+    // determine the initial split by picking the slack at the top N percentile
+    // (default=0.005 --> top 0.5%)
+    auto h_split = tmp_paths[short_pile_size*init_split_perc].slack;   
+    // std::cout << "init_split=" << h_split << '\n';
+
+    // count the slacks that are greater/less equal to the split value
+    int h_num_short_paths = short_pile_size*init_split_perc+1;
+    int h_num_long_paths = short_pile_size-h_num_short_paths;
+
+    // !!!! note that the short pile still has a mix of long/short paths
+    // at this point, so we split the paths into short and long piles now
+    // we can use stream compaction to move the long paths to the long pile 
+    auto is_long_path = [h_split] __host__ __device__ (const PfxtNode& n) {
+      return n.slack > h_split;
+    };
+    
+    host_long_pile.resize(h_num_long_paths);
+    long_pile.resize(h_num_long_paths);
+    // update the tail of the long pile
+    // set_kernel<<<1, 1>>>(tail_long.get(), long_pile_size);
+
+    // copy the long paths from the short pile to the long pile
+    thrust::copy_if(
+      short_pile.begin(), 
+      short_pile.end(), 
+      long_pile.begin(),
+      is_long_path);
+
+    // save the long paths to the host long pile
+    thrust::copy(
+      long_pile.begin(), 
+      long_pile.end(), 
+      host_long_pile.begin()
+    );
+
+    // now we clear the device long pile
+    long_pile.clear();
+    thrust::device_vector<PfxtNode>().swap(long_pile);
+
+    // remove the long paths from the short pile
+    thrust::remove_if(
+      short_pile.begin(), 
+      short_pile.end(), 
+      is_long_path);
+
+    // down-size short pile
+    short_pile_size = h_num_short_paths;
+    short_pile.resize(short_pile_size);
+    d_short_pile = thrust::raw_pointer_cast(short_pile.data());
+
+    // update the tail of the short pile
+    set_kernel<<<1, 1>>>(tail_short.get(), short_pile_size);
+
+    // initialize the expansion window
+    int h_window_start{0}, h_window_end{short_pile_size};
+
+    // to count how many steps we took to generate enough paths
+    int steps{0};
+
+    // initialize short/long path counts (host and device)
+    h_num_short_paths = h_num_long_paths = 0;
+    int* d_num_long_paths;
+    int* d_num_short_paths;
+    cudaHostAlloc(&d_num_long_paths, sizeof(int), cudaHostAllocDefault);
+    cudaHostAlloc(&d_num_short_paths, sizeof(int), cudaHostAllocDefault);
+
+    while (true) {
+      // get current expansion window size
+      curr_expansion_window_size = h_window_end-h_window_start;
+      
+      // if expansion window size > 0, we have short paths to expand
+      if (curr_expansion_window_size > 0) {
+        // initialize number of long and short paths to 0
+        cudaMemset(d_num_long_paths, 0, sizeof(int));
+        cudaMemset(d_num_short_paths, 0, sizeof(int));
+        
+        // count the long paths and short paths
+        // that we are about to generate
+        compute_long_path_counts
+          <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>(
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_succs,
+            d_dists_cache,
+            d_short_pile,
+            h_window_start,
+            h_window_end,
+            d_num_long_paths,
+            d_num_short_paths,
+            h_split);
+        
+        // resize the long pile and short pile
+        cudaMemcpy(&h_num_long_paths, d_num_long_paths, sizeof(int),
+            cudaMemcpyDeviceToHost);
+     
+        cudaMemcpy(&h_num_short_paths, d_num_short_paths, sizeof(int),
+            cudaMemcpyDeviceToHost);
+
+        // up-size long pile
+        // long_pile_size += h_num_long_paths;
+        long_pile.resize(h_num_long_paths);
+        d_long_pile = thrust::raw_pointer_cast(long_pile.data());
+
+        // up-size short pile
+        short_pile_size += h_num_short_paths;
+        short_pile.resize(short_pile_size);
+        d_short_pile = thrust::raw_pointer_cast(short_pile.data());
+        
+        // run the actual expansion on the short pile
+        // add paths to the short pile and long pile
+        expand_short_pile
+          <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>(
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_succs,
+            d_dists_cache,
+            d_short_pile,
+            d_long_pile,
+            h_window_start,
+            h_window_end,
+            tail_short.get(),
+            tail_long.get(),
+            h_split);
+            
+        // up-size the cpu long pile storage
+        int old_size = host_long_pile.size();
+        host_long_pile.resize(old_size+h_num_long_paths);
+        
+        // save the long paths to the host
+        thrust::copy(
+          long_pile.begin(), 
+          long_pile.end(),
+          host_long_pile.begin()+old_size);
+
+        // now we can clear the long pile on device
+        long_pile.clear();
+        thrust::device_vector<PfxtNode>().swap(long_pile);
+
+        // reset the device long pile tail
+        set_kernel<<<1, 1>>>(tail_long.get(), 0);
+
+        // update window start and end
+        h_window_start += curr_expansion_window_size;
+        h_window_end += h_num_short_paths;
+      }
+      else {
+        // there's no more paths from the short pile
+        // to expand, we have to update the split value
+        // and move paths from the long pile to the short pile
+
+        // if there's no more paths in the long pile
+        // we can terminate the loop
+        if (host_long_pile.size() == 0) {
+          // if the host long pile is empty, we can terminate
+          std::cout << "terminating early, no more long paths left.\n";
+          break;
+        }
+        
+        // if (long_pile_size == 0) {
+        //   break;
+        // }
+
+        // if we already have enough paths in the short pile
+        // we can terminate
+        if (short_pile_size >= k) {
+          break;
+        }
+        
+        while (h_num_short_paths < BLOCKSIZE*2) {
+          // update the split value
+          h_split *= 1.1f;
+          
+          // now some paths in the long pile
+          // must be transferred to the short pile
+          // we calculate the long path count
+          // (the path count to be transferred can be calculated too)
+          // cudaMemset(d_num_long_paths, 0, sizeof(int));
+         
+          // count the paths that have slacks larger than split
+          h_num_long_paths = 
+            thrust::count_if(host_long_pile.begin(), host_long_pile.end(),
+              [h_split] __host__ __device__ (const PfxtNode& n) {
+                return n.slack > h_split;
+              });
+
+          h_num_short_paths = host_long_pile.size()-h_num_long_paths;
+        }
+
+        // up-size the short pile
+        short_pile_size += h_num_short_paths;
+        short_pile.resize(short_pile_size);
+        d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
+        
+        auto is_short_path = 
+          [h_split] __host__ __device__ (const PfxtNode& n) {
+            return n.slack <= h_split;
+          };
+
+        // add the short paths in the long pile to the short pile
+        // since this is a transfer of data between host and device
+        // we will need to compact the data on host and copy them
+        // to the short pile on device
+        thrust::host_vector<PfxtNode> short_paths_to_copy_to_device;
+        short_paths_to_copy_to_device.resize(h_num_short_paths);
+
+        thrust::copy_if(
+          host_long_pile.begin(), 
+          host_long_pile.end(),
+          short_paths_to_copy_to_device.begin(), 
+          is_short_path);
+        
+        // run stream compaction to remove the short paths
+        // in the long pile
+        thrust::remove_if(
+          host_long_pile.begin(), 
+          host_long_pile.end(), 
+          is_short_path);
+        
+        // down-size the long pile
+        host_long_pile.resize(h_num_long_paths);
+        
+        // now copy the short paths from the host to the device
+        thrust::copy(
+          short_paths_to_copy_to_device.begin(), 
+          short_paths_to_copy_to_device.end(),
+          short_pile.begin()+h_window_end);
+        
+        // update the expansion window end
+        // (window start stays the same)
+        h_window_end += h_num_short_paths;
+        
+        // update the tail of the short pile
+        set_kernel<<<1, 1>>>(tail_short.get(), short_pile_size);
+
+        
+        // long_pile_size = h_num_long_paths;
+        // long_pile.resize(long_pile_size);
+        // d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
+
+        // update the tail of the long pile
+        // set_kernel<<<1, 1>>>(tail_long.get(), long_pile_size);
+      }
+      steps++;
+    }
+
+    cudaFree(d_num_long_paths);
+    cudaFree(d_num_short_paths);
+    thrust::device_free(tail_long);
+    thrust::device_free(tail_short);
+    std::cout << "short-long expansion executed " << steps << " steps.\n";
   }
   else if (pe_method == PfxtExpMethod::SEQUENTIAL) {
     
@@ -4205,15 +4696,6 @@ int CpGen::_get_num_ftrs() {
   // printf("_get_queue_size head = %d, tail = %d, q_sz = %d\n", _h_qhead, _h_qtail, num_ftrs);
   return num_ftrs;
 }
-
-int CpGen::_get_expansion_window_size(int* p_start, int* p_end) {
-  int start, end;
-  cudaMemcpy(&start, p_start, sizeof(int), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&end, p_end, sizeof(int), cudaMemcpyDeviceToHost);
-  int size = end - start;
-  return size;
-}
-
 
 //void CpGen::bfs_hybrid(
 //    const float alpha, 
