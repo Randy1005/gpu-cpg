@@ -37,7 +37,6 @@ enum class PfxtExpMethod {
   PRECOMP_SPURS,
   ATOMIC_ENQ,
   SHORT_LONG,
-  LONG_PILE_ON_HOST,
   SEQUENTIAL
 };
 
@@ -82,6 +81,9 @@ struct pfxt_node_comp {
     return a.slack < b.slack;
   }
 };
+
+
+
 
 class CpGen {  
 public:
@@ -183,7 +185,19 @@ public:
       }
     }
 
+    // reset expansion steps
+    short_long_expansion_steps = 0;
   }
+
+  float compute_split_inc_amount(float avg_deg) {
+    const float min = 0.1f;
+    const float max = 10.0f;
+    const float d0 = 3.0f;
+    const float k = 0.8f;
+    float res = min+(max-min)/(1+std::exp(k*(avg_deg-d0)));
+    return res;
+  }
+
 
   std::chrono::duration<double, std::micro> prop_time;
   std::chrono::duration<double, std::micro> expand_time;
@@ -191,6 +205,9 @@ public:
   std::chrono::duration<double, std::micro> prefix_scan_time;
   std::chrono::duration<double, std::micro> csr_reorder_time;
   std::chrono::duration<double, std::micro> relax_time;
+
+  size_t short_long_expansion_steps{0};
+
 private:
   void _free();
  
