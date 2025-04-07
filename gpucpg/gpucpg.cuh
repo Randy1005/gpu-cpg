@@ -141,8 +141,7 @@ public:
     bool enable_reindex_cpu = false,
     bool enable_reindex_gpu = false,
     bool enable_fuse_steps = false,
-    bool enable_interm_perf_log = false,
-    const float long_short_ratio_upper_bnd = 100.0f); // enables runtime log on intermidiate steps (csr_reorder, etc.)
+    bool enable_interm_perf_log = false); // enables runtime log on intermidiate steps (csr_reorder, etc.)
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
