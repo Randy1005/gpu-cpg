@@ -2723,7 +2723,8 @@ void CpGen::report_paths(
   bool enable_reindex_cpu,
   bool enable_reindex_gpu,
   bool enable_fuse_steps,
-  bool enable_interm_perf_log) {
+  bool enable_interm_perf_log,
+  const float long_short_ratio_upper_bnd) {
 
   // set cache configuration
   // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
@@ -4018,19 +4019,21 @@ void CpGen::report_paths(
     
     // determine the initial split by picking the slack at the top N percentile
     // (default=0.005 --> top 0.5%)
-    auto h_split = tmp_paths[short_pile_size*init_split_perc].slack;  
-    // std::cout << "init_split=" << h_split << '\n';
+    auto h_split = tmp_paths[init_split_perc*short_pile_size].slack;  
+    std::cout << "init_split=" << h_split << '\n';
 
-    // count the slacks that are greater/less equal to the split value
-    int h_num_short_paths = short_pile_size*init_split_perc+1;
+    int h_num_short_paths = init_split_perc*short_pile_size+1;
     int h_num_long_paths = short_pile_size-h_num_short_paths;
 
-    // !!!! note that the short pile still has a mix of long/short paths
-    // at this point, so we split the paths into short and long piles now
-    // we can use stream compaction to move the long paths to the long pile 
-    auto is_long_path = [h_split] __host__ __device__ (const PfxtNode& n) {
-      return n.slack > h_split;
-    };
+    // auto is_long_path = 
+    //   [h_split] __host__ __device__ (const PfxtNode& n) {
+    //     return n.slack > h_split;
+    //   };
+
+    // auto is_short_path = 
+    //   [h_split] __host__ __device__ (const PfxtNode& n) {
+    //     return n.slack <= h_split;
+    //   };
 
     long_pile_size = h_num_long_paths;
     long_pile.resize(long_pile_size);
@@ -4044,13 +4047,17 @@ void CpGen::report_paths(
       short_pile.begin(), 
       short_pile.end(), 
       long_pile.begin(),
-      is_long_path);
+      [h_split] __host__ __device__ (const PfxtNode& n) {
+        return n.slack > h_split;
+      });
     
     // remove the long paths from the short pile
     thrust::remove_if(
       short_pile.begin(), 
       short_pile.end(), 
-      is_long_path);
+      [h_split] __host__ __device__ (const PfxtNode& n) {
+        return n.slack > h_split;
+      });
 
     // down-size short pile
     short_pile_size = h_num_short_paths;
@@ -4072,15 +4079,22 @@ void CpGen::report_paths(
 
     size_t free_mem, total_mem;
     float split_inc_amount = compute_split_inc_amount((float)M/N);
+    std::cout << "init_short_pile_size=" << short_pile_size 
+              << ", init_long_pile_size=" << long_pile_size << '\n';
     std::cout << "split_inc_amount=" << split_inc_amount << '\n';
 
     int window_size_threshold{BLOCKSIZE};
+    float curr_long_short_ratio;
+    bool long_pile_too_large{false};
+    const float long_pile_size_limit_in_bytes = 1e10;
     while (true) {
       // get current expansion window size
       curr_expansion_window_size = h_window_end-h_window_start;
       
       // if expansion window size > 0, we have short paths to expand
       if (curr_expansion_window_size > 0) {
+        int num_blks = ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE);
+        
         // initialize number of long and short paths to 0
         cudaMemset(d_num_long_paths, 0, sizeof(int));
         cudaMemset(d_num_short_paths, 0, sizeof(int));
@@ -4088,7 +4102,7 @@ void CpGen::report_paths(
         // count the long paths and short paths
         // that we are about to generate
         compute_long_path_counts
-          <<<ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE), BLOCKSIZE>>>(
+          <<<num_blks, BLOCKSIZE>>>(
             d_fanout_adjp,
             d_fanout_adjncy,
             d_fanout_wgts,
@@ -4102,22 +4116,25 @@ void CpGen::report_paths(
             h_split);
         
         cudaMemcpy(&h_num_long_paths, d_num_long_paths, sizeof(int),
-            cudaMemcpyDeviceToHost);
-     
+          cudaMemcpyDeviceToHost);
         cudaMemcpy(&h_num_short_paths, d_num_short_paths, sizeof(int),
-            cudaMemcpyDeviceToHost);
-       
+          cudaMemcpyDeviceToHost);
+      
+        if (sizeof(PfxtNode)*(long_pile_size+h_num_long_paths) > long_pile_size_limit_in_bytes) {
+          long_pile_too_large = true;
+          std::cout << "long pile will exceed 10 GB. Don't add long paths anymore.\n";
+        }
+        
         // up-size short pile
         short_pile_size += h_num_short_paths;
-        // std::cout << "short_pile_size=" << short_pile_size <<
-        //   " (added " << h_num_short_paths << " short paths)\n";
+        std::cout << "expanding...short_pile_size=" << short_pile_size <<
+          " (added " << h_num_short_paths << " short paths)\n";
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(short_pile.data());
         
-        int num_blks = ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE);
-        if (short_pile_size >= k) {
+        if (short_pile_size >= k || long_pile_too_large) {
           // can free up the long pile
-          if (long_pile_size > 0) {
+          if (long_pile_size > 0 && short_pile_size >= k) {
             // cudaMemGetInfo(&free_mem, &total_mem);
             // std::cout << "free mem before long pile clear=" << free_mem/1e9 << " GB.\n";
             long_pile.clear();
@@ -4145,8 +4162,8 @@ void CpGen::report_paths(
           // we need to update the split value and gather paths from
           // the long pile to expand
           long_pile_size += h_num_long_paths;
-          // std::cout << "long_pile_size=" << long_pile_size <<
-          //   " (added " << h_num_long_paths << " long paths)\n";
+          std::cout << "expanding...long_pile_size=" << long_pile_size <<
+            " (added " << h_num_long_paths << " long paths)\n";
           long_pile.resize(long_pile_size);
           d_long_pile = thrust::raw_pointer_cast(long_pile.data());
 
@@ -4169,6 +4186,10 @@ void CpGen::report_paths(
         // update window start and end
         h_window_start += curr_expansion_window_size;
         h_window_end = short_pile_size;
+        
+
+        // curr_long_short_ratio = (float)long_pile_size/short_pile_size;
+        // std::cout << "curr_long_short_ratio=" << curr_long_short_ratio << '\n';
       }
       else {
         // there's no more paths from the short pile
@@ -4195,46 +4216,45 @@ void CpGen::report_paths(
           // must be transferred to the short pile
           // we calculate the long path count
           // (the path count to be transferred can be calculated too)
-          cudaMemset(d_num_long_paths, 0, sizeof(int));
-         
-          // count the paths that have slacks larger than split
           h_num_long_paths = 
-            thrust::count_if(long_pile.begin(), long_pile.end(),
-              [h_split] __host__ __device__ (const PfxtNode& n) {
+            thrust::count_if(
+              long_pile.begin(), 
+              long_pile.end(),
+              [h_split]__host__ __device__ (const PfxtNode& n) {
                 return n.slack > h_split;
               });
 
           h_num_short_paths = long_pile_size-h_num_long_paths;
+          // curr_long_short_ratio = 
+          //   (float)h_num_long_paths/(short_pile_size+h_num_short_paths);
         }
 
+        std::cout << "updated split=" << h_split << '\n';
         // increase the split increment amount
-        // and window size threshold to expand the short
-        // pile faster to avoid accumulating 
-        // too many long paths in the long pile
-        split_inc_amount *= 2.0f;
+        // and window size threshold to expand
+        // the short pile faster
+        // split_inc_amount *= 1.5f;
         window_size_threshold *= 8.0f;
 
-        // std::cout << "updated split=" << h_split << '\n';
+        // std::cout << "### long-short ratio after split update=" << curr_long_short_ratio << " ###\n"; 
 
         // up-size the short pile
         short_pile_size += h_num_short_paths;
-        // std::cout << "short_pile_size (after split update)=" 
-        //   << short_pile_size << 
-        //   " (added " << h_num_short_paths << " short paths)\n";
+        std::cout << "short_pile_size (after split update)=" 
+          << short_pile_size << 
+          " (added " << h_num_short_paths << " short paths)\n";
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(short_pile.data());
 
-        auto is_short_path = 
-          [h_split] __host__ __device__ (const PfxtNode& n) {
-            return n.slack <= h_split;
-          };
 
         // add the short paths in the long pile to the short pile
         thrust::copy_if(
           long_pile.begin(), 
           long_pile.end(),
           short_pile.begin()+h_window_end, 
-          is_short_path);
+          [h_split]__host__ __device__ (const PfxtNode& n) {
+            return n.slack <= h_split;
+          });
 
         // update the expansion window end
         // (window start stays the same)
@@ -4243,27 +4263,38 @@ void CpGen::report_paths(
         // update the tail of the short pile
         set_kernel<<<1, 1>>>(tail_short.get(), short_pile_size);
 
-
         if (short_pile_size >= k) {
           if (long_pile_size > 0) {
             // clear the long pile if we have enough short paths
             long_pile.clear();
             thrust::device_vector<PfxtNode>().swap(long_pile);
             long_pile_size = 0;
+            long_pile_too_large = false;
           }
         }
         else {
-        
           // run stream compaction to remove the short paths
           // in the long pile
-          thrust::remove_if(long_pile.begin(), long_pile.end(), is_short_path);
+          thrust::remove_if(
+            long_pile.begin(), 
+            long_pile.end(), 
+            [h_split]__host__ __device__ (const PfxtNode& n) {
+              return n.slack <= h_split; 
+            });
+
           // down-size the long pile
           long_pile_size = h_num_long_paths;
-          // std::cout << "long_pile_size (after split update)=" 
-          //   << long_pile_size << '\n';
+          std::cout << "long_pile_size (after split update)=" 
+            << long_pile_size << '\n';
 
           // long_pile.resize(long_pile_size);
           // d_long_pile = thrust::raw_pointer_cast(long_pile.data());
+
+          if (sizeof(PfxtNode)*long_pile_size <= long_pile_size_limit_in_bytes 
+            && long_pile_too_large) {
+            long_pile_too_large = false;
+            std::cout << "long pile is under limit, can add long paths again.\n";
+          }
 
           // update the tail of the long pile
           set_kernel<<<1, 1>>>(tail_long.get(), long_pile_size);
@@ -4373,7 +4404,6 @@ void CpGen::report_paths(
     thrust::sort(short_pile.begin(), short_pile.end(), pfxt_node_comp());
     thrust::copy(short_pile.begin(), short_pile.end(), _h_pfxt_nodes.begin());
   }
-
 
   // free gpu memory
   cudaFree(next_ftr_tail);

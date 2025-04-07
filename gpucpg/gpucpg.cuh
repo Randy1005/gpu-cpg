@@ -141,7 +141,8 @@ public:
     bool enable_reindex_cpu = false,
     bool enable_reindex_gpu = false,
     bool enable_fuse_steps = false,
-    bool enable_interm_perf_log = false); // enables runtime log on intermidiate steps (csr_reorder, etc.)
+    bool enable_interm_perf_log = false,
+    const float long_short_ratio_upper_bnd = 100.0f); // enables runtime log on intermidiate steps (csr_reorder, etc.)
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
@@ -191,7 +192,7 @@ public:
 
   float compute_split_inc_amount(float avg_deg) {
     const float min = 0.1f;
-    const float max = 10.0f;
+    const float max = 100.0f;
     const float d0 = 3.0f;
     const float k = 0.8f;
     float res = min+(max-min)/(1+std::exp(k*(avg_deg-d0)));
