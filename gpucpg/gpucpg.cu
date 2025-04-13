@@ -2171,7 +2171,7 @@ __global__ void update_successors_bu(
   }
 }
 
-__global__ void compute_long_path_counts(
+__global__ void compute_short_long_path_counts(
   int* verts,
   int* edges,
   float* wgts,
@@ -2183,8 +2183,8 @@ __global__ void compute_long_path_counts(
   int* num_long_paths,
   int* num_short_paths,
   float split) {
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  const auto node_idx = tid + window_start;
+  int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  const auto node_idx = tid+window_start;
   
   __shared__ int s_num_long_paths;
   __shared__ int s_num_short_paths;
@@ -2216,7 +2216,6 @@ __global__ void compute_long_path_counts(
           slack+dist_neighbor+wgt-dist_v;
 
         if (new_path_slack > split) {
-          //printf("slack=%f, > split=%f\n", new_path_slack, *split);
           atomicAdd(&s_num_long_paths, 1);
         }
         else {
@@ -2237,6 +2236,74 @@ __global__ void compute_long_path_counts(
     atomicAdd(num_short_paths, s_num_short_paths);
   }
 }
+
+__global__ void compute_short_long_path_counts(
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* succs,
+  int* dists,
+  PfxtNode* short_pile,
+  int window_start,
+  int window_end,
+  int* num_long_paths,
+  int* num_short_paths,
+  float split,
+  float final_split) {
+  int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  const auto node_idx = tid+window_start;
+  
+  __shared__ int s_num_long_paths;
+  __shared__ int s_num_short_paths;
+  if (threadIdx.x == 0) {
+    s_num_long_paths = 0;
+    s_num_short_paths = 0;
+  }
+  __syncthreads();
+
+  if (node_idx < window_end) {
+    auto v = short_pile[node_idx].to;
+    auto slack = short_pile[node_idx].slack;
+    while (v != -1) {
+      auto edge_start = verts[v];
+      auto edge_end = verts[v+1];
+
+      for (auto eid = edge_start; eid < edge_end; eid++) {
+        // calculate the slack of each spurred path
+        // to determine if that path belongs to the
+        // long pile or not
+        auto neighbor = edges[eid];
+        if (neighbor == succs[v]) {
+          continue;
+        }
+        auto wgt = wgts[eid];
+        auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+        auto dist_v = (float)dists[v]/SCALE_UP;
+        auto new_path_slack = 
+          slack+dist_neighbor+wgt-dist_v;
+
+        if (new_path_slack <= split) {
+          atomicAdd(&s_num_short_paths, 1);
+        }
+        else if (new_path_slack > split && new_path_slack <= final_split) {
+          atomicAdd(&s_num_long_paths, 1);
+        }
+      }
+
+      // traverse to next successor
+      v = succs[v];
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    // accumulate local long paths to global
+    //printf("block %d has %d long paths\n", blockIdx.x, s_num_long_paths);
+    atomicAdd(num_long_paths, s_num_long_paths);
+    atomicAdd(num_short_paths, s_num_short_paths);
+  }
+}
+
 
 
 __global__ void compute_path_counts(
@@ -2646,7 +2713,6 @@ __global__ void expand_short_pile(
 }
 
 // TODO: cache local pfxt nodes with shared memory
-
 // this version is used if we know for sure
 // we will have enough short paths and storing long paths is just
 // gonna exhaust the GPU memory
@@ -2661,6 +2727,61 @@ __global__ void expand_short_pile_skip_long_paths(
   int window_end,
   int* curr_tail_short,
   float split) {
+  int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  const auto node_idx = tid+window_start;
+  
+  if (node_idx < window_end) {
+    auto v = short_pile[node_idx].to;
+    auto level = short_pile[node_idx].level;
+    auto slack = short_pile[node_idx].slack;
+    while (v != -1) {
+      auto edge_start = verts[v];
+      auto edge_end = verts[v+1];
+      for (auto eid = edge_start; eid < edge_end; eid++) {
+        auto neighbor = edges[eid];
+        if (neighbor == succs[v]) {
+          continue;
+        }
+        
+        auto wgt = wgts[eid];
+        auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+        auto dist_v = (float)dists[v]/SCALE_UP;
+        auto new_slack = 
+          slack+dist_neighbor+wgt-dist_v;
+
+        if (new_slack <= split) {
+          // this path belongs to the short pile
+          auto new_node_idx = atomicAdd(curr_tail_short, 1);
+          //printf("new idx (short)=%d\n", new_node_idx);
+          auto& new_path = short_pile[new_node_idx];
+          new_path.level = level+1;
+          new_path.from = v;
+          new_path.to = neighbor;
+          new_path.parent = node_idx;
+          new_path.num_children = 0;
+          new_path.slack = new_slack;
+        }
+      }
+      // traverse to next successor
+      v = succs[v];
+    }
+  }
+}
+
+__global__ void expand_short_pile_update_final_window(
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* succs,
+  int* dists,
+  PfxtNode* short_pile,
+  PfxtNode* final_window,
+  int window_start,
+  int window_end,
+  int* curr_tail_short,
+  int* curr_final_wd_tail,
+  float split,
+  float final_split) {
   int tid = threadIdx.x+blockIdx.x*blockDim.x;
   const auto node_idx = tid+window_start;
   
@@ -2687,9 +2808,7 @@ __global__ void expand_short_pile_skip_long_paths(
           slack+dist_neighbor+wgt-dist_v;
 
         if (new_slack <= split) {
-          // this path belongs to the short pile
           auto new_node_idx = atomicAdd(curr_tail_short, 1);
-          //printf("new idx (short)=%d\n", new_node_idx);
           auto& new_path = short_pile[new_node_idx];
           new_path.level = level+1;
           new_path.from = v;
@@ -2698,8 +2817,15 @@ __global__ void expand_short_pile_skip_long_paths(
           new_path.num_children = 0;
           new_path.slack = new_slack;
         }
-        else {
-          continue;  
+        else if (new_slack > split && new_slack <= final_split) {
+          auto new_node_idx = atomicAdd(curr_final_wd_tail, 1);
+          auto& new_path = final_window[new_node_idx];
+          new_path.level = level+1;
+          new_path.from = v;
+          new_path.to = neighbor;
+          new_path.parent = node_idx;
+          new_path.num_children = 0;
+          new_path.slack = new_slack; 
         }
       }
       // traverse to next successor
@@ -2707,6 +2833,7 @@ __global__ void expand_short_pile_skip_long_paths(
     }
   }
 }
+
 
 
 
@@ -3728,6 +3855,8 @@ void CpGen::report_paths(
   thrust::fill(tail_short, tail_short+1, 0);
   auto tail_long = thrust::device_new<int>();
   thrust::fill(tail_long, tail_long+1, 0);
+  auto tail_final_window = thrust::device_new<int>();
+  thrust::fill(tail_final_window, tail_final_window+1, 0);
 
 	timer_cpg.start();
   if (pe_method == PfxtExpMethod::BASIC) {
@@ -4098,12 +4227,15 @@ void CpGen::report_paths(
               << ", init_long_pile_size=" << long_pile_size << '\n';
     std::cout << "split_inc_amount=" << split_inc_amount << '\n';
 
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+
+
     // int window_size_threshold{BLOCKSIZE};
     const float long_pile_size_limit_in_bytes = 6e9;
     bool split_inc_should_slow_down{false};
-    thrust::device_vector<PfxtNode> final_window;
-    int final_window_size = 0;
-    float final_split;
+    int final_window_size{0};
+    float final_split{std::numeric_limits<float>::max()};
     while (true) {
       // get current expansion window size
       curr_expansion_window_size = h_window_end-h_window_start;
@@ -4118,7 +4250,7 @@ void CpGen::report_paths(
         
         // count the long paths and short paths
         // that we are about to generate
-        compute_long_path_counts
+        compute_short_long_path_counts
           <<<num_blks, BLOCKSIZE>>>(
             d_fanout_adjp,
             d_fanout_adjncy,
@@ -4155,21 +4287,19 @@ void CpGen::report_paths(
           }
           std::cout << "final split is " << final_split << '\n';
           std::cout << "final_window_size=" << final_window_size << '\n';
-          // copy all the short paths to the final window
-          final_window.resize(final_window_size);
-          thrust::copy_if(
+          
+          thrust::remove_if(
             long_pile.begin(), 
             long_pile.end(), 
-            final_window.begin(),
             [final_split] __host__ __device__ (const PfxtNode& n) {
-              return n.slack <= final_split;
+              return n.slack > final_split;
             });
 
-          // clear long pile
-          long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
-          long_pile_size = 0;
-          set_kernel<<<1, 1>>>(tail_long.get(), 0);
+          long_pile.resize(final_window_size);
+          long_pile.shrink_to_fit();
+          long_pile_size = final_window_size;
+          d_long_pile = thrust::raw_pointer_cast(long_pile.data());
+          set_kernel<<<1, 1>>>(tail_long.get(), final_window_size);
         }
 
         // up-size short pile
@@ -4179,17 +4309,13 @@ void CpGen::report_paths(
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(short_pile.data());
         
-        if (short_pile_size >= k || final_window_size > 0) {
+        if (short_pile_size >= k) {
           // can free up the long pile if we have enough short paths
           if (long_pile_size > 0) {
             long_pile.clear();
             thrust::device_vector<PfxtNode>().swap(long_pile);
             long_pile_size = 0;
           }
-
-          // TODO: write a kernel to put slack between h_split and final_split
-          // into the final window
-          // expand_short_pile_update_final_window<<<...>>>()
 
           // expand short pile but don't store long paths
           expand_short_pile_skip_long_paths
@@ -4206,55 +4332,100 @@ void CpGen::report_paths(
               h_split); 
         }
         else {
-          // if we still don't have enough paths in the short pile
-          // we will need to store long paths in case that we
-          // we need to update the split value and gather paths from
-          // the long pile to expand
+          // re-calculate short and long path counts 
+          cudaMemset(d_num_long_paths, 0, sizeof(int));
+          cudaMemset(d_num_short_paths, 0, sizeof(int));
+          
+          if (final_window_size > 0) {
+            // if we already prefetched the final window
+            // we know indeed the final split is determined
+            // we only need to store long paths that have slack
+            // between h_split and final_split
+            compute_short_long_path_counts
+              <<<num_blks, BLOCKSIZE>>>(
+                d_fanout_adjp,
+                d_fanout_adjncy,
+                d_fanout_wgts,
+                d_succs,
+                d_dists_cache,
+                d_short_pile,
+                h_window_start,
+                h_window_end,
+                d_num_long_paths,
+                d_num_short_paths,
+                h_split,
+                final_split);
+
+            cudaMemcpy(&h_num_long_paths, d_num_long_paths, sizeof(int),
+              cudaMemcpyDeviceToHost);
+            cudaMemcpy(&h_num_short_paths, d_num_short_paths, sizeof(int),
+              cudaMemcpyDeviceToHost);
+          }
+
           long_pile_size += h_num_long_paths;
           std::cout << "expanding...long_pile_size=" << long_pile_size <<
             " (added " << h_num_long_paths << " long paths)\n";
           long_pile.resize(long_pile_size);
           d_long_pile = thrust::raw_pointer_cast(long_pile.data());
 
-          expand_short_pile
-            <<<num_blks, BLOCKSIZE>>>(
-              d_fanout_adjp,
-              d_fanout_adjncy,
-              d_fanout_wgts,
-              d_succs,
-              d_dists_cache,
-              d_short_pile,
-              d_long_pile,
-              h_window_start,
-              h_window_end,
-              tail_short.get(),
-              tail_long.get(),
-              h_split); 
+          if (final_window_size > 0) {
+            expand_short_pile_update_final_window
+              <<<num_blks, BLOCKSIZE>>>(
+                d_fanout_adjp,
+                d_fanout_adjncy,
+                d_fanout_wgts,
+                d_succs,
+                d_dists_cache,
+                d_short_pile,
+                d_long_pile,
+                h_window_start,
+                h_window_end,
+                tail_short.get(),
+                tail_long.get(),
+                h_split,
+                final_split); 
+          }
+          else {
+            expand_short_pile
+              <<<num_blks, BLOCKSIZE>>>(
+                d_fanout_adjp,
+                d_fanout_adjncy,
+                d_fanout_wgts,
+                d_succs,
+                d_dists_cache,
+                d_short_pile,
+                d_long_pile,
+                h_window_start,
+                h_window_end,
+                tail_short.get(),
+                tail_long.get(),
+                h_split);
+          } 
         }
      
         // update window start and end for the next expansion
         h_window_start += curr_expansion_window_size;
         h_window_end = short_pile_size;
 
-        if (h_window_start == h_window_end && final_window_size > 0) {
+
+        // if we have prefetched the final window
+        // we copy the final window to the short pile
+        // get it ready for the last expansion
+        if (h_window_start == h_window_end 
+          && final_window_size > 0 && final_split > h_split) {
           // update split
           h_split = final_split;
 
           // copy the final window to the short pile
-          short_pile_size += (final_window_size+h_num_short_paths);
+          short_pile_size += long_pile_size;
           short_pile.resize(short_pile_size);
           d_short_pile = thrust::raw_pointer_cast(short_pile.data());
-          std::cout << "copying final window to short pile.\n";
+          std::cout << "copying final window (long pile) to short pile.\n";
           thrust::copy(
-            final_window.begin(), 
-            final_window.end(), 
+            long_pile.begin(), 
+            long_pile.end(), 
             short_pile.begin()+h_window_start);
-          h_window_end += final_window_size;
-
-          // clear the final window
-          final_window.clear();
-          thrust::device_vector<PfxtNode>().swap(final_window);
-          final_window_size = 0;
+          h_window_end += long_pile_size;
 
           // update the tail of the short pile
           set_kernel<<<1, 1>>>(tail_short.get(), short_pile_size);
@@ -4287,26 +4458,6 @@ void CpGen::report_paths(
           h_num_short_paths = long_pile_size-h_num_long_paths;
         }
       
-        if (h_num_short_paths > 0.05f*k) {
-          std::cout << "window size exceeds 5\% of k, slow down split increment\n";
-          split_inc_should_slow_down = true;
-        } 
-
-        if (split_inc_should_slow_down){ 
-          // if (split_inc_amount*0.5f > init_split_inc_amount) {
-          //   split_inc_amount *= 0.5f;
-          // }
-          // else {
-            split_inc_amount = init_split_inc_amount;
-          // }
-        }
-        else {
-          split_inc_amount *= 1.2f;
-        }
-
-        std::cout << "updated split_inc_amount=" << split_inc_amount << '\n';
-        std::cout << "updated split=" << h_split << '\n';
-        
         // up-size the short pile
         short_pile_size += h_num_short_paths;
         std::cout << "short_pile_size (after split update)=" 
@@ -4314,6 +4465,22 @@ void CpGen::report_paths(
           " (added " << h_num_short_paths << " short paths)\n";
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(short_pile.data());
+
+        if (short_pile_size > 0.5f*k) {
+          std::cout << "slow down split increment\n";
+          split_inc_should_slow_down = true;
+        } 
+
+        if (split_inc_should_slow_down){ 
+          split_inc_amount = init_split_inc_amount;
+        }
+        else {
+          split_inc_amount *= 1.2f;
+        }
+
+        std::cout << "split_inc_amount=" << split_inc_amount << '\n';
+        std::cout << "updated split=" << h_split << '\n';
+
 
         // add the short paths in the long pile to the short pile
         thrust::copy_if(
@@ -4330,7 +4497,7 @@ void CpGen::report_paths(
         // update the tail of the short pile
         set_kernel<<<1, 1>>>(tail_short.get(), short_pile_size);
 
-        if (short_pile_size >= k && long_pile_size > 0) {
+        if (short_pile_size >= k) {
           // can clear the long pile if we have enough short paths
           long_pile.clear();
           thrust::device_vector<PfxtNode>().swap(long_pile);
