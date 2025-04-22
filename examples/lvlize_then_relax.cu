@@ -2,15 +2,17 @@
 #include <cassert>
 
 int main(int argc, char* argv[]) {
-  if (argc != 5) {
-    std::cerr << "usage: ./a.out [benchmark] [k] [enable_csr_reorder_gpu] [enable_runtime_measure]\n";
+  if (argc != 6) {
+    std::cerr << "usage: ./a.out [benchmark] [k] [enable_runtime_measure] [csr_reorder_method] [enable_spur_fnf]\n";
     std::exit(1);
   }
 
   std::string benchmark = argv[1];
   auto num_paths = std::stoi(argv[2]);
-  bool enable_csr_reorder_gpu = std::stoi(argv[3]);
-  bool enable_interm_perf_log = std::stoi(argv[4]);
+  bool enable_interm_perf_log = std::stoi(argv[3]);
+  gpucpg::CsrReorderMethod cr_method = static_cast<gpucpg::CsrReorderMethod>(std::stoi(argv[4]));
+  bool enable_spur_fnf = std::stoi(argv[5]);
+
   int max_dev_lvls{5};
   bool enable_compress{true};
 
@@ -60,7 +62,8 @@ int main(int argc, char* argv[]) {
   for (int run = 0; run < runs; run++) {
     cpgen_lvlize_td_then_relax_bu.report_paths(num_paths, max_dev_lvls, enable_compress,
       gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SHORT_LONG,
-      false, 0.005f, 5.0f, 8, false, false, false, enable_interm_perf_log);
+      false, 0.005f, 5.0f, 8, false, false, false, enable_interm_perf_log, cr_method, 
+      enable_spur_fnf);
     total_lvlize_time += cpgen_lvlize_td_then_relax_bu.lvlize_time;
     total_relax_time += cpgen_lvlize_td_then_relax_bu.relax_time;
     total_pfxt_time += cpgen_lvlize_td_then_relax_bu.expand_time;
@@ -86,10 +89,11 @@ int main(int argc, char* argv[]) {
   total_relax_time = std::chrono::duration<double, std::micro>{0};
   total_pfxt_time = std::chrono::duration<double, std::micro>{0};
 
-  for (int run = 0; run < 10; run++) {
+  for (int run = 0; run < runs; run++) {
     cpgen_lvlize_td_then_relax_bu_reindex.report_paths(num_paths, max_dev_lvls, enable_compress,
       gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SHORT_LONG, 
-      false, 0.005f, 5.0f, 8, false, enable_csr_reorder_gpu, false, enable_interm_perf_log);
+      false, 0.005f, 5.0f, 8, false, true, false, enable_interm_perf_log, cr_method, 
+      enable_spur_fnf);
       
     total_lvlize_time += cpgen_lvlize_td_then_relax_bu_reindex.lvlize_time;
     total_prefix_scan_time += cpgen_lvlize_td_then_relax_bu_reindex.prefix_scan_time;
@@ -128,7 +132,7 @@ int main(int argc, char* argv[]) {
   
   auto golden_last_slk = cpgen_ref.get_slacks(num_paths).back();
   runtime_log_file << "==== SEQUENTIAL =====\n"
-    << "pfxt expansion runtime=" << cpgen_ref.expand_time/1ms << " ms.\n";
+    << "CPU sequential runtime: " << cpgen_ref.expand_time/1ms << " ms.\n";
   runtime_log_file << "Last Slack (ref)= " << golden_last_slk << "\n";
   std::cout << "Golden last slack (ref)= "
             << golden_last_slk 

@@ -10,6 +10,7 @@ add_executable(bfs_hybrid ${GPUCPG_EXAMPLE_DIR}/bfs_hybrid.cu)
 add_executable(bfs_td ${GPUCPG_EXAMPLE_DIR}/bfs_td.cu)
 add_executable(densify ${GPUCPG_EXAMPLE_DIR}/densify.cu)
 add_executable(lvlize_then_relax ${GPUCPG_EXAMPLE_DIR}/lvlize_then_relax.cu)
+add_executable(dac21-baseline ${GPUCPG_EXAMPLE_DIR}/dac21-baseline.cu)
 
 list(APPEND GPUCPG_EXAMPLES
   #cpg
@@ -24,6 +25,7 @@ list(APPEND GPUCPG_EXAMPLES
   bfs_td
   densify
   lvlize_then_relax
+  dac21-baseline
 )
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)

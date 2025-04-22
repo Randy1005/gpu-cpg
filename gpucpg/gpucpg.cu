@@ -25,9 +25,11 @@ namespace cg = cooperative_groups;
 #define S_BUFF_CAPACITY 4096 
 #define S_FRONTIER_CAPACITY 4096 
 #define W_FRONTIER_CAPACITY 64
-#define S_PFXT_CAPACITY 1024 
-#define PER_THREAD_WORK_ITEMS 8 
+#define PER_THREAD_WORK_ITEMS 1 
 #define EXP_WINDOW_SIZE_THRD 192 
+#define S_SHORT_PILE_CAPACITY 256
+#define S_LONG_PILE_CAPACITY 768
+#define S_PFXT_CAPACITY 1024 
 
 // macros for blocks calculation
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
@@ -224,6 +226,7 @@ void CpGen::read_input(const std::string& filename) {
     throw std::runtime_error("Unable to open file: " + filename);
   }
 
+  benchmark_path = filename;
   std::string line;
   int vertex_count;
 
@@ -1705,15 +1708,14 @@ __global__ void reorder_csr_e_oriented(
   int* reordered_oes,
   float* reordered_owgts,
   int* reidx_map) {
-  int tid = threadIdx.x + blockIdx.x*blockDim.x;
-  if (tid < num_edges) {
-    
+  int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  for (int i = tid; i < num_edges; i += blockDim.x*gridDim.x) {
     // u: from, v: to
     // eid: the index of v in the adjncy list of u
-    const auto v = oes[tid];
-    const auto u = inv_oes[tid];
-    const auto eid = tid-ovs[u];
-    const auto wgt = owgts[tid];
+    const auto v = oes[i];
+    const auto u = inv_oes[i];
+    const auto eid = i-ovs[u];
+    const auto wgt = owgts[i];
 
     // get the reindexed u
     const auto new_u = reidx_map[u];
@@ -1729,6 +1731,74 @@ __global__ void reorder_csr_e_oriented(
 
 }
 
+__global__ void reorder_csr_e_oriented_vec2(
+  int num_edges,
+  int* ovs,
+  int* oes,
+  int* inv_oes,
+  float* owgts,
+  int* reordered_ovs,
+  int* reordered_oes,
+  float* reordered_owgts,
+  int* reidx_map) {
+  int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  for (int i = tid; i < num_edges/2; i += blockDim.x*gridDim.x) {
+    int i_x = i*2;
+    int i_y = i_x+1;
+    // u: from, v: to
+    // eid: the index of v in the adjncy list of u
+    const auto v = reinterpret_cast<int2*>(oes)[i];
+    const auto u = reinterpret_cast<int2*>(inv_oes)[i];
+    const auto wgt = reinterpret_cast<float2*>(owgts)[i];
+
+    int2 eid = make_int2(i_x-ovs[u.x], i_y-ovs[u.y]);
+    
+    // get the reindexed u and v
+    int2 new_u = make_int2(reidx_map[u.x], reidx_map[u.y]);
+    int2 new_v = make_int2(reidx_map[v.x], reidx_map[v.y]);
+
+    // get the edge beginning of reindexed u
+    int2 new_e_beg = make_int2(reordered_ovs[new_u.x], reordered_ovs[new_u.y]);
+
+    if (new_u.x == new_u.y && (new_e_beg.x+eid.x)%2 == 0) {
+      int vectorized_idx = (new_e_beg.x+eid.x)/2;
+      reinterpret_cast<int2*>(reordered_oes)[vectorized_idx] = new_v;
+      reinterpret_cast<float2*>(reordered_owgts)[vectorized_idx] = wgt;
+    }
+    else {
+      reordered_oes[new_e_beg.x+eid.x] = new_v.x;
+      reordered_owgts[new_e_beg.x+eid.x] = wgt.x;
+
+      reordered_oes[new_e_beg.y+eid.y] = new_v.y;
+      reordered_owgts[new_e_beg.y+eid.y] = wgt.y; 
+    }
+
+  }
+
+  // reindex the final edge
+  if (tid == num_edges/2 && num_edges%2 == 1) {
+    // u: from, v: to
+    // eid: the index of v in the adjncy list of u
+    const auto v = oes[num_edges-1];
+    const auto u = inv_oes[num_edges-1];
+    const auto eid = num_edges-1-ovs[u];
+    const auto wgt = owgts[num_edges-1];
+
+    // get the reindexed u
+    const auto new_u = reidx_map[u];
+
+    // get the edge beginning of reindexed u
+    const auto new_e_beg = reordered_ovs[new_u];
+    const auto new_v = reidx_map[v];
+
+    // update the reordered edge and wgts
+    reordered_oes[new_e_beg+eid] = new_v;
+    reordered_owgts[new_e_beg+eid] = wgt;
+  }
+
+}
+
+
 __global__ void reorder_csr_v_oriented(
   int num_verts,
   int* ovs,
@@ -1738,7 +1808,7 @@ __global__ void reorder_csr_v_oriented(
   int* reordered_oes,
   float* reordered_owgts,
   int* reidx_map) {
-  const int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  const int tid = threadIdx.x+blockIdx.x*blockDim.x;
   if (tid < num_verts) {
     const auto reidxed_vid = reidx_map[tid];
     auto new_e_beg = reordered_ovs[reidxed_vid];
@@ -1755,6 +1825,45 @@ __global__ void reorder_csr_v_oriented(
   
   }
 }
+
+template<int tile_sz>
+__global__ void reorder_csr_v_oriented_tile_scan(
+  int num_verts,
+  int* ovs,
+  int* oes,
+  float* owgts,
+  int* reordered_ovs,
+  int* reordered_oes,
+  float* reordered_owgts,
+  int* reidx_map) {
+  int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  auto tile = cg::tiled_partition<tile_sz>(cg::this_thread_block());
+  const int tile_id = tid/tile_sz;
+  int lane = tile.thread_rank();
+
+  if (tile_id < num_verts) {
+    const auto reidxed_vid = reidx_map[tile_id];
+    auto new_e_beg = reordered_ovs[reidxed_vid];
+    const auto old_e_beg = ovs[tile_id];
+    const auto old_e_end = ovs[tile_id+1];
+    const auto odeg = old_e_end-old_e_beg;
+
+    for (int i = lane; i < odeg; i+=tile_sz) {
+      const auto old_neighbor = oes[old_e_beg+i];
+
+      // if (tile_id < 2) {
+      //   printf("tile_id: %d, lane: %d, old_e_beg+i: %d, old_e_end: %d\n", tile_id, lane, old_e_beg+i, old_e_end);
+      // }
+
+      const auto wgt = owgts[old_e_beg+i];
+      const auto new_neighbor = reidx_map[old_neighbor];
+      reordered_oes[new_e_beg+i] = new_neighbor;
+      reordered_owgts[new_e_beg+i] = wgt;
+    }
+  
+  }
+}
+
 
 __global__ void bfs_td_step_privatized(
   int* ivs,
@@ -2641,7 +2750,6 @@ __global__ void expand_new_pfxt_level_atomic_enq(
   }
 }
 
-// TODO: cache local pfxt nodes with shared memory
 __global__ void expand_short_pile(
   int* verts,
   int* edges,
@@ -2655,9 +2763,10 @@ __global__ void expand_short_pile(
   int* curr_tail_short,
   int* curr_tail_long,
   float split) {
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  const auto node_idx = tid + window_start;
-  
+  const int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  const auto node_idx = tid+window_start;
+
+  // start generating new short and long paths
   if (node_idx < window_end) {
     auto v = short_pile[node_idx].to;
     auto level = short_pile[node_idx].level;
@@ -2682,22 +2791,22 @@ __global__ void expand_short_pile(
           slack+dist_neighbor+wgt-dist_v;
 
         if (new_slack <= split) {
-          // this path belongs to the short pile
-          auto new_node_idx = atomicAdd(curr_tail_short, 1);
-          //printf("new idx (short)=%d\n", new_node_idx);
-          auto& new_path = short_pile[new_node_idx];
+          const auto curr_short_pile_idx = atomicAdd(curr_tail_short, 1);
+          auto& new_path = short_pile[curr_short_pile_idx];
+        
+          // populate pfxt node info
           new_path.level = level+1;
           new_path.from = v;
           new_path.to = neighbor;
           new_path.parent = node_idx;
           new_path.num_children = 0;
-          new_path.slack = new_slack;
+          new_path.slack = new_slack; 
         }
         else {
-          // this path belongs to the long pile
-          auto new_node_idx = atomicAdd(curr_tail_long, 1);
-          //printf("new idx (long)=%d\n", new_node_idx);
-          auto& new_path = long_pile[new_node_idx];
+          const auto curr_long_pile_idx = atomicAdd(curr_tail_long, 1);
+          auto& new_path = long_pile[curr_long_pile_idx];
+
+          // populate pfxt node info
           new_path.level = level+1;
           new_path.from = v;
           new_path.to = neighbor;
@@ -2712,7 +2821,110 @@ __global__ void expand_short_pile(
   }
 }
 
-// TODO: cache local pfxt nodes with shared memory
+__global__ void spur(
+  int v,
+  int e_beg,
+  int e_end,
+  int parent_lvl,
+  int parent_idx,
+  float parent_slack,
+  int* oes,
+  float* owgts,
+  int* succs,
+  int* dists,
+  PfxtNode* short_pile,
+  PfxtNode* long_pile,
+  int* num_curr_short_paths,
+  int* num_curr_long_paths,
+  float split) {
+  const int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  const int eid = tid+e_beg;
+  for (int e = eid; e < e_end; e += blockDim.x*gridDim.x) {
+    const auto neighbor = oes[e];
+    if (neighbor == succs[v]) {
+      continue;
+    }
+    auto wgt = owgts[e];
+    auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+    auto dist_v = (float)dists[v]/SCALE_UP;
+    auto new_slack = parent_slack+dist_neighbor+wgt-dist_v;
+    if (new_slack <= split) {
+      const auto curr_short_pile_idx = atomicAdd(num_curr_short_paths, 1);
+      auto& new_path = short_pile[curr_short_pile_idx];
+    
+      // populate pfxt node info
+      new_path.level = parent_lvl+1;
+      new_path.from = v;
+      new_path.to = neighbor;
+      new_path.parent = parent_idx;
+      new_path.num_children = 0;
+      new_path.slack = new_slack; 
+    }
+    else {
+      const auto curr_long_pile_idx = atomicAdd(num_curr_long_paths, 1);
+      auto& new_path = long_pile[curr_long_pile_idx];
+
+      // populate pfxt node info
+      new_path.level = parent_lvl+1;
+      new_path.from = v;
+      new_path.to = neighbor;
+      new_path.parent = parent_idx;
+      new_path.num_children = 0;
+      new_path.slack = new_slack;
+    }
+  }
+}
+
+
+__global__ void expand_short_pile_spur_fnf(
+  int* verts,
+  int* edges,
+  float* wgts,
+  int* succs,
+  int* dists,
+  PfxtNode* short_pile,
+  PfxtNode* long_pile,
+  int window_start,
+  int window_end,
+  int* curr_tail_short,
+  int* curr_tail_long,
+  float split) {
+  const int tid = threadIdx.x+blockIdx.x*blockDim.x;
+  const auto node_idx = tid+window_start;
+
+  // start generating new short and long paths
+  if (node_idx < window_end) {
+    auto v = short_pile[node_idx].to;
+    auto level = short_pile[node_idx].level;
+    auto slack = short_pile[node_idx].slack;
+    
+    while (v != -1) {
+      auto edge_start = verts[v];
+      auto edge_end = verts[v+1];
+      spur<<<1, 32, 0, cudaStreamFireAndForget>>>(
+        v,
+        edge_start,
+        edge_end,
+        level,
+        node_idx,
+        slack,
+        edges,
+        wgts,
+        succs,
+        dists,
+        short_pile,
+        long_pile,
+        curr_tail_short,
+        curr_tail_long,
+        split);
+      
+      // traverse to next successor
+      v = succs[v];
+    }
+  }
+}
+
+
 // this version is used if we know for sure
 // we will have enough short paths and storing long paths is just
 // gonna exhaust the GPU memory
@@ -2729,7 +2941,8 @@ __global__ void expand_short_pile_skip_long_paths(
   float split) {
   int tid = threadIdx.x+blockIdx.x*blockDim.x;
   const auto node_idx = tid+window_start;
-  
+ 
+  // start generating new short paths
   if (node_idx < window_end) {
     auto v = short_pile[node_idx].to;
     auto level = short_pile[node_idx].level;
@@ -2746,16 +2959,15 @@ __global__ void expand_short_pile_skip_long_paths(
         auto wgt = wgts[eid];
         auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
         auto dist_v = (float)dists[v]/SCALE_UP;
-        auto new_slack = 
-          slack+dist_neighbor+wgt-dist_v;
+        auto new_slack = slack+dist_neighbor+wgt-dist_v;
 
         if (new_slack <= split) {
-          // this path belongs to the short pile
-          auto new_node_idx = atomicAdd(curr_tail_short, 1);
-          //printf("new idx (short)=%d\n", new_node_idx);
-          auto& new_path = short_pile[new_node_idx];
+          const auto curr_short_pile_idx = atomicAdd(curr_tail_short, 1);
+          auto& new_path = short_pile[curr_short_pile_idx];
+
+          // populate pfxt node info
           new_path.level = level+1;
-          new_path.from = v;
+          new_path.from = v;  
           new_path.to = neighbor;
           new_path.parent = node_idx;
           new_path.num_children = 0;
@@ -2850,7 +3062,9 @@ void CpGen::report_paths(
   bool enable_reindex_cpu,
   bool enable_reindex_gpu,
   bool enable_fuse_steps,
-  bool enable_interm_perf_log) {
+  bool enable_interm_perf_log,
+  const CsrReorderMethod cr_method,
+  bool enable_spur_fnf) {
 
   // set cache configuration
   // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
@@ -3134,31 +3348,64 @@ void CpGen::report_paths(
       if (enable_interm_perf_log) {
         timer.start();
       }
-      // int num_blks = ROUNDUPBLOCKS(N, BLOCKSIZE);
-      // reorder_csr_v_oriented
-      //   <<<num_blks, BLOCKSIZE>>>(
-      //     N,
-      //     d_fanout_adjp,
-      //     d_fanout_adjncy,
-      //     d_fanout_wgts,
-      //     d_reordered_fanout_adjp,
-      //     d_reordered_fanout_adjncy,
-      //     d_reordered_fanout_wgts,
-      //     d_reidx_map);
-      
-      int num_blks = ROUNDUPBLOCKS(M, BLOCKSIZE);
-      reorder_csr_e_oriented
-        <<<num_blks, BLOCKSIZE>>>(
-          M,
-          d_fanout_adjp,
-          d_fanout_adjncy,
-          d_inv_fanout_adjncy,
-          d_fanout_wgts,
-          d_reordered_fanout_adjp,
-          d_reordered_fanout_adjncy,
-          d_reordered_fanout_wgts,
-          d_reidx_map); 
-     
+
+      if (cr_method == CsrReorderMethod::V_ORIENTED) {
+        int num_blks = ROUNDUPBLOCKS(N, BLOCKSIZE);
+        reorder_csr_v_oriented
+          <<<num_blks, BLOCKSIZE>>>(
+            N,
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_reordered_fanout_adjp,
+            d_reordered_fanout_adjncy,
+            d_reordered_fanout_wgts,
+            d_reidx_map);
+      }
+      else if (cr_method == CsrReorderMethod::V_ORIENTED_TILE_SCAN) {
+        constexpr int tile_sz = 32;
+        int tiles_per_blk = BLOCKSIZE/tile_sz;
+        int num_blks = ROUNDUPBLOCKS(N, tiles_per_blk);
+        reorder_csr_v_oriented_tile_scan<tile_sz>
+          <<<num_blks, BLOCKSIZE>>>(
+            N,
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_reordered_fanout_adjp,
+            d_reordered_fanout_adjncy,
+            d_reordered_fanout_wgts,
+            d_reidx_map);
+      }
+      else if (cr_method == CsrReorderMethod::E_ORIENTED) {
+        int num_blks = ROUNDUPBLOCKS(M, BLOCKSIZE);
+        reorder_csr_e_oriented
+          <<<num_blks, BLOCKSIZE>>>(
+            M,
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_inv_fanout_adjncy,
+            d_fanout_wgts,
+            d_reordered_fanout_adjp,
+            d_reordered_fanout_adjncy,
+            d_reordered_fanout_wgts,
+            d_reidx_map);
+      }
+      else if (cr_method == CsrReorderMethod::E_ORIENTED_VEC2) {
+        int num_blks = ROUNDUPBLOCKS(M/2, BLOCKSIZE);
+        reorder_csr_e_oriented_vec2
+          <<<num_blks, BLOCKSIZE>>>(
+            M,
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_inv_fanout_adjncy,
+            d_fanout_wgts,
+            d_reordered_fanout_adjp,
+            d_reordered_fanout_adjncy,
+            d_reordered_fanout_wgts,
+            d_reidx_map); 
+      }
+
       if (enable_interm_perf_log) {
         cudaDeviceSynchronize();
         timer.stop();
@@ -3847,8 +4094,8 @@ void CpGen::report_paths(
   thrust::device_vector<PfxtNode> long_pile;
   
   // get raw pointer to short and long piles
-  auto d_short_pile = thrust::raw_pointer_cast(&short_pile[0]);
-  auto d_long_pile = thrust::raw_pointer_cast(&long_pile[0]);
+  auto d_short_pile = thrust::raw_pointer_cast(short_pile.data());
+  auto d_long_pile = thrust::raw_pointer_cast(long_pile.data());
   
   // initialize tail pointers for short and long piles
   auto tail_short = thrust::device_new<int>();
@@ -4066,7 +4313,8 @@ void CpGen::report_paths(
   else if (pe_method == PfxtExpMethod::ATOMIC_ENQ) {
     // increment tail pointer to the current pfxt level size
     inc_kernel<<<1, 1>>>(_d_pfxt_tail, curr_lvl_size); 
-    
+   
+    const float mem_limit = 6e9;
     while (curr_lvl < max_dev_lvls) {
       // variable to record path counts in the same level
       int h_total_paths;
@@ -4093,11 +4341,19 @@ void CpGen::report_paths(
       h_total_paths = thrust::reduce(
           thrust::device,
           d_path_prefix_sums,
-          d_path_prefix_sums + curr_lvl_size);
+          d_path_prefix_sums+curr_lvl_size);
 
+      std::cout << "curr_lvl=" << curr_lvl
+                << ", h_total_paths=" << h_total_paths
+                << '\n';
       if (h_total_paths == 0) {
         break;
-      }    
+      }
+      
+      if (sizeof(PfxtNode)*(pfxt_size+h_total_paths) >= mem_limit) {
+        std::cout << "pfxt size limit reached, stop expanding\n";
+        break;
+      }
 
       // allocate new space for new level
       pfxt_size += h_total_paths;
@@ -4131,19 +4387,19 @@ void CpGen::report_paths(
       _h_lvl_offsets[curr_lvl+1] = pfxt_size; 
 
       // compress pfxt nodes on host if level size is bigger than k
-      if (curr_lvl_size > k && enable_compress) {
+      if (/*curr_lvl_size > k &&*/ enable_compress) {
         auto lvl_start = _h_lvl_offsets[curr_lvl];  
         std::ranges::sort(
-            _h_pfxt_nodes.begin() + lvl_start,
+            _h_pfxt_nodes.begin()+lvl_start,
             _h_pfxt_nodes.end(),
             [](const auto& a, const auto& b) {
             return a.slack < b.slack;
             }); 
 
-        
+       
         // size down the pfxt node storage
-        auto downsize = curr_lvl_size - k;
-        curr_lvl_size = k;
+        int downsize = curr_lvl_size*0.9f;
+        curr_lvl_size = curr_lvl_size-downsize;
         pfxt_size -= downsize;
         _h_pfxt_nodes.resize(pfxt_size);
 
@@ -4227,13 +4483,7 @@ void CpGen::report_paths(
               << ", init_long_pile_size=" << long_pile_size << '\n';
     std::cout << "split_inc_amount=" << split_inc_amount << '\n';
 
-    size_t free_mem, total_mem;
-    cudaMemGetInfo(&free_mem, &total_mem);
-
-
-    // int window_size_threshold{BLOCKSIZE};
     const float long_pile_size_limit_in_bytes = 6e9;
-    bool split_inc_should_slow_down{false};
     int final_window_size{0};
     float final_split{std::numeric_limits<float>::max()};
     while (true) {
@@ -4271,30 +4521,50 @@ void CpGen::report_paths(
   
         if (sizeof(PfxtNode)*(long_pile_size+h_num_long_paths) > long_pile_size_limit_in_bytes
           && final_window_size == 0 && short_pile_size+h_num_short_paths < k) {
-          final_split = h_split;
-          split_inc_amount = init_split_inc_amount*0.1f;
           std::cout << "long_pile_size exceeds limit, prefetch the final window.\n";
-          while (short_pile_size+h_num_short_paths+final_window_size < k) {
-            final_split += split_inc_amount;
-            h_num_long_paths = 
-              thrust::count_if(
-                long_pile.begin(), 
-                long_pile.end(),
-                [final_split] __host__ __device__ (const PfxtNode& n) {
-                  return n.slack > final_split;
-                });
-            final_window_size = long_pile_size-h_num_long_paths;
-          }
-          std::cout << "final split is " << final_split << '\n';
-          std::cout << "final_window_size=" << final_window_size << '\n';
+          // final_split = h_split;
+          // split_inc_amount = init_split_inc_amount*0.1f;
+          // while (short_pile_size+h_num_short_paths+final_window_size < k) {
+          //   final_split += split_inc_amount;
+          //   h_num_long_paths = 
+          //     thrust::count_if(
+          //       long_pile.begin(), 
+          //       long_pile.end(),
+          //       [final_split] __host__ __device__ (const PfxtNode& n) {
+          //         return n.slack > final_split;
+          //       });
+          //   final_window_size = long_pile_size-h_num_long_paths;
+          // }
+
+          int num_short_paths_needed = k-(short_pile_size+h_num_short_paths);
+
+          // sort the long pile
+          thrust::sort(
+            long_pile.begin(), 
+            long_pile.end(),
+            pfxt_node_comp());
           
-          thrust::remove_if(
+          // use the last slack as the final split
+          PfxtNode tmp_node;
+          cudaMemcpy(&tmp_node, 
+            &d_long_pile[num_short_paths_needed-1], 
+            sizeof(PfxtNode), 
+            cudaMemcpyDeviceToHost);
+          
+          final_split = tmp_node.slack;
+
+          // to make sure we also include the paths with identical slacks
+          // we increase the final split by a little bit
+          std::cout << "final split is " << final_split << '\n';
+          
+          final_window_size = thrust::remove_if(
             long_pile.begin(), 
             long_pile.end(), 
             [final_split] __host__ __device__ (const PfxtNode& n) {
               return n.slack > final_split;
-            });
+            })-long_pile.begin();
 
+          std::cout << "final_window_size=" << final_window_size << '\n';
           long_pile.resize(final_window_size);
           long_pile.shrink_to_fit();
           long_pile_size = final_window_size;
@@ -4332,7 +4602,7 @@ void CpGen::report_paths(
               h_split); 
         }
         else {
-          // re-calculate short and long path counts 
+          // re-calculate short and long path counts
           cudaMemset(d_num_long_paths, 0, sizeof(int));
           cudaMemset(d_num_short_paths, 0, sizeof(int));
           
@@ -4386,27 +4656,45 @@ void CpGen::report_paths(
                 final_split); 
           }
           else {
-            expand_short_pile
-              <<<num_blks, BLOCKSIZE>>>(
-                d_fanout_adjp,
-                d_fanout_adjncy,
-                d_fanout_wgts,
-                d_succs,
-                d_dists_cache,
-                d_short_pile,
-                d_long_pile,
-                h_window_start,
-                h_window_end,
-                tail_short.get(),
-                tail_long.get(),
-                h_split);
+
+            if (enable_spur_fnf) {
+              expand_short_pile_spur_fnf
+                <<<num_blks, BLOCKSIZE>>>(
+                  d_fanout_adjp,
+                  d_fanout_adjncy,
+                  d_fanout_wgts,
+                  d_succs,
+                  d_dists_cache,
+                  d_short_pile,
+                  d_long_pile,
+                  h_window_start,
+                  h_window_end,
+                  tail_short.get(),
+                  tail_long.get(),
+                  h_split);
+            }
+            else {
+              expand_short_pile
+                <<<num_blks, BLOCKSIZE>>>(
+                  d_fanout_adjp,
+                  d_fanout_adjncy,
+                  d_fanout_wgts,
+                  d_succs,
+                  d_dists_cache,
+                  d_short_pile,
+                  d_long_pile,
+                  h_window_start,
+                  h_window_end,
+                  tail_short.get(),
+                  tail_long.get(),
+                  h_split);
+            }
           } 
         }
      
         // update window start and end for the next expansion
         h_window_start += curr_expansion_window_size;
         h_window_end = short_pile_size;
-
 
         // if we have prefetched the final window
         // we copy the final window to the short pile
@@ -4468,19 +4756,14 @@ void CpGen::report_paths(
 
         if (short_pile_size > 0.5f*k) {
           std::cout << "slow down split increment\n";
-          split_inc_should_slow_down = true;
-        } 
-
-        if (split_inc_should_slow_down){ 
           split_inc_amount = init_split_inc_amount;
         }
         else {
           split_inc_amount *= 1.2f;
-        }
+        } 
 
         std::cout << "split_inc_amount=" << split_inc_amount << '\n';
         std::cout << "updated split=" << h_split << '\n';
-
 
         // add the short paths in the long pile to the short pile
         thrust::copy_if(
@@ -4615,22 +4898,17 @@ void CpGen::report_paths(
       pe_method == PfxtExpMethod::PRECOMP_SPURS ||
       pe_method == PfxtExpMethod::ATOMIC_ENQ) {
   
-    int total_paths{0};
-    //std::cout << "==== level-by-level expansion ====\n";
-    for (int i = 0; i < max_dev_lvls; i++) {
-      auto beg = _h_lvl_offsets[i];
-      auto end = _h_lvl_offsets[i+1];
-      auto lvl_size = (beg > end) ? 0 : end-beg;
-      total_paths += lvl_size;
-      //std::cout << "pfxt level " << i << " size=" << lvl_size << '\n';
-    }
-    _h_pfxt_nodes.resize(total_paths);
+    // for (int i = 0; i < max_dev_lvls; i++) {
+    //   auto beg = _h_lvl_offsets[i];
+    //   auto end = _h_lvl_offsets[i+1];
+    //   auto lvl_size = (beg > end) ? 0 : end-beg;
+    //   total_paths += lvl_size;
+    // }
+    _h_pfxt_nodes.resize(pfxt_nodes.size());
     thrust::sort(pfxt_nodes.begin(), pfxt_nodes.end(), pfxt_node_comp());
     thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
   }
   else if (pe_method == PfxtExpMethod::SHORT_LONG) {
-    //std::cout << "==== short-long expansion ====\n";
-    //std::cout << "short_pile_size=" << short_pile_size << '\n';
     _h_pfxt_nodes.resize(short_pile_size);
     thrust::sort(short_pile.begin(), short_pile.end(), pfxt_node_comp());
     thrust::copy(short_pile.begin(), short_pile.end(), _h_pfxt_nodes.begin());

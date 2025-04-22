@@ -40,6 +40,13 @@ enum class PfxtExpMethod {
   SEQUENTIAL
 };
 
+enum class CsrReorderMethod {
+  V_ORIENTED = 0,
+  V_ORIENTED_TILE_SCAN,
+  E_ORIENTED,
+  E_ORIENTED_VEC2
+};
+
 struct PfxtNode {
   __host__ __device__ PfxtNode(
     int level = -1,
@@ -141,7 +148,9 @@ public:
     bool enable_reindex_cpu = false,
     bool enable_reindex_gpu = false,
     bool enable_fuse_steps = false,
-    bool enable_interm_perf_log = false); // enables runtime log on intermidiate steps (csr_reorder, etc.)
+    bool enable_interm_perf_log = false,
+    const CsrReorderMethod csr_reorder_method = CsrReorderMethod::E_ORIENTED,
+    bool enable_spur_fnf = false);
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
@@ -207,6 +216,8 @@ public:
   std::chrono::duration<double, std::micro> relax_time;
 
   size_t short_long_expansion_steps{0};
+
+  std::string benchmark_path;
 
 private:
   void _free();
