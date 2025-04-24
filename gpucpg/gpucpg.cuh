@@ -150,7 +150,7 @@ public:
     bool enable_fuse_steps = false,
     bool enable_interm_perf_log = false,
     const CsrReorderMethod csr_reorder_method = CsrReorderMethod::E_ORIENTED,
-    bool enable_spur_fnf = false);
+    bool enable_warp_spur = false);
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);

@@ -3,7 +3,7 @@
 
 int main(int argc, char* argv[]) {
   if (argc != 6) {
-    std::cerr << "usage: ./a.out [benchmark] [k] [enable_runtime_measure] [csr_reorder_method] [enable_spur_fnf]\n";
+    std::cerr << "usage: ./a.out [benchmark] [k] [enable_runtime_measure] [csr_reorder_method] [enable_warp_spur]\n";
     std::exit(1);
   }
 
@@ -11,7 +11,7 @@ int main(int argc, char* argv[]) {
   auto num_paths = std::stoi(argv[2]);
   bool enable_interm_perf_log = std::stoi(argv[3]);
   gpucpg::CsrReorderMethod cr_method = static_cast<gpucpg::CsrReorderMethod>(std::stoi(argv[4]));
-  bool enable_spur_fnf = std::stoi(argv[5]);
+  bool enable_warp_spur = std::stoi(argv[5]);
 
   int max_dev_lvls{5};
   bool enable_compress{true};
@@ -26,6 +26,10 @@ int main(int argc, char* argv[]) {
   std::cout << cpgen_ref.compute_split_inc_amount(20.0) << '\n';
   std::cout << cpgen_ref.compute_split_inc_amount(30.0) << '\n';
   std::cout << cpgen_ref.compute_split_inc_amount(40.0) << '\n';
+
+  std::cout << "enable_interm_perf_log=" << enable_interm_perf_log << '\n';
+  std::cout << "cr_method=" << static_cast<int>(cr_method) << '\n';
+  std::cout << "enable_warp_spur=" << enable_warp_spur << '\n';
 
 
   #pragma omp parallel
@@ -63,7 +67,7 @@ int main(int argc, char* argv[]) {
     cpgen_lvlize_td_then_relax_bu.report_paths(num_paths, max_dev_lvls, enable_compress,
       gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SHORT_LONG,
       false, 0.005f, 5.0f, 8, false, false, false, enable_interm_perf_log, cr_method, 
-      enable_spur_fnf);
+      enable_warp_spur);
     total_lvlize_time += cpgen_lvlize_td_then_relax_bu.lvlize_time;
     total_relax_time += cpgen_lvlize_td_then_relax_bu.relax_time;
     total_pfxt_time += cpgen_lvlize_td_then_relax_bu.expand_time;
@@ -76,9 +80,9 @@ int main(int argc, char* argv[]) {
 
   runtime_log_file
     << "==== No CSR reorder ====\n"
-    << "Total Levelize Time (avg): " << total_lvlize_time/1ms/10.0f << " ms.\n"
-    << "Total Relax Time (avg): " << total_relax_time/1ms/10.0f << " ms.\n"
-    << "Total Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/10.0f << " ms.\n"
+    << "Total Levelize Time (avg): " << total_lvlize_time/1ms/runs << " ms.\n"
+    << "Total Relax Time (avg): " << total_relax_time/1ms/runs << " ms.\n"
+    << "Total Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/runs << " ms.\n"
     << "Expansion Steps: " << cpgen_lvlize_td_then_relax_bu.short_long_expansion_steps << '\n'
     << "Last Slack=" << slks.back() << '\n';
   
@@ -93,7 +97,7 @@ int main(int argc, char* argv[]) {
     cpgen_lvlize_td_then_relax_bu_reindex.report_paths(num_paths, max_dev_lvls, enable_compress,
       gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SHORT_LONG, 
       false, 0.005f, 5.0f, 8, false, true, false, enable_interm_perf_log, cr_method, 
-      enable_spur_fnf);
+      enable_warp_spur);
       
     total_lvlize_time += cpgen_lvlize_td_then_relax_bu_reindex.lvlize_time;
     total_prefix_scan_time += cpgen_lvlize_td_then_relax_bu_reindex.prefix_scan_time;
@@ -111,11 +115,11 @@ int main(int argc, char* argv[]) {
   slks = cpgen_lvlize_td_then_relax_bu_reindex.get_slacks(num_paths);
   runtime_log_file 
     << "==== With CSR reorder (GPU) ====\n"
-    << "Total Levelize Time (avg): " << total_lvlize_time/1ms/10.0f << " ms.\n"
-    << "Total Prefix Scan Time (avg): " << total_prefix_scan_time/1ms/10.0f << " ms.\n"
-    << "Total CSR Reorder Time (avg): " << total_csr_reorder_time/1ms/10.0f << " ms.\n"
-    << "Total Relax Time (avg): " << total_relax_time/1ms/10.0f << " ms.\n"
-    << "Total Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/10.0f << " ms.\n"
+    << "Total Levelize Time (avg): " << total_lvlize_time/1ms/runs << " ms.\n"
+    << "Total Prefix Scan Time (avg): " << total_prefix_scan_time/1ms/runs << " ms.\n"
+    << "Total CSR Reorder Time (avg): " << total_csr_reorder_time/1ms/runs << " ms.\n"
+    << "Total Relax Time (avg): " << total_relax_time/1ms/runs << " ms.\n"
+    << "Total Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/runs << " ms.\n"
     << "Expansion Steps: " << cpgen_lvlize_td_then_relax_bu_reindex.short_long_expansion_steps << '\n'
     << "Last Slack=" << slks.back() << '\n';
 
@@ -127,16 +131,16 @@ int main(int argc, char* argv[]) {
   runtime_log_file.flush();
 
   // sequential cpg
-  cpgen_ref.report_paths(num_paths, max_dev_lvls, enable_compress,
-    gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SEQUENTIAL);
+  // cpgen_ref.report_paths(num_paths, max_dev_lvls, enable_compress,
+  //   gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SEQUENTIAL);
   
-  auto golden_last_slk = cpgen_ref.get_slacks(num_paths).back();
-  runtime_log_file << "==== SEQUENTIAL =====\n"
-    << "CPU sequential runtime: " << cpgen_ref.expand_time/1ms << " ms.\n";
-  runtime_log_file << "Last Slack (ref)= " << golden_last_slk << "\n";
-  std::cout << "Golden last slack (ref)= "
-            << golden_last_slk 
-            << "\n";
+  // auto golden_last_slk = cpgen_ref.get_slacks(num_paths).back();
+  // runtime_log_file << "==== SEQUENTIAL =====\n"
+  //   << "CPU sequential runtime: " << cpgen_ref.expand_time/1ms << " ms.\n";
+  // runtime_log_file << "Last Slack (ref)= " << golden_last_slk << "\n";
+  // std::cout << "Golden last slack (ref)= "
+  //           << golden_last_slk 
+  //           << "\n";
 
   runtime_log_file.close();
   

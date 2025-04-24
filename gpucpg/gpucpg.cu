@@ -1606,8 +1606,6 @@ __global__ void bfs_td_step_privatized_reindex(
           const auto oe_end = ovs[neighbor+1];
           reordered_ovs[pos+1] = oe_end-oe_beg;
         }
-
-                
       }
     }
   }
@@ -1696,6 +1694,16 @@ __global__ void reorder_csr_cdp(
         reordered_owgts);       
   }
 }
+
+__global__ void simple_cp(
+  int num_edges,
+  int* src,
+  int* dst) {
+  int tid = threadIdx.x + blockIdx.x*blockDim.x;
+  if (tid < num_edges) {
+    dst[tid] = src[tid];
+  }
+} 
 
 
 __global__ void reorder_csr_e_oriented(
@@ -2821,7 +2829,10 @@ __global__ void expand_short_pile(
   }
 }
 
-__global__ void spur(
+
+
+__device__ void warp_spur(
+  int lane,
   int v,
   int e_beg,
   int e_end,
@@ -2837,9 +2848,8 @@ __global__ void spur(
   int* num_curr_short_paths,
   int* num_curr_long_paths,
   float split) {
-  const int tid = threadIdx.x+blockIdx.x*blockDim.x;
-  const int eid = tid+e_beg;
-  for (int e = eid; e < e_end; e += blockDim.x*gridDim.x) {
+  const int eid = lane+e_beg;
+  for (int e = eid; e < e_end; e+=32) {
     const auto neighbor = oes[e];
     if (neighbor == succs[v]) {
       continue;
@@ -2875,8 +2885,7 @@ __global__ void spur(
   }
 }
 
-
-__global__ void expand_short_pile_spur_fnf(
+__global__ void expand_short_pile_warp_spur(
   int* verts,
   int* edges,
   float* wgts,
@@ -2890,7 +2899,9 @@ __global__ void expand_short_pile_spur_fnf(
   int* curr_tail_long,
   float split) {
   const int tid = threadIdx.x+blockIdx.x*blockDim.x;
-  const auto node_idx = tid+window_start;
+  const int tile_id = tid/32;
+  const int lane = tid%32;
+  const auto node_idx = tile_id+window_start;
 
   // start generating new short and long paths
   if (node_idx < window_end) {
@@ -2901,7 +2912,8 @@ __global__ void expand_short_pile_spur_fnf(
     while (v != -1) {
       auto edge_start = verts[v];
       auto edge_end = verts[v+1];
-      spur<<<1, 32, 0, cudaStreamFireAndForget>>>(
+      warp_spur(
+        lane,
         v,
         edge_start,
         edge_end,
@@ -2916,8 +2928,8 @@ __global__ void expand_short_pile_spur_fnf(
         long_pile,
         curr_tail_short,
         curr_tail_long,
-        split);
-      
+        split);    
+
       // traverse to next successor
       v = succs[v];
     }
@@ -3064,7 +3076,7 @@ void CpGen::report_paths(
   bool enable_fuse_steps,
   bool enable_interm_perf_log,
   const CsrReorderMethod cr_method,
-  bool enable_spur_fnf) {
+  bool enable_warp_spur) {
 
   // set cache configuration
   // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
@@ -3139,6 +3151,12 @@ void CpGen::report_paths(
   int* d_fanout_adjp = thrust::raw_pointer_cast(&fanout_adjp[0]);
   int* d_fanout_adjncy = thrust::raw_pointer_cast(&fanout_adjncy[0]);
   float* d_fanout_wgts = thrust::raw_pointer_cast(&fanout_wgts[0]);
+
+  // thrust::device_vector<int> test_dst_fanout_adjncy(M, 0);
+  // auto d_test_dst_fanout_adjncy = thrust::raw_pointer_cast(test_dst_fanout_adjncy.data());
+  // simple_cp<<<ROUNDUPBLOCKS(M, BLOCKSIZE), BLOCKSIZE>>>
+  //   (M, d_fanout_adjncy, d_test_dst_fanout_adjncy);
+
 
   auto d_inv_fanout_adjncy = thrust::raw_pointer_cast(inv_fanout_adjncy.data());
 
@@ -4656,9 +4674,10 @@ void CpGen::report_paths(
                 final_split); 
           }
           else {
-
-            if (enable_spur_fnf) {
-              expand_short_pile_spur_fnf
+            if (enable_warp_spur) {
+              int num_threads = curr_expansion_window_size*32;
+              int num_blks = ROUNDUPBLOCKS(num_threads, BLOCKSIZE);
+              expand_short_pile_warp_spur
                 <<<num_blks, BLOCKSIZE>>>(
                   d_fanout_adjp,
                   d_fanout_adjncy,
@@ -4823,7 +4842,7 @@ void CpGen::report_paths(
     };
     
     std::priority_queue<PfxtNode, std::vector<PfxtNode>, decltype(cmp)>
-     pfxt_pq(cmp); 
+     pfxt_pq(cmp), tmp_pfxt_pq(cmp); 
   
     for (const auto& src : _srcs) {
       float dist = (float)h_dists[src] / SCALE_UP;
@@ -4837,23 +4856,17 @@ void CpGen::report_paths(
     h_succs.resize(N);
     thrust::copy(successors.begin(), successors.end(), h_succs.begin());
 
+    std::vector<PfxtNode> tmp_pfxt;
     for (int i = 0; i < k; i++) {
       if (pfxt_pq.empty()) {
         break;
       }
 
-      // print the current priority queue size in GBs
-      // if (float pfxt_pq_size_in_gb = pfxt_pq.size()*sizeof(PfxtNode)/1e9; 
-      //     pfxt_pq_size_in_gb > 12.0f) {
-      //   std::cout << "num_paths=" << i << '\n';
-      //   std::cout << "pfxt_pq size=" << pfxt_pq_size_in_gb << " GB\n";
-      // }
-
       const auto& node = pfxt_pq.top();
       // record the top node in another container
       paths.emplace_back(node.level, node.from, node.to, node.parent,
           node.num_children, node.slack);
-
+      
       // spur
       auto v = node.to;
       auto level = node.level;
@@ -4881,8 +4894,59 @@ void CpGen::report_paths(
       }
 
       // pop the top node
-      pfxt_pq.pop(); 
+      pfxt_pq.pop();
     }
+
+    // int num_paths_needed;
+    // if (paths.size() < k) {
+    //   num_paths_needed = k-paths.size();
+    //   for (int i = 0; i < num_paths_needed; i++) {
+    //     const auto& node = pfxt_pq.top();
+    //     tmp_pfxt_pq.emplace(node.level, node.from, node.to, node.parent,
+    //         node.num_children, node.slack);
+    //     pfxt_pq.pop();
+    //   }
+
+    //   // clear the original queue
+    //   while (!pfxt_pq.empty()) {
+    //     pfxt_pq.pop();
+    //   }
+    //   // copy the tmp queue to the original queue
+    //   pfxt_pq.swap(tmp_pfxt_pq);
+    // }
+
+    // for (int i = 0; i < num_paths_needed; i++) {
+    //   const auto& node = pfxt_pq.top();
+    //   paths.emplace_back(node.level, node.from, node.to, node.parent,
+    //       node.num_children, node.slack);
+    //   pfxt_pq.pop();
+      
+    //   // spur
+    //   auto v = node.to;
+    //   auto level = node.level;
+    //   auto slack = node.slack;
+    //   while (v != -1) {
+    //     auto edge_start = _h_fanout_adjp[v];
+    //     auto edge_end = _h_fanout_adjp[v+1];
+    //     for (auto eid = edge_start; eid < edge_end; eid++) {
+    //       auto neighbor = _h_fanout_adjncy[eid];
+    //       if (neighbor == h_succs[v]) {
+    //         continue;
+    //       }
+
+    //       auto wgt = _h_fanout_wgts[eid];
+    //       auto dist_neighbor = (float)h_dists[neighbor] / SCALE_UP;
+    //       auto dist_v = (float)h_dists[v] / SCALE_UP;
+    //       auto new_slack = slack + dist_neighbor + wgt - dist_v;
+
+    //       // populate child path info
+    //       paths.emplace_back(level+1, v, neighbor, -1, 0, new_slack);
+    //     } 
+
+    //     // traverse to next successor
+    //     v = h_succs[v];
+    //   }
+    // }
  
     // copy paths to host pfxt nodes
     _h_pfxt_nodes.clear();
@@ -4912,6 +4976,9 @@ void CpGen::report_paths(
     _h_pfxt_nodes.resize(short_pile_size);
     thrust::sort(short_pile.begin(), short_pile.end(), pfxt_node_comp());
     thrust::copy(short_pile.begin(), short_pile.end(), _h_pfxt_nodes.begin());
+  }
+  else if (pe_method == PfxtExpMethod::SEQUENTIAL) {
+    thrust::sort(_h_pfxt_nodes.begin(), _h_pfxt_nodes.end(), pfxt_node_comp());
   }
 
   // free gpu memory
