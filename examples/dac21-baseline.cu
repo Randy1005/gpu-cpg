@@ -19,7 +19,7 @@ int main(int argc, char* argv[]) {
   std::ofstream runtime_log_file(benchmark+"-dac21-rt.log");
   int N = cpgen_no_csr_reorder.num_verts();
   int M = cpgen_no_csr_reorder.num_edges();
-  const int runs = 10;
+  const int runs = 1;
   runtime_log_file << "== Runtime Log for benchmark: " 
                    << benchmark 
                    << " (N=" << N 
@@ -43,10 +43,11 @@ int main(int argc, char* argv[]) {
   std::vector<float> slks = cpgen_no_csr_reorder.get_slacks(num_paths);
 
   runtime_log_file
-    << "Sfxt Build Time (avg): " << total_sfxt_time/1ms/10.0f << " ms.\n"
-    << "Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/10.0f << " ms.\n"
+    << "Sfxt Build Time (avg): " << total_sfxt_time/1ms/runs << " ms.\n"
+    << "Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/runs << " ms.\n"
     << "Last Slack= " << slks.back() << '\n';
-  
+ 
+
   runtime_log_file.close();
   
   return 0;

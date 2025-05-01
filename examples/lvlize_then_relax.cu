@@ -84,7 +84,7 @@ int main(int argc, char* argv[]) {
     << "Total Relax Time (avg): " << total_relax_time/1ms/runs << " ms.\n"
     << "Total Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/runs << " ms.\n"
     << "Expansion Steps: " << cpgen_lvlize_td_then_relax_bu.short_long_expansion_steps << '\n'
-    << "Last Slack=" << slks.back() << '\n';
+    << "Last Slack: " << slks.back() << '\n';
   
   // reset the timings
   total_lvlize_time = std::chrono::duration<double, std::micro>{0};
@@ -121,7 +121,7 @@ int main(int argc, char* argv[]) {
     << "Total Relax Time (avg): " << total_relax_time/1ms/runs << " ms.\n"
     << "Total Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/runs << " ms.\n"
     << "Expansion Steps: " << cpgen_lvlize_td_then_relax_bu_reindex.short_long_expansion_steps << '\n'
-    << "Last Slack=" << slks.back() << '\n';
+    << "Last Slack: " << slks.back() << '\n';
 
   std::cout << "LEVELIZE_THEN_RELAX with CSR reorder (GPU): " 
             << "last slack=" << slks.back() 
@@ -131,16 +131,16 @@ int main(int argc, char* argv[]) {
   runtime_log_file.flush();
 
   // sequential cpg
-  // cpgen_ref.report_paths(num_paths, max_dev_lvls, enable_compress,
-  //   gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SEQUENTIAL);
+  cpgen_ref.report_paths(num_paths, max_dev_lvls, enable_compress,
+    gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SEQUENTIAL);
   
-  // auto golden_last_slk = cpgen_ref.get_slacks(num_paths).back();
-  // runtime_log_file << "==== SEQUENTIAL =====\n"
-  //   << "CPU sequential runtime: " << cpgen_ref.expand_time/1ms << " ms.\n";
-  // runtime_log_file << "Last Slack (ref)= " << golden_last_slk << "\n";
-  // std::cout << "Golden last slack (ref)= "
-  //           << golden_last_slk 
-  //           << "\n";
+  auto golden_last_slk = cpgen_ref.get_slacks(num_paths).back();
+  runtime_log_file << "==== SEQUENTIAL =====\n"
+    << "CPU sequential runtime: " << cpgen_ref.expand_time/1ms << " ms.\n";
+  runtime_log_file << "Last Slack (ref)= " << golden_last_slk << "\n";
+  std::cout << "Golden last slack (ref)= "
+            << golden_last_slk 
+            << "\n";
 
   runtime_log_file.close();
   

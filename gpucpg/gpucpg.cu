@@ -22,6 +22,7 @@ namespace cg = cooperative_groups;
 #define BLOCKSIZE 768 
 #define WARPS_PER_BLOCK 32
 #define WARP_SIZE 32
+#define TILE_SIZE 16
 #define S_BUFF_CAPACITY 4096 
 #define S_FRONTIER_CAPACITY 4096 
 #define W_FRONTIER_CAPACITY 64
@@ -35,7 +36,7 @@ namespace cg = cooperative_groups;
 #define ROUNDUPBLOCKS(DATALEN, NTHREADS) \
   (((DATALEN) + (NTHREADS) - 1) / (NTHREADS))
 
-#define SCALE_UP 100000
+#define SCALE_UP 10000
 #define cudaCheckErrors(msg) \
   do { \
     cudaError_t __err = cudaGetLastError(); \
@@ -311,9 +312,85 @@ void CpGen::read_input(const std::string& filename) {
       _h_fanin_wgts.push_back(weight);
     }
   }
+}
 
-  // segsort the csr to get better coalesced access
-  // segsort_adjncy();
+void CpGen::convert_dimacs(
+  const std::string& dimacs_file,
+  const std::string& output_file) {
+  // this function converts a DIMACS file to our custom benchmark format
+  std::ifstream infile(dimacs_file);
+  if (!infile) {
+    throw std::runtime_error("Unable to open file: "+dimacs_file);
+  }
+  std::ofstream outfile(output_file);
+  if (!outfile) {
+    throw std::runtime_error("Unable to open file: "+output_file);
+  }
+
+  std::string line;
+  // the first couple lines are comments starting with "%"
+  // skip the comments
+  while (std::getline(infile, line)) {
+    if (line[0] != '%') {
+      break;
+    }
+  }
+
+  // the starting line of the dimacs file is [num_verts] [num_edges]
+  std::istringstream iss(line);
+  int num_verts, num_edges;
+  iss >> num_verts >> num_edges;
+
+  // write the number of vertices to our benchmark
+  outfile << num_verts << '\n';
+  // write placeholder vertex IDs to our benchmark
+  for (int i = 0; i < num_verts; i++) {
+    outfile << "\"Placeholder\";\n";
+  }
+
+  // our benchmark is directed
+  // the format is "from" -> "to", [weight];
+  // the dimacs format is undirected and only has adjacency lists
+  // the format is [neighbor1] [neighbor2] ... [neighborN]
+  // whose neighbor is not specified, so the first non-comment line
+  // is v0's neighbors, the second line is v1's neighbors, etc.
+  // and the dimacs file is 1-indexed, so we need to subtract 1 to
+  // convert to 0-indexed
+  // and to add directions, we only direct from smaller vid to larger vid
+  // so in DIMACS, if the first adjacency list is "2 4 5", we write
+  // "0" -> "1", [some random weight];
+  // "0" -> "3", [some random weight];
+  // "0" -> "4", [some random weight];
+  // the second adjacency list will have something like "1 7 8"
+  // we will ignore the "1" -> "0" edge, to avoid cycles
+  // and we will write "1" -> "6", [some random weight];
+  // "1" -> "7", [some random weight];
+
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_real_distribution<float> dis(1.0, 10.0);
+
+  for (int from_vid = 0; from_vid < num_verts; ++from_vid) {
+    std::getline(infile, line);
+    std::istringstream iss(line);
+    int to_vid;
+
+    while (iss >> to_vid) {
+      // Convert 1-indexed to 0-indexed
+      to_vid -= 1;
+
+      // Only add directed edges from smaller vid to larger vid
+      if (from_vid < to_vid) {
+        float rnd_wgt = dis(gen);
+
+        // float weight = std::round(rnd_wgt*100.0f)/100.0f; // round to 2 decimal places
+        outfile << "\"" << from_vid << "\"" << " -> " << "\"" << to_vid << "\", " << rnd_wgt << ";\n";
+      }
+    }
+  }
+  // close the files
+  infile.close();
+  outfile.close();
 }
 
 void CpGen::segsort_adjncy() {
@@ -356,8 +433,9 @@ void CpGen::densify_graph(const int desired_avg_degree) {
   const int num_levels = _h_verts_lvlp.size()-1;
   std::cout << "num_levels=" << num_levels << '\n';
   std::cout << "N=" << N << ", M=" << M << '\n';
+  std::cout << "benchmark_path=" << benchmark_path << '\n';
   std::uniform_int_distribution<int> dis_lvl(0, num_levels-2);
-  std::uniform_real_distribution<double> dis_wgt(0.1, 50.0);
+  std::uniform_real_distribution<double> dis_wgt(1.0, 10.0);
 
   int num_edges_needed = desired_avg_degree * N - M;
   std::cout << "num_edges_needed=" << num_edges_needed << '\n';
@@ -389,13 +467,16 @@ void CpGen::densify_graph(const int desired_avg_degree) {
     if (found) {
      continue;
     }
-    
-    _h_fanout_edges[u].emplace_back(v, dis_wgt(gen));
-    _h_fanin_edges[v].emplace_back(u, dis_wgt(gen));
+   
+    float rnd_wgt = dis_wgt(gen);
+    // float weight = std::round(rnd_wgt*100.0f)/100.0f; // round to 2 decimal places
+
+    _h_fanout_edges[u].emplace_back(v, rnd_wgt);
+    _h_fanin_edges[v].emplace_back(u, rnd_wgt);
     num_edges_needed--;
-    if (num_edges_needed % 100000 == 0) {
-      std::cout << "num_edges_needed=" << num_edges_needed << '\n';
-    }
+    // if (num_edges_needed % 100000 == 0) {
+    //   std::cout << "num_edges_needed=" << num_edges_needed << '\n';
+    // }
   }
   std::cout << "densification done.\n";
 }
@@ -2442,7 +2523,7 @@ __global__ void compute_path_counts(
     int path_count{0};
     while (v != -1) {
       auto edge_start = verts[v];
-      auto edge_end = (v == num_verts - 1) ? num_edges : verts[v+1];
+      auto edge_end = verts[v+1];
       // the deviation edge count at this vertex
       // is the num of fanout minus the successor edge
       auto fanout_count = edge_end - edge_start;
@@ -2646,6 +2727,131 @@ __global__ void expand_new_pfxt_level_atomic_enq(
   }
 }
 
+__global__ void expand_new_pfxt_level_atomic_enq_stop_at_pos(
+  int num_verts,
+  int num_edges,
+  int* vertices,
+  int* edges,
+  float* wgts,
+  int* succs,
+  int* dists,
+  PfxtNode* pfxt_nodes,
+  int* lvl_offsets,
+  int curr_lvl,
+  int* pfxt_tail,
+  int stop_pos) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  auto lvl_start = lvl_offsets[curr_lvl];
+  auto lvl_end = lvl_offsets[curr_lvl+1];
+  const auto pfxt_node_idx = tid + lvl_start;
+
+  __shared__ PfxtNode s_pfxt_nodes[S_PFXT_CAPACITY];
+  __shared__ int s_num_pfxt_nodes;
+  for (auto s_pfxt_node_idx = threadIdx.x; s_pfxt_node_idx < S_PFXT_CAPACITY;
+      s_pfxt_node_idx += blockDim.x) {
+    // initialize shared mem
+    s_pfxt_nodes[s_pfxt_node_idx] = PfxtNode();
+  }
+
+  if (threadIdx.x == 0) {
+    s_num_pfxt_nodes = 0;
+  }
+  __syncthreads();
+
+
+  if (pfxt_node_idx < lvl_end) {
+    auto level = pfxt_nodes[pfxt_node_idx].level;
+    auto slack = pfxt_nodes[pfxt_node_idx].slack;
+    auto v = pfxt_nodes[pfxt_node_idx].to;
+    while (v != -1) {
+      auto edge_start = vertices[v];
+      auto edge_end = vertices[v+1];
+      for (auto eid = edge_start; eid < edge_end; eid++) {
+        auto neighbor = edges[eid];
+        if (neighbor == succs[v]) {
+          continue;
+        }
+        auto wgt = wgts[eid];
+        
+        const auto s_curr_pfxt_node_idx = atomicAdd(&s_num_pfxt_nodes, 1);
+        if (s_curr_pfxt_node_idx < S_PFXT_CAPACITY) {
+          // place this node in smem if we have space
+          auto& new_path = s_pfxt_nodes[s_curr_pfxt_node_idx];
+          
+          // populate pfxt node info
+          new_path.level = level + 1;
+          new_path.from = v;
+          new_path.to = neighbor;
+          new_path.parent = pfxt_node_idx;
+          new_path.num_children = 0;
+          auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+          auto dist_v = (float)dists[v]/SCALE_UP;
+          new_path.slack = 
+            slack+dist_neighbor+wgt-dist_v;
+        }
+        else {
+          s_num_pfxt_nodes = S_PFXT_CAPACITY;
+          // write this pfxt node back to glob mem
+          // if not enough space in smem
+          const auto curr_pfxt_node_idx = atomicAdd(pfxt_tail, 1);
+          if (curr_pfxt_node_idx >= stop_pos) {
+            // if we are at the stop position, we'll have 
+            // to give up this path
+            return;
+          }
+
+          auto& new_path = pfxt_nodes[curr_pfxt_node_idx];
+        
+          // populate pfxt node info
+          new_path.level = level + 1;
+          new_path.from = v;
+          new_path.to = neighbor;
+          new_path.parent = pfxt_node_idx;
+          new_path.num_children = 0;
+          auto dist_neighbor = (float)dists[neighbor]/SCALE_UP;
+          auto dist_v = (float)dists[v]/SCALE_UP;
+          new_path.slack = 
+            slack+dist_neighbor+wgt-dist_v;
+        }
+      } 
+      // traverse to next successor
+      v = succs[v];
+    }
+  }
+  __syncthreads();
+
+  // write the rest of the pfxt nodes in smem
+  // back to glob mem
+  __shared__ int s_pfxt_beg;
+  if (threadIdx.x == 0) {
+    s_pfxt_beg = atomicAdd(pfxt_tail, s_num_pfxt_nodes);
+  }
+  __syncthreads();
+
+  if (s_pfxt_beg >= stop_pos) {
+    // if we are at the stop position, we'll have 
+    // to give up this path
+    return;
+  }
+
+  for (auto s_pfxt_node_idx = threadIdx.x; 
+    s_pfxt_node_idx < s_num_pfxt_nodes;
+    s_pfxt_node_idx += blockDim.x) {
+    // the location to write on glob mem
+    const auto g_pfxt_node_idx = s_pfxt_beg+s_pfxt_node_idx;
+    if (g_pfxt_node_idx >= stop_pos) {
+      // if we are at the stop position, we'll have 
+      // to give up this path
+      return;
+    }
+
+    // write to glob mem
+    pfxt_nodes[g_pfxt_node_idx] = s_pfxt_nodes[s_pfxt_node_idx]; 
+  }
+}
+
+
+
 __global__ void expand_new_pfxt_level_atomic_enq(
     int num_verts,
     int num_edges,
@@ -2831,7 +3037,8 @@ __global__ void expand_short_pile(
 
 
 
-__device__ void warp_spur(
+template<int tile_size>
+__device__ void tile_spur(
   int lane,
   int v,
   int e_beg,
@@ -2849,7 +3056,7 @@ __device__ void warp_spur(
   int* num_curr_long_paths,
   float split) {
   const int eid = lane+e_beg;
-  for (int e = eid; e < e_end; e+=32) {
+  for (int e = eid; e < e_end; e+=tile_size) {
     const auto neighbor = oes[e];
     if (neighbor == succs[v]) {
       continue;
@@ -2885,7 +3092,8 @@ __device__ void warp_spur(
   }
 }
 
-__global__ void expand_short_pile_warp_spur(
+template<int tile_size>
+__global__ void expand_short_pile_tile_spur(
   int* verts,
   int* edges,
   float* wgts,
@@ -2899,8 +3107,9 @@ __global__ void expand_short_pile_warp_spur(
   int* curr_tail_long,
   float split) {
   const int tid = threadIdx.x+blockIdx.x*blockDim.x;
-  const int tile_id = tid/32;
-  const int lane = tid%32;
+  auto tile = cg::tiled_partition<tile_size>(cg::this_thread_block());
+  const int tile_id = tid/tile.size();
+  const int lane = tile.thread_rank();
   const auto node_idx = tile_id+window_start;
 
   // start generating new short and long paths
@@ -2912,7 +3121,7 @@ __global__ void expand_short_pile_warp_spur(
     while (v != -1) {
       auto edge_start = verts[v];
       auto edge_end = verts[v+1];
-      warp_spur(
+      tile_spur<tile_size>(
         lane,
         v,
         edge_start,
@@ -3076,7 +3285,7 @@ void CpGen::report_paths(
   bool enable_fuse_steps,
   bool enable_interm_perf_log,
   const CsrReorderMethod cr_method,
-  bool enable_warp_spur) {
+  bool enable_tile_spur) {
 
   // set cache configuration
   // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
@@ -3151,12 +3360,6 @@ void CpGen::report_paths(
   int* d_fanout_adjp = thrust::raw_pointer_cast(&fanout_adjp[0]);
   int* d_fanout_adjncy = thrust::raw_pointer_cast(&fanout_adjncy[0]);
   float* d_fanout_wgts = thrust::raw_pointer_cast(&fanout_wgts[0]);
-
-  // thrust::device_vector<int> test_dst_fanout_adjncy(M, 0);
-  // auto d_test_dst_fanout_adjncy = thrust::raw_pointer_cast(test_dst_fanout_adjncy.data());
-  // simple_cp<<<ROUNDUPBLOCKS(M, BLOCKSIZE), BLOCKSIZE>>>
-  //   (M, d_fanout_adjncy, d_test_dst_fanout_adjncy);
-
 
   auto d_inv_fanout_adjncy = thrust::raw_pointer_cast(inv_fanout_adjncy.data());
 
@@ -3381,10 +3584,9 @@ void CpGen::report_paths(
             d_reidx_map);
       }
       else if (cr_method == CsrReorderMethod::V_ORIENTED_TILE_SCAN) {
-        constexpr int tile_sz = 32;
-        int tiles_per_blk = BLOCKSIZE/tile_sz;
+        int tiles_per_blk = BLOCKSIZE/TILE_SIZE;
         int num_blks = ROUNDUPBLOCKS(N, tiles_per_blk);
-        reorder_csr_v_oriented_tile_scan<tile_sz>
+        reorder_csr_v_oriented_tile_scan<TILE_SIZE>
           <<<num_blks, BLOCKSIZE>>>(
             N,
             d_fanout_adjp,
@@ -4332,7 +4534,8 @@ void CpGen::report_paths(
     // increment tail pointer to the current pfxt level size
     inc_kernel<<<1, 1>>>(_d_pfxt_tail, curr_lvl_size); 
    
-    const float mem_limit = 6e9;
+    const float mem_limit = 4e9;
+    size_t free_mem{0}, total_mem{0};
     while (curr_lvl < max_dev_lvls) {
       // variable to record path counts in the same level
       int h_total_paths;
@@ -4361,6 +4564,11 @@ void CpGen::report_paths(
           d_path_prefix_sums,
           d_path_prefix_sums+curr_lvl_size);
 
+      cudaMemGetInfo(&free_mem, &total_mem);
+      std::cout << "free_mem(bytes)=" << free_mem << '\n';
+      int max_paths_to_store = free_mem/sizeof(PfxtNode);
+      std::cout << "can hold " << free_mem/sizeof(PfxtNode) << " pfxt nodes\n";
+
       std::cout << "curr_lvl=" << curr_lvl
                 << ", h_total_paths=" << h_total_paths
                 << '\n';
@@ -4368,8 +4576,37 @@ void CpGen::report_paths(
         break;
       }
       
-      if (sizeof(PfxtNode)*(pfxt_size+h_total_paths) >= mem_limit) {
-        std::cout << "pfxt size limit reached, stop expanding\n";
+      if (h_total_paths >= max_paths_to_store ||
+          h_total_paths < 0) {
+        // if somehow the new size overflowed
+        // or resizing the pfxt node storage would exceed the
+        // memory limit, we'll just calculate how many nodes 
+        // we can store with rest of the memory
+        // and break out of the loop
+        int num_paths_can_store = max_paths_to_store*0.1f; 
+        std::cout << "num_paths_can_store=" << num_paths_can_store << '\n';
+        h_total_paths = num_paths_can_store;
+        pfxt_size += h_total_paths;
+        pfxt_nodes.resize(pfxt_size);
+        d_pfxt_nodes = thrust::raw_pointer_cast(pfxt_nodes.data());
+
+        // only store until we reach the size limit
+        expand_new_pfxt_level_atomic_enq_stop_at_pos
+          <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
+            N,
+            M,
+            d_fanout_adjp,
+            d_fanout_adjncy,
+            d_fanout_wgts,
+            d_succs,
+            d_dists_cache,
+            d_pfxt_nodes,
+            d_lvl_offsets,
+            curr_lvl,
+            _d_pfxt_tail,
+            pfxt_size);
+            
+        std::cout << "final pfxt_size=" << pfxt_size << '\n';
         break;
       }
 
@@ -4382,18 +4619,18 @@ void CpGen::report_paths(
       d_pfxt_nodes = thrust::raw_pointer_cast(&pfxt_nodes[0]);
 
       expand_new_pfxt_level_atomic_enq
-        <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>
-        (N,
-         M,
-         d_fanout_adjp,
-         d_fanout_adjncy,
-         d_fanout_wgts,
-         d_succs,
-         d_dists_cache,
-         d_pfxt_nodes,
-         d_lvl_offsets,
-         curr_lvl,
-         _d_pfxt_tail);
+        <<<ROUNDUPBLOCKS(curr_lvl_size, BLOCKSIZE), BLOCKSIZE>>>(
+          N,
+          M,
+          d_fanout_adjp,
+          d_fanout_adjncy,
+          d_fanout_wgts,
+          d_succs,
+          d_dists_cache,
+          d_pfxt_nodes,
+          d_lvl_offsets,
+          curr_lvl,
+          _d_pfxt_tail);
 
       thrust::copy(pfxt_nodes.begin(), pfxt_nodes.end(), _h_pfxt_nodes.begin());
 
@@ -4500,6 +4737,8 @@ void CpGen::report_paths(
     std::cout << "init_short_pile_size=" << short_pile_size 
               << ", init_long_pile_size=" << long_pile_size << '\n';
     std::cout << "split_inc_amount=" << split_inc_amount << '\n';
+
+    
 
     const float long_pile_size_limit_in_bytes = 6e9;
     int final_window_size{0};
@@ -4674,10 +4913,10 @@ void CpGen::report_paths(
                 final_split); 
           }
           else {
-            if (enable_warp_spur) {
-              int num_threads = curr_expansion_window_size*32;
+            if (enable_tile_spur) {
+              int num_threads = curr_expansion_window_size*TILE_SIZE;
               int num_blks = ROUNDUPBLOCKS(num_threads, BLOCKSIZE);
-              expand_short_pile_warp_spur
+              expand_short_pile_tile_spur<TILE_SIZE>
                 <<<num_blks, BLOCKSIZE>>>(
                   d_fanout_adjp,
                   d_fanout_adjncy,
@@ -4842,8 +5081,8 @@ void CpGen::report_paths(
     };
     
     std::priority_queue<PfxtNode, std::vector<PfxtNode>, decltype(cmp)>
-     pfxt_pq(cmp), tmp_pfxt_pq(cmp); 
-  
+     pfxt_pq(cmp); 
+ 
     for (const auto& src : _srcs) {
       float dist = (float)h_dists[src] / SCALE_UP;
       pfxt_pq.emplace(0, -1, src, -1, 0, dist);
@@ -4856,7 +5095,6 @@ void CpGen::report_paths(
     h_succs.resize(N);
     thrust::copy(successors.begin(), successors.end(), h_succs.begin());
 
-    std::vector<PfxtNode> tmp_pfxt;
     for (int i = 0; i < k; i++) {
       if (pfxt_pq.empty()) {
         break;
@@ -4881,12 +5119,13 @@ void CpGen::report_paths(
           }
 
           auto wgt = _h_fanout_wgts[eid];
-          auto dist_neighbor = (float)h_dists[neighbor] / SCALE_UP;
-          auto dist_v = (float)h_dists[v] / SCALE_UP;
+          float dist_neighbor = (float)h_dists[neighbor] / SCALE_UP;
+          float dist_v = (float)h_dists[v] / SCALE_UP;
           auto new_slack = slack + dist_neighbor + wgt - dist_v;
 
           // populate child path info
           pfxt_pq.emplace(level+1, v, neighbor, -1, 0, new_slack);
+          paths.back().num_children++;
         } 
 
         // traverse to next successor
@@ -4897,57 +5136,6 @@ void CpGen::report_paths(
       pfxt_pq.pop();
     }
 
-    // int num_paths_needed;
-    // if (paths.size() < k) {
-    //   num_paths_needed = k-paths.size();
-    //   for (int i = 0; i < num_paths_needed; i++) {
-    //     const auto& node = pfxt_pq.top();
-    //     tmp_pfxt_pq.emplace(node.level, node.from, node.to, node.parent,
-    //         node.num_children, node.slack);
-    //     pfxt_pq.pop();
-    //   }
-
-    //   // clear the original queue
-    //   while (!pfxt_pq.empty()) {
-    //     pfxt_pq.pop();
-    //   }
-    //   // copy the tmp queue to the original queue
-    //   pfxt_pq.swap(tmp_pfxt_pq);
-    // }
-
-    // for (int i = 0; i < num_paths_needed; i++) {
-    //   const auto& node = pfxt_pq.top();
-    //   paths.emplace_back(node.level, node.from, node.to, node.parent,
-    //       node.num_children, node.slack);
-    //   pfxt_pq.pop();
-      
-    //   // spur
-    //   auto v = node.to;
-    //   auto level = node.level;
-    //   auto slack = node.slack;
-    //   while (v != -1) {
-    //     auto edge_start = _h_fanout_adjp[v];
-    //     auto edge_end = _h_fanout_adjp[v+1];
-    //     for (auto eid = edge_start; eid < edge_end; eid++) {
-    //       auto neighbor = _h_fanout_adjncy[eid];
-    //       if (neighbor == h_succs[v]) {
-    //         continue;
-    //       }
-
-    //       auto wgt = _h_fanout_wgts[eid];
-    //       auto dist_neighbor = (float)h_dists[neighbor] / SCALE_UP;
-    //       auto dist_v = (float)h_dists[v] / SCALE_UP;
-    //       auto new_slack = slack + dist_neighbor + wgt - dist_v;
-
-    //       // populate child path info
-    //       paths.emplace_back(level+1, v, neighbor, -1, 0, new_slack);
-    //     } 
-
-    //     // traverse to next successor
-    //     v = h_succs[v];
-    //   }
-    // }
- 
     // copy paths to host pfxt nodes
     _h_pfxt_nodes.clear();
     _h_pfxt_nodes = std::move(paths);

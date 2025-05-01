@@ -1,4 +1,3 @@
-#add_executable(cpg ${GPUCPG_EXAMPLE_DIR}/cpg.cu)
 add_executable(cpg-short-long ${GPUCPG_EXAMPLE_DIR}/cpg-short-long.cu)
 add_executable(levelize ${GPUCPG_EXAMPLE_DIR}/levelize.cu)
 add_executable(gen_benchmark ${GPUCPG_EXAMPLE_DIR}/gen_benchmark.cu)
@@ -11,9 +10,9 @@ add_executable(bfs_td ${GPUCPG_EXAMPLE_DIR}/bfs_td.cu)
 add_executable(densify ${GPUCPG_EXAMPLE_DIR}/densify.cu)
 add_executable(lvlize_then_relax ${GPUCPG_EXAMPLE_DIR}/lvlize_then_relax.cu)
 add_executable(dac21-baseline ${GPUCPG_EXAMPLE_DIR}/dac21-baseline.cu)
+add_executable(convert-dimacs ${GPUCPG_EXAMPLE_DIR}/convert-dimacs.cu)
 
 list(APPEND GPUCPG_EXAMPLES
-  #cpg
   cpg-short-long 
   cpg-compare
   cpg-mteps
@@ -26,7 +25,7 @@ list(APPEND GPUCPG_EXAMPLES
   densify
   lvlize_then_relax
   dac21-baseline
-)
+  convert-dimacs)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}
