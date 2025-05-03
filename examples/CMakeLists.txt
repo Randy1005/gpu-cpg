@@ -11,6 +11,7 @@ add_executable(densify ${GPUCPG_EXAMPLE_DIR}/densify.cu)
 add_executable(lvlize_then_relax ${GPUCPG_EXAMPLE_DIR}/lvlize_then_relax.cu)
 add_executable(dac21-baseline ${GPUCPG_EXAMPLE_DIR}/dac21-baseline.cu)
 add_executable(convert-dimacs ${GPUCPG_EXAMPLE_DIR}/convert-dimacs.cu)
+add_executable(gen-big-table ${GPUCPG_EXAMPLE_DIR}/gen-big-table.cu)
 
 list(APPEND GPUCPG_EXAMPLES
   cpg-short-long 
@@ -25,7 +26,8 @@ list(APPEND GPUCPG_EXAMPLES
   densify
   lvlize_then_relax
   dac21-baseline
-  convert-dimacs)
+  convert-dimacs
+  gen-big-table)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}

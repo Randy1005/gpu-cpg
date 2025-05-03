@@ -9,7 +9,8 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/remove.h>
-#include <thrust/swap.h>
+#include <thrust/extrema.h>
+#include <thrust/pair.h>
 #include <cuda_runtime_api.h>
 #include <cooperative_groups.h>
 #include <iomanip>
@@ -3521,6 +3522,9 @@ void CpGen::report_paths(
       num_curr_ftrs = _get_num_ftrs();
       curr_depth++;
     }
+
+    graph_diameter = curr_depth;
+    
     if (enable_interm_perf_log) {
       timer.stop();
       lvlize_time = timer.get_elapsed_time();
@@ -4738,8 +4742,6 @@ void CpGen::report_paths(
               << ", init_long_pile_size=" << long_pile_size << '\n';
     std::cout << "split_inc_amount=" << split_inc_amount << '\n';
 
-    
-
     const float long_pile_size_limit_in_bytes = 6e9;
     int final_window_size{0};
     float final_split{std::numeric_limits<float>::max()};
@@ -4779,20 +4781,6 @@ void CpGen::report_paths(
         if (sizeof(PfxtNode)*(long_pile_size+h_num_long_paths) > long_pile_size_limit_in_bytes
           && final_window_size == 0 && short_pile_size+h_num_short_paths < k) {
           std::cout << "long_pile_size exceeds limit, prefetch the final window.\n";
-          // final_split = h_split;
-          // split_inc_amount = init_split_inc_amount*0.1f;
-          // while (short_pile_size+h_num_short_paths+final_window_size < k) {
-          //   final_split += split_inc_amount;
-          //   h_num_long_paths = 
-          //     thrust::count_if(
-          //       long_pile.begin(), 
-          //       long_pile.end(),
-          //       [final_split] __host__ __device__ (const PfxtNode& n) {
-          //         return n.slack > final_split;
-          //       });
-          //   final_window_size = long_pile_size-h_num_long_paths;
-          // }
-
           int num_short_paths_needed = k-(short_pile_size+h_num_short_paths);
 
           // sort the long pile
@@ -4978,6 +4966,9 @@ void CpGen::report_paths(
         } 
       }
       else {
+        // we count one split update as one step
+        short_long_expansion_steps++;
+        
         // there's no more paths from the short pile
         // to expand, we have to update the split value
         // and move paths from the long pile to the short pile
@@ -4987,7 +4978,24 @@ void CpGen::report_paths(
 
         // update the split value
         while (h_num_short_paths == 0) {
-          h_split += split_inc_amount;
+          if (short_long_expansion_steps == 1) {
+            std::cout << "first split update. use min slack from long pile.\n";
+            thrust::host_vector<PfxtNode> tmp_paths(long_pile);
+            auto it = 
+              thrust::min_element(
+                thrust::host,
+                tmp_paths.begin(), 
+                tmp_paths.end(),
+                pfxt_node_comp());
+
+            auto min = *it;
+            h_split = min.slack;
+          }
+          else {
+            h_split += split_inc_amount;
+          }
+
+
           
           // now some paths in the long pile
           // must be transferred to the short pile
@@ -5065,7 +5073,6 @@ void CpGen::report_paths(
           set_kernel<<<1, 1>>>(tail_long.get(), long_pile_size);
         }
       }
-      short_long_expansion_steps++;;
     }
 
     cudaFree(d_num_long_paths);

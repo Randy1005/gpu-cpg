@@ -21,11 +21,11 @@ int main(int argc, char* argv[]) {
     cpgen_lvlize_td_then_relax_bu_reindex,
     cpgen_ref;
 
-  std::cout << cpgen_ref.compute_split_inc_amount(2.0) << '\n';
-  std::cout << cpgen_ref.compute_split_inc_amount(10.0) << '\n';
-  std::cout << cpgen_ref.compute_split_inc_amount(20.0) << '\n';
-  std::cout << cpgen_ref.compute_split_inc_amount(30.0) << '\n';
-  std::cout << cpgen_ref.compute_split_inc_amount(40.0) << '\n';
+  // std::cout << cpgen_ref.compute_split_inc_amount(2.0) << '\n';
+  // std::cout << cpgen_ref.compute_split_inc_amount(10.0) << '\n';
+  // std::cout << cpgen_ref.compute_split_inc_amount(20.0) << '\n';
+  // std::cout << cpgen_ref.compute_split_inc_amount(30.0) << '\n';
+  // std::cout << cpgen_ref.compute_split_inc_amount(40.0) << '\n';
 
   std::cout << "enable_interm_perf_log=" << enable_interm_perf_log << '\n';
   std::cout << "cr_method=" << static_cast<int>(cr_method) << '\n';
@@ -50,7 +50,7 @@ int main(int argc, char* argv[]) {
   std::ofstream runtime_log_file(benchmark+"-rt.log");
   int N = cpgen_lvlize_td_then_relax_bu.num_verts();
   int M = cpgen_lvlize_td_then_relax_bu.num_edges();
-  const int runs = 10;
+  const int runs = 1;
   runtime_log_file << "== Runtime Log for benchmark: " 
                    << benchmark 
                    << " (N=" << N 
@@ -130,17 +130,23 @@ int main(int argc, char* argv[]) {
   // write the pending outputs in case the sequential cpg is killed
   runtime_log_file.flush();
 
+
+  std::ofstream slks_file("slks-sl.log");
+  for (auto slk : slks) {
+    slks_file << slk << '\n';
+  }
+
   // sequential cpg
-  cpgen_ref.report_paths(num_paths, max_dev_lvls, enable_compress,
-    gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SEQUENTIAL);
+  // cpgen_ref.report_paths(num_paths, max_dev_lvls, enable_compress,
+  //   gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SEQUENTIAL);
   
-  auto golden_last_slk = cpgen_ref.get_slacks(num_paths).back();
-  runtime_log_file << "==== SEQUENTIAL =====\n"
-    << "CPU sequential runtime: " << cpgen_ref.expand_time/1ms << " ms.\n";
-  runtime_log_file << "Last Slack (ref)= " << golden_last_slk << "\n";
-  std::cout << "Golden last slack (ref)= "
-            << golden_last_slk 
-            << "\n";
+  // auto golden_last_slk = cpgen_ref.get_slacks(num_paths).back();
+  // runtime_log_file << "==== SEQUENTIAL =====\n"
+  //   << "CPU sequential runtime: " << cpgen_ref.expand_time/1ms << " ms.\n";
+  // runtime_log_file << "Last Slack (ref)= " << golden_last_slk << "\n";
+  // std::cout << "Golden last slack (ref)= "
+  //           << golden_last_slk 
+  //           << "\n";
 
   runtime_log_file.close();
   

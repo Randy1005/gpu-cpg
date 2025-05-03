@@ -46,7 +46,11 @@ int main(int argc, char* argv[]) {
     << "Sfxt Build Time (avg): " << total_sfxt_time/1ms/runs << " ms.\n"
     << "Pfxt Expansion Time (avg): " << total_pfxt_time/1ms/runs << " ms.\n"
     << "Last Slack= " << slks.back() << '\n';
- 
+
+  std::ofstream slks_file("slks-dac21.log");
+  for (auto& s: slks) {
+    slks_file << s << '\n';
+  }
 
   runtime_log_file.close();
   
