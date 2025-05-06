@@ -5,7 +5,6 @@
 *.cubin
 *.fatbin
 
-experiments/
 reports/
 build/
 build*/

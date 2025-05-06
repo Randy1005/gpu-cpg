@@ -4754,6 +4754,8 @@ void CpGen::report_paths(
 
     const float long_pile_size_limit_in_bytes = 6e9;
     int final_window_size{0};
+    int prev_step_short_pile_size{0};
+
     float final_split{std::numeric_limits<float>::max()};
     while (true) {
       // get current expansion window size
@@ -4976,6 +4978,10 @@ void CpGen::report_paths(
         } 
       }
       else {
+        // record the paths generated per step
+        paths_gen_per_step.emplace_back(short_pile_size-prev_step_short_pile_size);
+        prev_step_short_pile_size = short_pile_size;
+
         // we count one split update as one step
         short_long_expansion_steps++;
         
@@ -5006,8 +5012,6 @@ void CpGen::report_paths(
             h_split += split_inc_amount;
           }
 
-
-          
           // now some paths in the long pile
           // must be transferred to the short pile
           // we calculate the long path count
@@ -5031,13 +5035,15 @@ void CpGen::report_paths(
         short_pile.resize(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(short_pile.data());
 
-        if (short_pile_size > 0.5f*k) {
-          std::cout << "slow down split increment\n";
-          split_inc_amount = init_split_inc_amount;
+        if (!fixed_split_inc_amount) {
+          if (short_pile_size > 0.5f*k) {
+            std::cout << "slow down split increment\n";
+            split_inc_amount = init_split_inc_amount;
+          }
+          else {
+            split_inc_amount *= 1.2f;
+          } 
         }
-        else {
-          split_inc_amount *= 1.2f;
-        } 
 
         std::cout << "split_inc_amount=" << split_inc_amount << '\n';
         std::cout << "updated split=" << h_split << '\n';
@@ -5085,6 +5091,7 @@ void CpGen::report_paths(
         }
       }
     }
+    total_gen_paths = short_pile_size;
 
     cudaFree(d_num_long_paths);
     cudaFree(d_num_short_paths);

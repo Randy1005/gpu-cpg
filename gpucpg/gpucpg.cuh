@@ -203,6 +203,10 @@ public:
     // reset the pfxt storage
     _h_pfxt_nodes.clear();
     _h_lvl_offsets.clear();
+
+    // reset generated paths per step
+    paths_gen_per_step.clear();
+    paths_gen_per_step.shrink_to_fit();
   }
 
   float compute_split_inc_amount(float avg_deg) {
@@ -226,6 +230,10 @@ public:
   std::string benchmark_path;
 
   int graph_diameter;
+
+  std::vector<int> paths_gen_per_step;
+
+  int total_gen_paths{0};
 
 private:
   void _free();
