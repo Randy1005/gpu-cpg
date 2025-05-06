@@ -201,7 +201,7 @@ void CpGen::dump_benchmark_with_wgts(const std::string& filename, std::ostream& 
   // Parse edges
   std::random_device rd;
   std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dis(1.0, 50.0);
+  std::uniform_real_distribution<float> dis(1.0, 10.0);
   while (std::getline(infile, line)) {
     std::istringstream iss(line);
     std::string from_str, to_str;
@@ -3286,7 +3286,8 @@ void CpGen::report_paths(
   bool enable_fuse_steps,
   bool enable_interm_perf_log,
   const CsrReorderMethod cr_method,
-  bool enable_tile_spur) {
+  bool enable_tile_spur,
+  std::optional<float> fixed_split_inc_amount) {
 
   // set cache configuration
   // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
@@ -4736,7 +4737,16 @@ void CpGen::report_paths(
     cudaHostAlloc(&d_num_long_paths, sizeof(int), cudaHostAllocDefault);
     cudaHostAlloc(&d_num_short_paths, sizeof(int), cudaHostAllocDefault);
 
-    const float init_split_inc_amount = compute_split_inc_amount((float)M/N);
+    float init_split_inc_amount;
+    if (fixed_split_inc_amount) {
+      // user wishes to use a fixed split increment amount
+      std::cout << "fixed_split_inc_amount=" << *fixed_split_inc_amount << '\n';
+      init_split_inc_amount = *fixed_split_inc_amount;
+    }
+    else {
+      init_split_inc_amount = compute_split_inc_amount((float)M/N);
+    }
+    
     auto split_inc_amount = init_split_inc_amount;
     std::cout << "init_short_pile_size=" << short_pile_size 
               << ", init_long_pile_size=" << long_pile_size << '\n';
@@ -4777,7 +4787,7 @@ void CpGen::report_paths(
           cudaMemcpyDeviceToHost);
         cudaMemcpy(&h_num_short_paths, d_num_short_paths, sizeof(int),
           cudaMemcpyDeviceToHost);
-  
+ 
         if (sizeof(PfxtNode)*(long_pile_size+h_num_long_paths) > long_pile_size_limit_in_bytes
           && final_window_size == 0 && short_pile_size+h_num_short_paths < k) {
           std::cout << "long_pile_size exceeds limit, prefetch the final window.\n";
@@ -4979,7 +4989,7 @@ void CpGen::report_paths(
         // update the split value
         while (h_num_short_paths == 0) {
           if (short_long_expansion_steps == 1) {
-            std::cout << "first split update. use min slack from long pile.\n";
+            std::cout << "first split update. use min slack plus some delta from long pile.\n";
             thrust::host_vector<PfxtNode> tmp_paths(long_pile);
             auto it = 
               thrust::min_element(
@@ -4989,7 +4999,8 @@ void CpGen::report_paths(
                 pfxt_node_comp());
 
             auto min = *it;
-            h_split = min.slack;
+            // h_split = min.slack+8*split_inc_amount;
+            h_split = min.slack+split_inc_amount;
           }
           else {
             h_split += split_inc_amount;

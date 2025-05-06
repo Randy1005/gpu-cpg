@@ -12,6 +12,11 @@ add_executable(lvlize_then_relax ${GPUCPG_EXAMPLE_DIR}/lvlize_then_relax.cu)
 add_executable(dac21-baseline ${GPUCPG_EXAMPLE_DIR}/dac21-baseline.cu)
 add_executable(convert-dimacs ${GPUCPG_EXAMPLE_DIR}/convert-dimacs.cu)
 add_executable(gen-big-table ${GPUCPG_EXAMPLE_DIR}/gen-big-table.cu)
+add_executable(gen-runtime-error-vs-k ${GPUCPG_EXAMPLE_DIR}/gen-runtime-error-vs-k.cu)
+add_executable(gen-runtime-error-vs-avgdeg ${GPUCPG_EXAMPLE_DIR}/gen-runtime-error-vs-avgdeg.cu)
+add_executable(gen-runtime-error-vs-diam ${GPUCPG_EXAMPLE_DIR}/gen-runtime-error-vs-diam.cu)
+add_executable(abl-study-gen-runtime-vs-delta ${GPUCPG_EXAMPLE_DIR}/abl-study-gen-runtime-vs-delta.cu)
+add_executable(cpg ${GPUCPG_EXAMPLE_DIR}/cpg.cu)
 
 list(APPEND GPUCPG_EXAMPLES
   cpg-short-long 
@@ -27,7 +32,12 @@ list(APPEND GPUCPG_EXAMPLES
   lvlize_then_relax
   dac21-baseline
   convert-dimacs
-  gen-big-table)
+  gen-big-table
+  gen-runtime-error-vs-k
+  gen-runtime-error-vs-avgdeg
+  gen-runtime-error-vs-diam
+  abl-study-gen-runtime-vs-delta
+  cpg)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}

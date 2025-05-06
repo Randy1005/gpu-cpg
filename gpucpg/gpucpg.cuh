@@ -12,6 +12,7 @@
 #include <queue>
 #include <functional>
 #include <unordered_map>
+#include <optional>
 #include "timer.hpp"
 
 namespace gpucpg {
@@ -151,7 +152,8 @@ public:
     bool enable_fuse_steps = false,
     bool enable_interm_perf_log = false,
     const CsrReorderMethod csr_reorder_method = CsrReorderMethod::E_ORIENTED,
-    bool enable_tile_spur = false);
+    bool enable_tile_spur = false,
+    std::optional<float> fixed_split_inc_amount = std::nullopt);
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
@@ -197,6 +199,10 @@ public:
 
     // reset expansion steps
     short_long_expansion_steps = 0;
+
+    // reset the pfxt storage
+    _h_pfxt_nodes.clear();
+    _h_lvl_offsets.clear();
   }
 
   float compute_split_inc_amount(float avg_deg) {
