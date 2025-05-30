@@ -59,14 +59,14 @@ int main(int argc, char* argv[]) {
   // write the header if the file is empty
   if (big_table_no_cr.tellp() == 0) {
     big_table_no_cr << "benchmark,|V|,|E|,Diameter,"
-      << "avg_path_cost_error(%),sfxt(ms),pfxt(ms),total(ms),"
-      << "avg_path_cost_error(%),sfxt(ms),pfxt(ms),total(ms)\n";
+      << "avg_path_cost_error(%),max_path_cost_error(%),sfxt(ms),pfxt(ms),total(ms),"
+      << "avg_path_cost_error(%),max_path_cost_error(%),sfxt(ms),pfxt(ms),total(ms)\n";
   }
 
   if (big_table_with_cr.tellp() == 0) {
     big_table_with_cr << "benchmark,|V|,|E|,Diameter,"
-      << "avg_path_cost_error(%),sfxt(ms),pfxt(ms),total(ms),"
-      << "avg_path_cost_error(%),sfxt(ms),pfxt(ms),total(ms)\n";
+      << "avg_path_cost_error(%),max_path_cost_error(%),sfxt(ms),pfxt(ms),total(ms),"
+      << "avg_path_cost_error(%),max_path_cost_error(%),sfxt(ms),pfxt(ms),total(ms)\n";
   }
 
   // write the benchmark name, number of vertices and edges, and diameter
@@ -101,13 +101,21 @@ int main(int argc, char* argv[]) {
   auto slks_dac21 = cpgen_dac21.get_slacks(num_paths);
 
   float total_slk_error = 0.0f;
-  for (int i = 0; i < num_paths; i++) {
-    auto error = 
-      (std::abs(slks_dac21[i]-slks_golden_vec[i])*100.0f)/slks_golden_vec[i];
-    total_slk_error += error;
+  float max_slk_error_dac21 = 0.0f;
+  int k = slks_dac21.size();
+  int max_err_idx = -1;
+  for (int i = 0; i < k; i++) {
+    if (slks_golden_vec[i] > 0.0f) {
+      auto error = 
+        std::abs(slks_dac21[i]-slks_golden_vec[i])*100.0f/slks_golden_vec[i];
+      total_slk_error += error;
+      max_slk_error_dac21 = std::max(max_slk_error_dac21, error);
+      max_err_idx = i;
+    }
   }
-  auto avg_path_cost_error_dac21 = total_slk_error/num_paths;
-
+  auto avg_path_cost_error_dac21 = total_slk_error/k;
+  std::cout << benchmark_name << ": max slk error: " 
+    << max_slk_error_dac21 << "% at idx " << max_err_idx << '\n';
 
 
   // reset the timings
@@ -136,12 +144,17 @@ int main(int argc, char* argv[]) {
   // calculate the average path cost error for no csr reorder
   auto slks_no_cr = cpgen_ours_no_cr.get_slacks(num_paths);
   total_slk_error = 0.0f;
-  for (int i = 0; i < num_paths; i++) {
-    auto error = 
-      (std::abs(slks_no_cr[i]-slks_golden_vec[i])*100.0f)/slks_golden_vec[i];
-    total_slk_error += error;
+  float max_slk_error_ours_no_cr = 0.0f;
+  k = slks_no_cr.size();
+  for (int i = 0; i < k; i++) {
+    if (slks_golden_vec[i] > 0.0f) {
+      auto error = 
+        std::abs(slks_no_cr[i]-slks_golden_vec[i])*100.0f/slks_golden_vec[i];
+      total_slk_error += error;
+      max_slk_error_ours_no_cr = std::max(max_slk_error_ours_no_cr, error);
+    }
   }
-  auto avg_path_cost_error_no_cr = total_slk_error/num_paths;
+  auto avg_path_cost_error_no_cr = total_slk_error/k;
   
 
   // reset the timings
@@ -171,12 +184,17 @@ int main(int argc, char* argv[]) {
   // calculate the average path cost error for csr reorder
   auto slks_with_cr = cpgen_ours_with_cr.get_slacks(num_paths);
   total_slk_error = 0.0f;
-  for (int i = 0; i < num_paths; i++) {
-    auto error = 
-      (std::abs(slks_with_cr[i]-slks_golden_vec[i])*100.0f)/slks_golden_vec[i];
-    total_slk_error += error;
+  float max_slk_error_ours_with_cr = 0.0f;
+  k = slks_with_cr.size();
+  for (int i = 0; i < k; i++) {
+    if (slks_golden_vec[i] > 0.0f) {
+      auto error = 
+        std::abs(slks_with_cr[i]-slks_golden_vec[i])*100.0f/slks_golden_vec[i];
+      total_slk_error += error;
+      max_slk_error_ours_with_cr = std::max(max_slk_error_ours_with_cr, error);
+    }
   }
-  auto avg_path_cost_error_with_cr = total_slk_error/num_paths;
+  auto avg_path_cost_error_with_cr = total_slk_error/k;
 
   // now we have the graph diameter
   auto diam = cpgen_ours_no_cr.graph_diameter;
@@ -185,39 +203,45 @@ int main(int argc, char* argv[]) {
   big_table_no_cr << benchmark_name << ','
     << N << ',' 
     << M << ','
-    << diam << ',' << std::fixed << std::setprecision(2)
+    << diam << ',' << std::fixed << std::setprecision(3)
     << avg_path_cost_error_dac21 << ','
+    << max_slk_error_dac21 << ','
+    << std::setprecision(1)
     << avg_sfxt_time_dac21 << ','
     << avg_pfxt_time_dac21 << ','
     << avg_total_time_dac21 << ','
-
+    << std::setprecision(3)
     << avg_path_cost_error_no_cr << ','
-    << avg_sfxt_time_no_cr << ','
-    << avg_pfxt_time_no_cr << ','
-    << avg_total_time_no_cr << " ("
-    << avg_total_time_dac21/avg_total_time_no_cr << "x)\n";
+    << max_slk_error_ours_no_cr << ','
+    << std::setprecision(1)
+    << avg_sfxt_time_no_cr << " (" << avg_sfxt_time_dac21/avg_sfxt_time_no_cr << "$\\times$),"
+    << avg_pfxt_time_no_cr << " (" << avg_pfxt_time_dac21/avg_pfxt_time_no_cr << "$\\times$),"
+    << avg_total_time_no_cr << " (" << avg_total_time_dac21/avg_total_time_no_cr << "$\\times$)\n";
   
   
   big_table_with_cr << benchmark_name << ','
     << N << ',' 
     << M << ','
-    << diam << ',' << std::fixed << std::setprecision(2)
+    << diam << ',' << std::fixed << std::setprecision(3)
     << avg_path_cost_error_dac21 << ','
+    << max_slk_error_dac21 << ','
+    << std::setprecision(1)
     << avg_sfxt_time_dac21 << ','
     << avg_pfxt_time_dac21 << ','
     << avg_total_time_dac21 << ','
-
+    << std::setprecision(3)
     << avg_path_cost_error_with_cr << ','
-    << avg_sfxt_time_with_cr << ','
-    << avg_pfxt_time_with_cr << ','
-    << avg_total_time_with_cr << " (" 
-    << avg_total_time_dac21/avg_total_time_with_cr << "x)\n";
+    << max_slk_error_ours_with_cr << ','
+    << std::setprecision(1)
+    << avg_sfxt_time_with_cr << " (" << avg_sfxt_time_dac21/avg_sfxt_time_with_cr << "$\\times$),"
+    << avg_pfxt_time_with_cr << " (" << avg_pfxt_time_dac21/avg_pfxt_time_with_cr << "$\\times$),"
+    << avg_total_time_with_cr << " (" << avg_total_time_dac21/avg_total_time_with_cr << "$\\times$)\n"; 
  
   
   // close the files
   big_table_no_cr.close();
   big_table_with_cr.close();
 
-  std::cout << benchmark_name << ": csv written.\n";
+  std::cout << benchmark_name << ": big-table written.\n";
   return 0;
 }

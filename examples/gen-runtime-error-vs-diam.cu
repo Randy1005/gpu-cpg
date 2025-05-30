@@ -30,7 +30,7 @@ int main(int argc, char* argv[]) {
   auto cr_method = gpucpg::CsrReorderMethod::E_ORIENTED;
   bool enable_warp_spur{true};
 
-  int max_dev_lvls{10};
+  int max_dev_lvls{12};
   bool enable_compress{true};
 
   gpucpg::CpGen
@@ -56,31 +56,19 @@ int main(int argc, char* argv[]) {
 
 
   // open a csv file to write the content if not already present
-  std::ofstream rt_vs_diam_dac21_csv("runtime-vs-diam-dac21.csv", std::ios::app);
+  std::ofstream speedup_vs_diam_csv("speedup-vs-diam-dac21.csv", std::ios::app);
   std::ofstream err_vs_diam_dac21_csv("error-vs-diam-dac21.csv", std::ios::app);
-  std::ofstream rt_vs_diam_ours_csv("runtime-vs-diam-ours.csv", std::ios::app);
-  std::ofstream err_vs_diam_ours_csv("error-vs-diam-ours.csv", std::ios::app);
 
   // write the header if the file is empty
-  if (rt_vs_diam_dac21_csv.tellp() == 0) {
-    rt_vs_diam_dac21_csv << "benchmark,diameter,runtime\n";
-  } 
+  if (speedup_vs_diam_csv.tellp() == 0) {
+    speedup_vs_diam_csv << "benchmark,diameter,speedup\n";
+  }
 
   if (err_vs_diam_dac21_csv.tellp() == 0) {
     err_vs_diam_dac21_csv << "benchmark,diameter,err\n";
   }
 
-  if (rt_vs_diam_ours_csv.tellp() == 0) {
-    rt_vs_diam_ours_csv << "benchmark,diameter,runtime\n";
-  }
 
-  if (err_vs_diam_ours_csv.tellp() == 0) {
-    err_vs_diam_ours_csv << "benchmark,diameter,err\n";
-  }
-
-
-  int N = cpgen_ours.num_verts();
-  int M = cpgen_ours.num_edges();
   std::chrono::duration<double, std::micro> total_sfxt_time{0};
   std::chrono::duration<double, std::micro> total_pfxt_time{0};
   
@@ -110,12 +98,12 @@ int main(int argc, char* argv[]) {
   total_sfxt_time = std::chrono::duration<double, std::micro>{0};
   total_pfxt_time = std::chrono::duration<double, std::micro>{0};
 
-  // run with no csr reorder
+  // run with csr reorder
   int runs = 10;
   for (int r = 0; r < runs; r++) {
     cpgen_ours.report_paths(num_paths, max_dev_lvls, enable_compress,
       gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SHORT_LONG,
-      false, 0.005f, 5.0f, 8, false, false, false, true,
+      false, 0.005f, 5.0f, 8, false, true, false, true,
       cr_method, enable_warp_spur);
     total_sfxt_time += cpgen_ours.prop_time;
     total_pfxt_time += cpgen_ours.expand_time;
@@ -126,49 +114,21 @@ int main(int argc, char* argv[]) {
 
   auto avg_total_time_ours = (total_sfxt_time+total_pfxt_time)/1ms/runs;
 
-  // calculate the average path cost error for no csr reorder
-  auto slks_no_cr = cpgen_ours.get_slacks(num_paths);
-  total_slk_error = 0.0f;
-  for (int i = 0; i < num_paths; i++) {
-    if (slks_golden_vec[i] > 0.0f) {
-      auto error = 
-        std::abs(slks_no_cr[i]-slks_golden_vec[i])*100.0f/slks_golden_vec[i];
-      total_slk_error += error;
-    }
-  }
-  auto avg_path_cost_error_ours = total_slk_error/num_paths;
   
-
   // now we have the graph diameter
   auto diam = cpgen_ours.graph_diameter;
 
   // write the results to the csv file
-  rt_vs_diam_dac21_csv << benchmark_name << ','
+  speedup_vs_diam_csv << benchmark_name << ',' 
     << diam << ','
-    << std::fixed << std::setprecision(2)
-    << avg_total_time_dac21 << '\n';
-
+    << std::fixed << std::setprecision(2) 
+    << avg_total_time_dac21/avg_total_time_ours << '\n';
+ 
   err_vs_diam_dac21_csv << benchmark_name << ','
     << diam << ','
     << std::fixed << std::setprecision(3)
     << avg_path_cost_error_dac21 << '\n';
 
-  rt_vs_diam_ours_csv << benchmark_name << ','
-    << diam << ','
-    << std::fixed << std::setprecision(2)
-    << avg_total_time_ours << '\n';
-
-  err_vs_diam_ours_csv << benchmark_name << ','
-    << diam << ','
-    << std::fixed << std::setprecision(3)
-    << avg_path_cost_error_ours << '\n';
-
-  // close the csv files
-  rt_vs_diam_dac21_csv.close();
-  err_vs_diam_dac21_csv.close();
-  rt_vs_diam_ours_csv.close();
-  err_vs_diam_ours_csv.close();
-
-  std::cout << cpgen_ours.benchmark_path << " runtime, error vs diameter written.\n";
+  std::cout << cpgen_ours.benchmark_path << " speedup, error vs diameter written.\n";
   return 0;
 }

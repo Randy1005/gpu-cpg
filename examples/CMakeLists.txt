@@ -1,4 +1,4 @@
-add_executable(cpg-short-long ${GPUCPG_EXAMPLE_DIR}/cpg-short-long.cu)
+add_executable(cpg ${GPUCPG_EXAMPLE_DIR}/cpg.cu)
 add_executable(levelize ${GPUCPG_EXAMPLE_DIR}/levelize.cu)
 add_executable(gen_benchmark ${GPUCPG_EXAMPLE_DIR}/gen_benchmark.cu)
 add_executable(gen_sizedup_benchmark ${GPUCPG_EXAMPLE_DIR}/gen_sizedup_benchmark.cu)
@@ -16,10 +16,12 @@ add_executable(gen-runtime-error-vs-k ${GPUCPG_EXAMPLE_DIR}/gen-runtime-error-vs
 add_executable(gen-runtime-error-vs-avgdeg ${GPUCPG_EXAMPLE_DIR}/gen-runtime-error-vs-avgdeg.cu)
 add_executable(gen-runtime-error-vs-diam ${GPUCPG_EXAMPLE_DIR}/gen-runtime-error-vs-diam.cu)
 add_executable(abl-study-gen-runtime-vs-delta ${GPUCPG_EXAMPLE_DIR}/abl-study-gen-runtime-vs-delta.cu)
-add_executable(cpg ${GPUCPG_EXAMPLE_DIR}/cpg.cu)
+add_executable(compare-warp-spur ${GPUCPG_EXAMPLE_DIR}/compare-warp-spur.cu)
+add_executable(cpg-runtime-breakdown ${GPUCPG_EXAMPLE_DIR}/cpg-runtime-breakdown.cu)
+add_executable(dump-graph-stats ${GPUCPG_EXAMPLE_DIR}/dump-graph-stats.cu)
 
 list(APPEND GPUCPG_EXAMPLES
-  cpg-short-long 
+  cpg 
   cpg-compare
   cpg-mteps
   levelize
@@ -37,7 +39,9 @@ list(APPEND GPUCPG_EXAMPLES
   gen-runtime-error-vs-avgdeg
   gen-runtime-error-vs-diam
   abl-study-gen-runtime-vs-delta
-  cpg)
+  compare-warp-spur
+  cpg-runtime-breakdown
+  dump-graph-stats)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}

@@ -3,13 +3,14 @@
 #include <iomanip>
 
 int main(int argc, char* argv[]) {
-  if (argc != 3) {
-    std::cerr << "usage: ./a.out [benchmark] [slks_golden_results]\n";
+  if (argc != 4) {
+    std::cerr << "usage: ./a.out [benchmark] [MDL] [slks_golden_results]\n";
     std::exit(1);
   }
 
   std::string benchmark = argv[1];
-  std::string slks_golden_results = argv[2];
+  auto mdl = std::stoi(argv[2]);
+  std::string slks_golden_results = argv[3];
 
   // read the golden results line by line
   std::ifstream slks_golden_results_file(slks_golden_results);
@@ -25,8 +26,6 @@ int main(int argc, char* argv[]) {
   // default settings for the big table
   auto cr_method = gpucpg::CsrReorderMethod::E_ORIENTED;
   bool enable_warp_spur{true};
-
-  int max_dev_lvls{10};
   bool enable_compress{true};
 
   gpucpg::CpGen
@@ -53,8 +52,8 @@ int main(int argc, char* argv[]) {
 
 
   // open a csv file to write the content 
-  std::ofstream dac21_runtime_vs_k_csv(benchmark_name+"-rt-vs-k-dac21.csv");
-  std::ofstream dac21_err_vs_k_csv(benchmark_name+"-err-vs-k-dac21.csv");
+  std::ofstream dac21_runtime_vs_k_csv(benchmark_name+"-rt-vs-k-dac21-mdl="+std::to_string(mdl)+".csv");
+  std::ofstream dac21_err_vs_k_csv(benchmark_name+"-err-vs-k-dac21-mdl="+std::to_string(mdl)+".csv");
   std::ofstream ours_runtime_vs_k_csv(benchmark_name+"-rt-vs-k-ours.csv");
   std::ofstream ours_err_vs_k_csv(benchmark_name+"-err-vs-k-ours.csv");
 
@@ -70,7 +69,7 @@ int main(int argc, char* argv[]) {
   // run ours for each k
   std::vector<float> slk_ours;
   for (int k = 10; k <= 1000000; k *= 10) {
-    cpgen_ours.report_paths(k, max_dev_lvls, enable_compress,
+    cpgen_ours.report_paths(k, 10, enable_compress,
       gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SHORT_LONG,
       false, 0.005f, 5.0f, 8, false, true, false, false, cr_method, enable_warp_spur);
 
@@ -85,8 +84,10 @@ int main(int argc, char* argv[]) {
     slk_ours = cpgen_ours.get_slacks(k);
     float total_error = 0.0f;
     for (int pi = 0; pi < k; pi++) {
-      total_error += 
-        std::abs(slks_golden_results_vec[pi]-slk_ours[pi])*100.0f/slks_golden_results_vec[pi];
+      if (slks_golden_results_vec[pi] > 0.0f) {
+        total_error += 
+          std::abs(slks_golden_results_vec[pi]-slk_ours[pi])*100.0f/slks_golden_results_vec[pi];
+      }
     }
 
     ours_err_vs_k_csv << k << ','
@@ -97,36 +98,37 @@ int main(int argc, char* argv[]) {
     slk_ours.clear();
   }  
 
-  // dac21 runtime and error is always the same
-  // because the only thing to change is MDL, we can't possibly
-  // know how many MDL is required for a given k
-  // so we just run the dac21 code once and use the same runtime
-  // but the error will be different for each k
-  const int num_paths = 1000000;
-  cpgen_dac21.report_paths(num_paths, max_dev_lvls, enable_compress,
-    gpucpg::PropDistMethod::BASIC, gpucpg::PfxtExpMethod::ATOMIC_ENQ,
-    false, 0.005f, 5.0f, 8, false, false);
+  std::vector<float> slks_dac21;
+  cpgen_dac21.report_paths(0, mdl, enable_compress,
+    gpucpg::PropDistMethod::BASIC, gpucpg::PfxtExpMethod::ATOMIC_ENQ);
   auto total_time = cpgen_dac21.prop_time+cpgen_dac21.expand_time;
-  auto slks_dac21 = cpgen_dac21.get_slacks(num_paths);
-
-  // calculate the average error for each k
-  // and write it to the csv file
-  // for k=10, 100, 1000, 10000, 100000, 1000000
-  for (int k = 10; k <= 1000000; k *= 10) {
-    // write runtime vs k 
+  slks_dac21 = cpgen_dac21.get_slacks(1000000);
+  int num_paths_dac21 = slks_dac21.size();
+  for (int k = 10; k <= 1000000; k *=10) {
+    // write the runtime
     dac21_runtime_vs_k_csv << k << ','
       << std::fixed << std::setprecision(2)
       << total_time/1ms << '\n';
 
+    // calculate the average error for each k
     float total_error = 0.0f;
     for (int pi = 0; pi < k; pi++) {
-      total_error += 
-        std::abs(slks_dac21[pi]-slks_golden_results_vec[pi])*100.0f/slks_dac21[pi];
+      if (slks_golden_results_vec[pi] > 0.0f) {
+        if (pi > num_paths_dac21) {
+          // use dac21's last slk to compare
+          auto dac21_last_slk = slks_dac21.back();
+          total_error += 
+            std::abs(slks_golden_results_vec[pi]-dac21_last_slk)*100.0f/slks_golden_results_vec[pi];
+        }
+        else {
+          total_error += 
+            std::abs(slks_golden_results_vec[pi]-slks_dac21[pi])*100.0f/slks_golden_results_vec[pi];
+        }
+      }
     }
 
-    // write error vs k
     dac21_err_vs_k_csv << k << ','
-      << std::fixed << std::setprecision(6)
+      << std::fixed << std::setprecision(3)
       << total_error/k << '\n';
   }
 

@@ -36,13 +36,14 @@ int main(int argc, char* argv[]) {
  
   // csvs to record the paths per step
   std::vector<std::ofstream> gen_paths_per_step_csvs(N);
+  std::ofstream gen_paths_per_step_dy_delta_csv(benchmark_name+"-acc-paths-per-step-d=DYN.csv");
 
 
   // write the header (also record the steps taken)
   rt_vs_delta_csv << "delta,steps,rt\n";
+
   
   for (int d = 0; d < N; d++) {
-
     float delta = delta_beg+d*delta_inc;
     cpgen.report_paths(num_paths, max_dev_lvls, enable_compress,
       gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SHORT_LONG,
@@ -67,6 +68,28 @@ int main(int argc, char* argv[]) {
       << total_time << '\n';
 
     cpgen.reset();
+  }
+
+  // run with dynamic delta
+  cpgen.report_paths(num_paths, max_dev_lvls, enable_compress,
+    gpucpg::PropDistMethod::LEVELIZE_THEN_RELAX, gpucpg::PfxtExpMethod::SHORT_LONG,
+    false, 0.005f, 5.0f, 8, false, false, false, true,
+    cr_method, enable_warp_spur);
+  
+  // write runtime
+  auto total_time = (cpgen.prop_time+cpgen.expand_time)/1ms;
+  rt_vs_delta_csv << "dynamic," 
+    << cpgen.short_long_expansion_steps << ','
+    << total_time << '\n';
+
+
+  // write the paths generated per step (accumulated)
+  gen_paths_per_step_dy_delta_csv << "step,paths\n";
+  int total_steps = cpgen.paths_gen_per_step.size();
+  int accum_paths{0};
+  for (int i = 0; i < total_steps; i++) {
+    accum_paths += cpgen.paths_gen_per_step[i];
+    gen_paths_per_step_dy_delta_csv << i << ',' << accum_paths << '\n';
   }
 
   // close the csv files
