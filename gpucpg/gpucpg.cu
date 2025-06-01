@@ -311,6 +311,9 @@ void CpGen::read_input(const std::string& filename) {
     for (const auto& [from, weight] : _h_fanin_edges[i]) {
       _h_fanin_adjncy.push_back(from);
       _h_fanin_wgts.push_back(weight);
+      
+      // update the inversed fanin edges
+      _h_inv_fanin_adjncy.push_back(i);
     }
   }
 }
@@ -3287,7 +3290,8 @@ void CpGen::report_paths(
   bool enable_interm_perf_log,
   const CsrReorderMethod cr_method,
   bool enable_tile_spur,
-  std::optional<float> fixed_split_inc_amount) {
+  std::optional<float> fixed_split_inc_amount,
+  std::optional<std::string> reorder_file) {
 
   // set cache configuration
   // cudaFuncSetCacheConfig(prop_distance_bfs_td_step_privatized, cudaFuncCachePreferShared);
@@ -3337,6 +3341,7 @@ void CpGen::report_paths(
   thrust::device_vector<int> fanout_adjp(_h_fanout_adjp);
   thrust::device_vector<float> fanout_wgts(_h_fanout_wgts);
 
+  thrust::device_vector<int> inv_fanin_adjncy(_h_inv_fanin_adjncy);
   thrust::device_vector<int> inv_fanout_adjncy(_h_inv_fanout_adjncy);
 
   // shortest distances
@@ -3363,6 +3368,7 @@ void CpGen::report_paths(
   int* d_fanout_adjncy = thrust::raw_pointer_cast(&fanout_adjncy[0]);
   float* d_fanout_wgts = thrust::raw_pointer_cast(&fanout_wgts[0]);
 
+  auto d_inv_fanin_adjncy = thrust::raw_pointer_cast(inv_fanin_adjncy.data());
   auto d_inv_fanout_adjncy = thrust::raw_pointer_cast(inv_fanout_adjncy.data());
 
   int* d_dists_cache = thrust::raw_pointer_cast(&dists_cache[0]);
@@ -3428,6 +3434,7 @@ void CpGen::report_paths(
   auto d_reordered_fanout_adjncy = thrust::raw_pointer_cast(reordered_fanout_adjncy.data());
   auto d_reordered_fanout_wgts = thrust::raw_pointer_cast(reordered_fanout_wgts.data());
   
+
   reordered_fanout_adjp[0] = 0;
   int num_sinks = _sinks.size();
   for (int i = 0; i < num_sinks; i++) {
@@ -3482,10 +3489,329 @@ void CpGen::report_paths(
 
     Timer timer;
 
+    // the other graph reoder methods generate a text file
+    // but have different usages
+    // e.g., rabbit ordering generates a vertex mapping file (.vmap)
+    // Gorder generates the fanout adjacency list
+    if (cr_method == CsrReorderMethod::RABBIT) {
+      // read in the rabbit reordering vmap file
+      if (!reorder_file) {
+        throw std::runtime_error("Rabbit reordering method requires a vmap file.");
+      }
+
+      std::ifstream vmap_ifs(*reorder_file);
+      if (!vmap_ifs.is_open()) {
+        throw std::runtime_error("Failed to open rabbit vmap file.");
+      }
+
+      std::vector<int> h_rabbit_vmap(N);
+      // read the vmap file line by line
+      std::string line;
+      int vid = 0;
+      while (std::getline(vmap_ifs, line)) {
+        h_rabbit_vmap[vid++] = stoi(line); 
+      }
+      vmap_ifs.close();
+      
+      std::cout << "vmap read complete.\n";
+
+      // update sinks
+      dists_cache = thrust::device_vector<int>(N, std::numeric_limits<int>::max());
+      for (auto &s: _sinks) {
+        s = h_rabbit_vmap[s];
+        dists_cache[s] = 0;
+      }
+      d_dists_cache = thrust::raw_pointer_cast(dists_cache.data());
+
+      // update srcs
+      for (auto &s: _srcs) {
+        s = h_rabbit_vmap[s];
+      }
+
+      // update queue
+      queue = thrust::device_vector<int>(N, -1);
+      thrust::copy(_sinks.begin(), _sinks.end(), queue.begin());
+      d_queue = thrust::raw_pointer_cast(queue.data());
+
+      Timer timer_rabbit;
+      // TODO: should I update the CSR on cpu or gpu?
+      // I'll do cpu for now (probably better for motivation)
+      // first the fanin adj pointers
+      timer_rabbit.start();
+      std::vector<int> h_reordered_fanin_adjp(N+1, 0);
+      #pragma omp parallel for
+      for (int vid = 0; vid < N; vid++) {
+        int new_vid = h_rabbit_vmap[vid];
+        int ideg = _h_fanin_adjp[vid+1]-_h_fanin_adjp[vid];
+
+        h_reordered_fanin_adjp[new_vid+1] = ideg;
+      }
+
+      // do a thrust inclusive scan
+      thrust::inclusive_scan(
+        thrust::host,
+        h_reordered_fanin_adjp.begin(), 
+        h_reordered_fanin_adjp.end(), 
+        h_reordered_fanin_adjp.begin());
+
+      // then the fanin adjacencies and wgts
+      std::vector<int> h_reordered_fanin_adjncy(M);
+      std::vector<float> h_reordered_fanin_wgts(M);
+      #pragma omp parallel for
+      for (int v = 0; v < N; v++) {
+        int ubeg = _h_fanin_adjp[v];
+        int uend = _h_fanin_adjp[v+1];
+        int new_vid = h_rabbit_vmap[v];
+        int new_ubeg = h_reordered_fanin_adjp[new_vid];
+        for (int e = ubeg; e < uend; e++) {
+          float wgt = _h_fanin_wgts[e];
+          int new_uid = h_rabbit_vmap[_h_fanin_adjncy[e]];
+          h_reordered_fanin_adjncy[new_ubeg+(e-ubeg)] = new_uid;
+          h_reordered_fanin_wgts[new_ubeg+(e-ubeg)] = wgt;
+        }
+      }
+
+      // then the fanout adj pointers
+      std::vector<int> h_reordered_fanout_adjp(N+1, 0);
+      std::vector<int> h_new_out_degrees(N, 0);
+      #pragma omp parallel for
+      for (int uid = 0; uid < N; uid++) {
+        int new_uid = h_rabbit_vmap[uid];
+        int odeg = _h_fanout_adjp[uid+1]-_h_fanout_adjp[uid];
+        h_reordered_fanout_adjp[new_uid+1] = odeg;
+        h_new_out_degrees[new_uid] = odeg;
+      }
+
+      // do a thrust inclusive scan
+      thrust::inclusive_scan(
+        thrust::host,
+        h_reordered_fanout_adjp.begin(), 
+        h_reordered_fanout_adjp.end(), 
+        h_reordered_fanout_adjp.begin());
+
+      // then the fanout adjacencies and wgts
+      std::vector<int> h_reordered_fanout_adjncy(M);
+      std::vector<float> h_reordered_fanout_wgts(M);
+      #pragma omp parallel for
+      for (int u = 0; u < N; u++) {
+        int vbeg = _h_fanout_adjp[u];
+        int vend = _h_fanout_adjp[u+1];
+        int new_uid = h_rabbit_vmap[u];
+        int new_vbeg = h_reordered_fanout_adjp[new_uid];
+        for (int e = vbeg; e < vend; e++) {
+          float wgt = _h_fanout_wgts[e];
+          int new_vid = h_rabbit_vmap[_h_fanout_adjncy[e]];
+          h_reordered_fanout_adjncy[new_vbeg+(e-vbeg)] = new_vid;
+          h_reordered_fanout_wgts[new_vbeg+(e-vbeg)] = wgt;
+        }
+      }
+      
+      timer_rabbit.stop();
+      rabbit_update_csr_time = timer_rabbit.get_elapsed_time();
+
+      // update dependency counter
+      deps = h_new_out_degrees;
+      
+      std::cout << "rabbit csr update complete.\n";
+      // copy the reordered csr to device
+      timer_rabbit.start();
+      thrust::copy(
+        h_reordered_fanin_adjp.begin(), 
+        h_reordered_fanin_adjp.end(), 
+        fanin_adjp.begin());
+      d_fanin_adjp = thrust::raw_pointer_cast(fanin_adjp.data());
+
+      thrust::copy(
+        h_reordered_fanin_adjncy.begin(), 
+        h_reordered_fanin_adjncy.end(), 
+        fanin_adjncy.begin());
+      d_fanin_adjncy = thrust::raw_pointer_cast(fanin_adjncy.data());
+
+      thrust::copy(
+        h_reordered_fanin_wgts.begin(), 
+        h_reordered_fanin_wgts.end(), 
+        fanin_wgts.begin());
+      d_fanin_wgts = thrust::raw_pointer_cast(fanin_wgts.data());
+
+      thrust::copy(
+        h_reordered_fanout_adjp.begin(), 
+        h_reordered_fanout_adjp.end(), 
+        fanout_adjp.begin());
+      d_fanout_adjp = thrust::raw_pointer_cast(fanout_adjp.data());
+
+      thrust::copy(
+        h_reordered_fanout_adjncy.begin(), 
+        h_reordered_fanout_adjncy.end(), 
+        fanout_adjncy.begin());
+      d_fanout_adjncy = thrust::raw_pointer_cast(fanout_adjncy.data());
+
+      thrust::copy(
+        h_reordered_fanout_wgts.begin(), 
+        h_reordered_fanout_wgts.end(), 
+        fanout_wgts.begin());
+      d_fanout_wgts = thrust::raw_pointer_cast(fanout_wgts.data());
+
+      timer_rabbit.stop();
+      rabbit_copy_to_gpu_time = timer_rabbit.get_elapsed_time();
+      std::cout << "rabbit csr copy to gpu complete.\n";
+    }
+    else if (cr_method == CsrReorderMethod::GORDER) {
+      // Gorder generates a fanout adjacency list
+      // we can directly read and build the fanout csr
+      // but will need to rebuild the fanin csr ourselves
+
+      // read in the gorder fanout adjacency list
+      if (!reorder_file) {
+        throw std::runtime_error("Gorder reordering method requires a fanout adjacency list file.");
+      }
+
+      std::ifstream gorder_ifs(*reorder_file);
+      if (!gorder_ifs.is_open()) {
+        throw std::runtime_error("Failed to open gorder fanout adjacency list file.");
+      }
+
+      std::vector<int> h_reordered_fanout_adjncy(M);
+      std::vector<int> h_reordered_fanout_adjp(N+1, 0);
+
+      // TODO: use same weights for now, because Gorder does not tell
+      // us the vertex mapping, we'll have to figure out where to put
+      // the weights ourselves
+      // std::vector<float> h_reordered_fanout_wgts(M, 0.1f);
+
+      std::vector<std::vector<int>> h_fanin_adjncy_vec_of_vec(N);
+      std::vector<int> h_reordered_fanin_adjncy(M);
+      std::vector<int> h_reordered_fanin_adjp(N+1, 0);
+      // std::vector<float> h_reordered_fanin_wgts(M, 0.1f);
+
+      // read in the fanout adjncy
+      std::string line;
+      int idx{0};
+      while (std::getline(gorder_ifs, line)) {
+        // each line is an edge
+        std::istringstream iss(line);
+        int u, v;
+        iss >> u >> v;
+        h_reordered_fanout_adjncy[idx++] = v;
+        h_reordered_fanout_adjp[u+1]++;
+
+        // record the fanin adjacency list too
+        h_fanin_adjncy_vec_of_vec[v].emplace_back(u);
+      }
+      gorder_ifs.close();
+
+      // do a thrust inclusive scan to finalize the fanout adj pointers
+      thrust::inclusive_scan(
+        thrust::host,
+        h_reordered_fanout_adjp.begin(), 
+        h_reordered_fanout_adjp.end(), 
+        h_reordered_fanout_adjp.begin());
+
+      // find the new sinks (and record the new out degrees)
+      std::vector<int> h_new_sinks;
+      std::vector<int> h_new_out_degrees(N, 0);
+      for (int u = 0; u < N; u++) {
+        int odeg = h_reordered_fanout_adjp[u+1]-h_reordered_fanout_adjp[u];
+        h_new_out_degrees[u] = odeg;
+        if (odeg == 0) {
+          h_new_sinks.emplace_back(u);
+        }
+      }
+
+      // build the fanin adjacency adjp (and also find the new srcs)
+      std::vector<int> h_new_srcs;
+      for (int v = 0; v < N; v++) {
+        int ideg = h_fanin_adjncy_vec_of_vec[v].size();
+        h_reordered_fanin_adjp[v+1] = ideg;
+        if (ideg == 0) {
+          h_new_srcs.emplace_back(v);
+        }
+      }
+
+      // do a thrust inclusive scan to finalize the fanin adj pointers
+      thrust::inclusive_scan(
+        thrust::host,
+        h_reordered_fanin_adjp.begin(), 
+        h_reordered_fanin_adjp.end(), 
+        h_reordered_fanin_adjp.begin());
+
+      // fill in the fanin adjacency list
+      for (int v = 0; v < N; v++) {
+        int ubeg = h_reordered_fanin_adjp[v];
+        int uend = h_reordered_fanin_adjp[v+1];
+        // copy the whole segment
+        std::copy(
+          h_fanin_adjncy_vec_of_vec[v].begin(), 
+          h_fanin_adjncy_vec_of_vec[v].end(), 
+          h_reordered_fanin_adjncy.begin()+ubeg); 
+      }
+
+      // update the srcs
+      _srcs = std::move(h_new_srcs);
+
+      // update the sinks
+      _sinks = std::move(h_new_sinks);
+
+      // device side updates
+      // out degrees
+      deps = h_new_out_degrees;
+      d_out_degs = thrust::raw_pointer_cast(deps.data());
+
+      // queue
+      queue = thrust::device_vector<int>(N, -1);
+      thrust::copy(_sinks.begin(), _sinks.end(), queue.begin());
+      d_queue = thrust::raw_pointer_cast(queue.data());
+      
+      // update the distances
+      dists_cache = thrust::device_vector<int>(N, std::numeric_limits<int>::max());
+      for (const auto& s: _sinks) {
+        dists_cache[s] = 0;
+      }
+      d_dists_cache = thrust::raw_pointer_cast(dists_cache.data());
+
+      // copy the reordered csr to device
+      // fanin csr
+      thrust::copy(
+        h_reordered_fanin_adjp.begin(), 
+        h_reordered_fanin_adjp.end(), 
+        fanin_adjp.begin());
+      d_fanin_adjp = thrust::raw_pointer_cast(fanin_adjp.data());
+
+      thrust::copy(
+        h_reordered_fanin_adjncy.begin(), 
+        h_reordered_fanin_adjncy.end(), 
+        fanin_adjncy.begin());
+      d_fanin_adjncy = thrust::raw_pointer_cast(fanin_adjncy.data());
+
+      // thrust::copy(
+      //   h_reordered_fanin_wgts.begin(), 
+      //   h_reordered_fanin_wgts.end(), 
+      //   fanin_wgts.begin());
+      // d_fanin_wgts = thrust::raw_pointer_cast(fanin_wgts.data());
+
+      // fanout csr
+      thrust::copy(
+        h_reordered_fanout_adjp.begin(), 
+        h_reordered_fanout_adjp.end(), 
+        fanout_adjp.begin());
+      d_fanout_adjp = thrust::raw_pointer_cast(fanout_adjp.data());
+
+      thrust::copy(
+        h_reordered_fanout_adjncy.begin(), 
+        h_reordered_fanout_adjncy.end(), 
+        fanout_adjncy.begin());
+      d_fanout_adjncy = thrust::raw_pointer_cast(fanout_adjncy.data());
+
+      // thrust::copy(
+      //   h_reordered_fanout_wgts.begin(), 
+      //   h_reordered_fanout_wgts.end(), 
+      //   fanout_wgts.begin());
+      // d_fanout_wgts = thrust::raw_pointer_cast(fanout_wgts.data());
+    }
+
     if (enable_interm_perf_log) {
       timer.start();
     }
-    // levelize
+    // levelization phase
     while (num_curr_ftrs) {
       // record the depth offset
       _h_verts_lvlp.emplace_back(_h_verts_lvlp.back()+num_curr_ftrs);
@@ -3524,6 +3850,7 @@ void CpGen::report_paths(
       curr_depth++;
     }
 
+
     graph_diameter = curr_depth;
     
     if (enable_interm_perf_log) {
@@ -3537,12 +3864,6 @@ void CpGen::report_paths(
       if (enable_interm_perf_log) {
         timer.start();
       }
-
-      // thrust::inclusive_scan(
-      //   thrust::device,
-      //   reordered_fanout_adjp.begin(), 
-      //   reordered_fanout_adjp.end(), 
-      //   reordered_fanout_adjp.begin());
 
       // use cub to do the prefix sum
       // to organize the r_adjp array
@@ -3630,6 +3951,7 @@ void CpGen::report_paths(
             d_reordered_fanout_wgts,
             d_reidx_map); 
       }
+      
 
       if (enable_interm_perf_log) {
         cudaDeviceSynchronize();
@@ -3637,6 +3959,7 @@ void CpGen::report_paths(
         csr_reorder_time = timer.get_elapsed_time();
         std::cout << "reorder csr time=" << csr_reorder_time/1ms << " ms\n";
       }
+
       thrust::sequence(
         thrust::device,
         queue.begin(),
@@ -4246,23 +4569,18 @@ void CpGen::report_paths(
   // copy distance vector back to host
   std::vector<int> h_dists(N);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
+  _h_dists = dists_cache;
+  _h_queue = queue;
   
   // temporary implementation to make sure pfxt expansion
   // also uses the reordered csr, we do not actually need
   // to copy, we can just tell pfxt to use the reordered csr
   // directly
   if (enable_reindex_gpu) {
-    // fanout_adjp = reordered_fanout_adjp;
-    // fanout_adjncy = reordered_fanout_adjncy;
-    // fanout_wgts = reordered_fanout_wgts;
     std::swap(d_fanout_adjp, d_reordered_fanout_adjp);
     std::swap(d_fanout_adjncy, d_reordered_fanout_adjncy);
     std::swap(d_fanout_wgts, d_reordered_fanout_wgts);
 
-    // update the host side storages too
-    // thrust::copy(reordered_fanout_adjp.begin(), reordered_fanout_adjp.end(), _h_fanout_adjp.begin());
-    // thrust::copy(reordered_fanout_adjncy.begin(), reordered_fanout_adjncy.end(), _h_fanout_adjncy.begin());
-    // thrust::copy(reordered_fanout_wgts.begin(), reordered_fanout_wgts.end(), _h_fanout_wgts.begin());
   
     // update srcs
     for (auto& src: _srcs) {
@@ -5273,6 +5591,25 @@ std::vector<PfxtNode> CpGen::get_pfxt_nodes(int k) {
   return nodes;
 }  
 
+
+void CpGen::dump_elist(std::ostream& os) const {
+  // dumps the edge list of the fanout graph
+  // format is like:
+  // 0 1
+  // 0 3
+  // 1 11
+  // 1 10
+  // meaning vertex 0 has edges to vertices 1 and 3
+  // vertex 0 has edges to vertices 1 and 3
+  // vertex 1 has edges to vertices 3 and 11
+  for (size_t i = 0; i < _h_fanout_adjp.size() - 1; i++) {
+    auto edge_beg = _h_fanout_adjp[i];
+    auto edge_end = _h_fanout_adjp[i+1];
+    for (int j = edge_beg; j < edge_end; j++) {
+      os << i << ' ' << _h_fanout_adjncy[j] << '\n';
+    }
+  }
+}
 
 void CpGen::dump_csrs(std::ostream& os) const {
   for (size_t i = 0; i < _h_fanin_adjp.size() - 1; i++) {

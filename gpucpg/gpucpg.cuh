@@ -13,6 +13,7 @@
 #include <functional>
 #include <unordered_map>
 #include <optional>
+#include <thrust/host_vector.h>
 #include "timer.hpp"
 
 namespace gpucpg {
@@ -45,7 +46,9 @@ enum class CsrReorderMethod {
   V_ORIENTED = 0,
   V_ORIENTED_TILE_SCAN,
   E_ORIENTED,
-  E_ORIENTED_VEC2
+  E_ORIENTED_VEC2,
+  RABBIT,
+  GORDER
 };
 
 struct PfxtNode {
@@ -153,7 +156,8 @@ public:
     bool enable_interm_perf_log = false,
     const CsrReorderMethod csr_reorder_method = CsrReorderMethod::E_ORIENTED,
     bool enable_tile_spur = false,
-    std::optional<float> fixed_split_inc_amount = std::nullopt);
+    std::optional<float> fixed_split_inc_amount = std::nullopt,
+    std::optional<std::string> rabbit_vmap_file = std::nullopt);
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
@@ -163,6 +167,8 @@ public:
       const std::string& filename,
       std::ostream& os, 
       int multiplier) const;
+
+  void dump_elist(std::ostream& os) const;
 
   void densify_graph(const int desired_avg_degree);
   void export_to_benchmark(const std::string& filename) const;
@@ -218,12 +224,29 @@ public:
     return res;
   }
 
+  void dump_lvlp(std::ostream& os) const {
+    for (const auto& lvlp : _h_verts_lvlp) {
+      os << lvlp << '\n';
+    }
+  }
+
+  void dump_dists_in_topo_order(std::ostream& os) const {
+    std::cout << "num_sinks=" << _sinks.size() << '\n';
+    for (const auto& v : _h_queue) {
+      os << _h_dists[v] << '\n';
+    }
+  }
+
+
   std::chrono::duration<double, std::micro> prop_time;
   std::chrono::duration<double, std::micro> expand_time;
   std::chrono::duration<double, std::micro> lvlize_time;
   std::chrono::duration<double, std::micro> prefix_scan_time;
   std::chrono::duration<double, std::micro> csr_reorder_time;
   std::chrono::duration<double, std::micro> relax_time;
+
+  std::chrono::duration<double, std::micro> rabbit_copy_to_gpu_time;
+  std::chrono::duration<double, std::micro> rabbit_update_csr_time;
 
   int short_long_expansion_steps{0};
 
@@ -259,8 +282,9 @@ private:
   std::vector<int> _h_fanout_adjncy;
   std::vector<float> _h_fanout_wgts;
 
-  // inversed fanout CSR storage
+  // inversed CSR storage
   std::vector<int> _h_inv_fanout_adjncy;
+  std::vector<int> _h_inv_fanin_adjncy;
 
   // store source and sink vertices
   std::vector<int> _srcs;
@@ -280,6 +304,10 @@ private:
 
   std::vector<int> _reindex_map;
   std::vector<int> _h_lvl_of;
+
+  // debugging
+  thrust::host_vector<int> _h_dists;
+  thrust::host_vector<int> _h_queue;
 
   // queue head and tail
   int* _d_qhead;

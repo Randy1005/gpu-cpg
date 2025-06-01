@@ -19,9 +19,13 @@ add_executable(abl-study-gen-runtime-vs-delta ${GPUCPG_EXAMPLE_DIR}/abl-study-ge
 add_executable(compare-warp-spur ${GPUCPG_EXAMPLE_DIR}/compare-warp-spur.cu)
 add_executable(cpg-runtime-breakdown ${GPUCPG_EXAMPLE_DIR}/cpg-runtime-breakdown.cu)
 add_executable(dump-graph-stats ${GPUCPG_EXAMPLE_DIR}/dump-graph-stats.cu)
+add_executable(dump-elist ${GPUCPG_EXAMPLE_DIR}/dump-elist.cu)
+add_executable(cpg-other-vrs ${GPUCPG_EXAMPLE_DIR}/cpg-other-vrs.cu)
+
 
 list(APPEND GPUCPG_EXAMPLES
   cpg 
+  cpg-other-vrs
   cpg-compare
   cpg-mteps
   levelize
@@ -41,7 +45,8 @@ list(APPEND GPUCPG_EXAMPLES
   abl-study-gen-runtime-vs-delta
   compare-warp-spur
   cpg-runtime-breakdown
-  dump-graph-stats)
+  dump-graph-stats
+  dump-elist)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}
