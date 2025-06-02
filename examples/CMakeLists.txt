@@ -21,6 +21,7 @@ add_executable(cpg-runtime-breakdown ${GPUCPG_EXAMPLE_DIR}/cpg-runtime-breakdown
 add_executable(dump-graph-stats ${GPUCPG_EXAMPLE_DIR}/dump-graph-stats.cu)
 add_executable(dump-elist ${GPUCPG_EXAMPLE_DIR}/dump-elist.cu)
 add_executable(cpg-other-vrs ${GPUCPG_EXAMPLE_DIR}/cpg-other-vrs.cu)
+add_executable(dump-csr-bin ${GPUCPG_EXAMPLE_DIR}/dump-csr-bin.cu)
 
 
 list(APPEND GPUCPG_EXAMPLES
@@ -46,7 +47,8 @@ list(APPEND GPUCPG_EXAMPLES
   compare-warp-spur
   cpg-runtime-breakdown
   dump-graph-stats
-  dump-elist)
+  dump-elist
+  dump-csr-bin)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}

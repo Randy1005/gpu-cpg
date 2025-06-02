@@ -222,7 +222,7 @@ void CpGen::dump_benchmark_with_wgts(const std::string& filename, std::ostream& 
 }
 
 
-void CpGen::read_input(const std::string& filename) {
+void CpGen::read_input(const std::string& filename, bool ignore_wgts) {
   std::ifstream infile(filename);
   if (!infile) {
     throw std::runtime_error("Unable to open file: " + filename);
@@ -253,7 +253,7 @@ void CpGen::read_input(const std::string& filename) {
   while (std::getline(infile, line)) {
     std::istringstream iss(line);
     std::string from_str, to_str;
-    float weight = 0.1; // Default weight
+    float weight = 1.0; // Default weight
 
     // Parse edge format "from" -> "to", [weight];
     std::getline(iss, from_str, '"');
@@ -264,7 +264,7 @@ void CpGen::read_input(const std::string& filename) {
     int from = std::stoi(from_str);
     int to = std::stoi(to_str);
 
-    if (line.find(",") != std::string::npos) { // Check for optional weight
+    if (!ignore_wgts && line.find(",") != std::string::npos) { // Check for optional weight
       std::string weight_str;
       std::getline(iss, weight_str, ',');
       std::getline(iss, weight_str, ';');
@@ -3627,11 +3627,11 @@ void CpGen::report_paths(
         fanin_adjncy.begin());
       d_fanin_adjncy = thrust::raw_pointer_cast(fanin_adjncy.data());
 
-      thrust::copy(
-        h_reordered_fanin_wgts.begin(), 
-        h_reordered_fanin_wgts.end(), 
-        fanin_wgts.begin());
-      d_fanin_wgts = thrust::raw_pointer_cast(fanin_wgts.data());
+      // thrust::copy(
+      //   h_reordered_fanin_wgts.begin(), 
+      //   h_reordered_fanin_wgts.end(), 
+      //   fanin_wgts.begin());
+      // d_fanin_wgts = thrust::raw_pointer_cast(fanin_wgts.data());
 
       thrust::copy(
         h_reordered_fanout_adjp.begin(), 
@@ -3645,11 +3645,11 @@ void CpGen::report_paths(
         fanout_adjncy.begin());
       d_fanout_adjncy = thrust::raw_pointer_cast(fanout_adjncy.data());
 
-      thrust::copy(
-        h_reordered_fanout_wgts.begin(), 
-        h_reordered_fanout_wgts.end(), 
-        fanout_wgts.begin());
-      d_fanout_wgts = thrust::raw_pointer_cast(fanout_wgts.data());
+      // thrust::copy(
+      //   h_reordered_fanout_wgts.begin(), 
+      //   h_reordered_fanout_wgts.end(), 
+      //   fanout_wgts.begin());
+      // d_fanout_wgts = thrust::raw_pointer_cast(fanout_wgts.data());
 
       timer_rabbit.stop();
       rabbit_copy_to_gpu_time = timer_rabbit.get_elapsed_time();
@@ -3673,7 +3673,7 @@ void CpGen::report_paths(
       std::vector<int> h_reordered_fanout_adjncy(M);
       std::vector<int> h_reordered_fanout_adjp(N+1, 0);
 
-      // TODO: use same weights for now, because Gorder does not tell
+      // TODO: use unit weights for now, because Gorder does not tell
       // us the vertex mapping, we'll have to figure out where to put
       // the weights ourselves
       // std::vector<float> h_reordered_fanout_wgts(M, 0.1f);
@@ -3699,6 +3699,9 @@ void CpGen::report_paths(
       }
       gorder_ifs.close();
 
+      Timer timer_gorder;
+
+      timer_gorder.start();
       // do a thrust inclusive scan to finalize the fanout adj pointers
       thrust::inclusive_scan(
         thrust::host,
@@ -3735,6 +3738,7 @@ void CpGen::report_paths(
         h_reordered_fanin_adjp.begin());
 
       // fill in the fanin adjacency list
+      #pragma omp parallel for
       for (int v = 0; v < N; v++) {
         int ubeg = h_reordered_fanin_adjp[v];
         int uend = h_reordered_fanin_adjp[v+1];
@@ -3744,6 +3748,8 @@ void CpGen::report_paths(
           h_fanin_adjncy_vec_of_vec[v].end(), 
           h_reordered_fanin_adjncy.begin()+ubeg); 
       }
+      timer_gorder.stop();
+      gorder_update_csr_time = timer_gorder.get_elapsed_time();
 
       // update the srcs
       _srcs = std::move(h_new_srcs);
@@ -3769,6 +3775,7 @@ void CpGen::report_paths(
       d_dists_cache = thrust::raw_pointer_cast(dists_cache.data());
 
       // copy the reordered csr to device
+      timer_gorder.start();
       // fanin csr
       thrust::copy(
         h_reordered_fanin_adjp.begin(), 
@@ -3806,6 +3813,17 @@ void CpGen::report_paths(
       //   h_reordered_fanout_wgts.end(), 
       //   fanout_wgts.begin());
       // d_fanout_wgts = thrust::raw_pointer_cast(fanout_wgts.data());
+      timer_gorder.stop();
+      gorder_copy_to_gpu_time = timer_gorder.get_elapsed_time();
+    }
+    else if (cr_method == CsrReorderMethod::CORDER) {
+      if (!reorder_file) {
+        throw std::runtime_error("Corder reordering method requires a csr-bin file.");
+      }
+
+      // TODO: figure out how to read in the binary file
+            
+
     }
 
     if (enable_interm_perf_log) {
@@ -5516,6 +5534,8 @@ void CpGen::report_paths(
   cudaFree(next_ftr_tail);
   cudaFree(next_rem_tail);
   _free();
+
+  std::cout << "pfxt expansion completed.\n";
 }
 
 void CpGen::levelize() {
@@ -5592,21 +5612,25 @@ std::vector<PfxtNode> CpGen::get_pfxt_nodes(int k) {
 }  
 
 
-void CpGen::dump_elist(std::ostream& os) const {
+void CpGen::dump_elist(std::ostream& os, bool dump_wgt) const {
   // dumps the edge list of the fanout graph
   // format is like:
-  // 0 1
-  // 0 3
-  // 1 11
-  // 1 10
-  // meaning vertex 0 has edges to vertices 1 and 3
-  // vertex 0 has edges to vertices 1 and 3
-  // vertex 1 has edges to vertices 3 and 11
+  // 0 1 1.5
+  // 0 3 0.1
+  // 1 11 1.3
+  // 1 10 2.3
+  // meaning vertex 0 has edges to vertex 1, if dump_wgt is true
+  // dump 1.5 as well
   for (size_t i = 0; i < _h_fanout_adjp.size() - 1; i++) {
     auto edge_beg = _h_fanout_adjp[i];
     auto edge_end = _h_fanout_adjp[i+1];
     for (int j = edge_beg; j < edge_end; j++) {
-      os << i << ' ' << _h_fanout_adjncy[j] << '\n';
+      if (dump_wgt) {
+        os << i << ' ' << _h_fanout_adjncy[j] << ' ' << _h_fanout_wgts[j] << '\n';
+      }
+      else {
+        os << i << ' ' << _h_fanout_adjncy[j] << '\n';
+      }
     }
   }
 }

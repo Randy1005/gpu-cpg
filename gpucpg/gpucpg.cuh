@@ -15,6 +15,8 @@
 #include <optional>
 #include <thrust/host_vector.h>
 #include "timer.hpp"
+#include "graph.h"
+
 
 namespace gpucpg {
 struct PfxtNode;
@@ -48,7 +50,8 @@ enum class CsrReorderMethod {
   E_ORIENTED,
   E_ORIENTED_VEC2,
   RABBIT,
-  GORDER
+  GORDER,
+  CORDER
 };
 
 struct PfxtNode {
@@ -99,7 +102,7 @@ struct pfxt_node_comp {
 class CpGen {  
 public:
   CpGen() = default;
-  void read_input(const std::string& filename);
+  void read_input(const std::string& filename, bool ignore_wgts = false);
   void convert_dimacs(const std::string& dimacs_file, const std::string& output_file);
   void levelize();
   
@@ -168,7 +171,7 @@ public:
       std::ostream& os, 
       int multiplier) const;
 
-  void dump_elist(std::ostream& os) const;
+  void dump_elist(std::ostream& os, bool dump_wgt = false) const;
 
   void densify_graph(const int desired_avg_degree);
   void export_to_benchmark(const std::string& filename) const;
@@ -238,6 +241,19 @@ public:
   }
 
 
+  void write_to_csr_bin(std::string& filename) {
+    auto graph = Graph(
+      num_verts(),
+      num_edges(),
+      _h_fanout_adjncy,
+      _h_fanout_adjncy,
+      _h_fanout_wgts,
+      true);
+
+    graph.write_to_bin(filename);
+  }
+
+
   std::chrono::duration<double, std::micro> prop_time;
   std::chrono::duration<double, std::micro> expand_time;
   std::chrono::duration<double, std::micro> lvlize_time;
@@ -247,6 +263,12 @@ public:
 
   std::chrono::duration<double, std::micro> rabbit_copy_to_gpu_time;
   std::chrono::duration<double, std::micro> rabbit_update_csr_time;
+
+  std::chrono::duration<double, std::micro> gorder_copy_to_gpu_time;
+  std::chrono::duration<double, std::micro> gorder_update_csr_time;
+
+  std::chrono::duration<double, std::micro> corder_copy_to_gpu_time;
+  std::chrono::duration<double, std::micro> corder_update_csr_time;
 
   int short_long_expansion_steps{0};
 
