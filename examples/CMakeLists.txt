@@ -22,6 +22,7 @@ add_executable(dump-graph-stats ${GPUCPG_EXAMPLE_DIR}/dump-graph-stats.cu)
 add_executable(dump-elist ${GPUCPG_EXAMPLE_DIR}/dump-elist.cu)
 add_executable(cpg-other-vrs ${GPUCPG_EXAMPLE_DIR}/cpg-other-vrs.cu)
 add_executable(dump-csr-bin ${GPUCPG_EXAMPLE_DIR}/dump-csr-bin.cu)
+add_executable(triton-sfxt-dump ${GPUCPG_EXAMPLE_DIR}/triton-sfxt-dump.cu)
 
 
 list(APPEND GPUCPG_EXAMPLES
@@ -48,7 +49,8 @@ list(APPEND GPUCPG_EXAMPLES
   cpg-runtime-breakdown
   dump-graph-stats
   dump-elist
-  dump-csr-bin)
+  dump-csr-bin
+  triton-sfxt-dump)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}

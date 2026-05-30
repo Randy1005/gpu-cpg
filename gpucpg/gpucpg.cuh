@@ -13,6 +13,7 @@
 #include <functional>
 #include <unordered_map>
 #include <optional>
+#include <iomanip>
 #include <thrust/host_vector.h>
 #include "timer.hpp"
 #include "graph.h"
@@ -216,6 +217,40 @@ public:
     // reset generated paths per step
     paths_gen_per_step.clear();
     paths_gen_per_step.shrink_to_fit();
+  }
+
+  void dump_sfxt_by_vertex(std::ostream& os) const {
+    constexpr double scale_up = 10000.0;
+    for (size_t i = 0; i < _h_dists.size(); ++i) {
+      os << i << ' ' << std::fixed << std::setprecision(4)
+         << static_cast<double>(_h_dists[i]) / scale_up << '\n';
+    }
+  }
+
+  void dump_fanout_edges_tfm(std::ostream& os) const {
+    constexpr int scale_up = 10000;
+    for (size_t src = 0; src + 1 < _h_fanout_adjp.size(); ++src) {
+      for (int e = _h_fanout_adjp[src]; e < _h_fanout_adjp[src + 1]; ++e) {
+        const int scaled_wgt = static_cast<int>(_h_fanout_wgts[e] * scale_up);
+        os << src << ' ' << _h_fanout_adjncy[e] << ' '
+           << std::fixed << std::setprecision(4)
+           << static_cast<double>(scaled_wgt) / scale_up << '\n';
+      }
+    }
+  }
+
+  void dump_node_levels(std::ostream& os) const {
+    for (size_t level = 0; level + 1 < _h_verts_lvlp.size(); ++level) {
+      for (int pos = _h_verts_lvlp[level]; pos < _h_verts_lvlp[level + 1]; ++pos) {
+        os << _h_queue[pos] << ' ' << level << '\n';
+      }
+    }
+  }
+
+  void dump_level_order(std::ostream& os) const {
+    for (const auto& v : _h_queue) {
+      os << v << '\n';
+    }
   }
 
   float compute_split_inc_amount(float avg_deg) {
