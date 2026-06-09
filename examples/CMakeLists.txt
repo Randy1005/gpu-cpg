@@ -23,6 +23,10 @@ add_executable(dump-elist ${GPUCPG_EXAMPLE_DIR}/dump-elist.cu)
 add_executable(cpg-other-vrs ${GPUCPG_EXAMPLE_DIR}/cpg-other-vrs.cu)
 add_executable(dump-csr-bin ${GPUCPG_EXAMPLE_DIR}/dump-csr-bin.cu)
 add_executable(triton-sfxt-dump ${GPUCPG_EXAMPLE_DIR}/triton-sfxt-dump.cu)
+add_executable(tc-pfxt-bvss-check ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-bvss-check.cu)
+add_executable(tc-pfxt-gate4-step1 ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-gate4-step1.cu)
+add_executable(tc-pfxt-gate5 ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-gate5.cu)
+add_executable(tc-sfxt-bvss-check ${GPUCPG_EXAMPLE_DIR}/tc-sfxt-bvss-check.cu)
 
 
 list(APPEND GPUCPG_EXAMPLES
@@ -50,7 +54,11 @@ list(APPEND GPUCPG_EXAMPLES
   dump-graph-stats
   dump-elist
   dump-csr-bin
-  triton-sfxt-dump)
+  triton-sfxt-dump
+  tc-pfxt-bvss-check
+  tc-pfxt-gate4-step1
+  tc-pfxt-gate5
+  tc-sfxt-bvss-check)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
   target_include_directories(${example}

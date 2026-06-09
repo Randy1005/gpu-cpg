@@ -2,6 +2,9 @@ enable_testing()
 include(${GPUCPG_3RDPARTY_DIR}/doctest/doctest.cmake)
 list(APPEND CU_UNITTESTS
   ballot
+  tc_pfxt_candidates
+  tc_pfxt_bvss
+  tc_sfxt_bvss
 )
 
 foreach(unittest IN LISTS CU_UNITTESTS)

@@ -18,6 +18,20 @@
 #include "timer.hpp"
 #include "graph.h"
 
+#define MAX_INTS_ON_SMEM 12288
+#define BLOCKSIZE 768
+#define WARPS_PER_BLOCK 32
+#define WARP_SIZE 32
+#define TILE_SIZE 16
+#define S_BUFF_CAPACITY 4096
+#define S_FRONTIER_CAPACITY 4096
+#define W_FRONTIER_CAPACITY 64
+#define PER_THREAD_WORK_ITEMS 1
+#define EXP_WINDOW_SIZE_THRD 192
+#define S_SHORT_PILE_CAPACITY 256
+#define S_LONG_PILE_CAPACITY 768
+#define S_PFXT_CAPACITY 1024
+#define SCALE_UP 10000
 
 namespace gpucpg {
 struct PfxtNode;
@@ -46,6 +60,7 @@ enum class PfxtExpMethod {
 };
 
 enum class CsrReorderMethod {
+  NONE = -1,
   V_ORIENTED = 0,
   V_ORIENTED_TILE_SCAN,
   E_ORIENTED,
@@ -65,12 +80,12 @@ struct PfxtNode {
     float slack = 0.0f) :
     level(level), from(from), to(to),
     parent(parent), num_children(num_children),
-    slack(slack) 
-  {  
+    slack(slack)
+  {
   }
- 
+
   ~PfxtNode() = default;
-  
+
   __host__ void dump_info(std::ostream& os) const {
     os << "---- PfxtNode ----\n";
     os << "lvl=" << level << '\n';
@@ -92,7 +107,7 @@ struct PfxtNode {
 
 struct pfxt_node_comp {
   __host__ __device__
-  bool operator() (const PfxtNode& a, const PfxtNode& b) {
+  bool operator() (const PfxtNode& a, const PfxtNode& b) const {
     return a.slack < b.slack;
   }
 };
@@ -100,13 +115,13 @@ struct pfxt_node_comp {
 
 
 
-class CpGen {  
+class CpGen {
 public:
   CpGen() = default;
   void read_input(const std::string& filename, bool ignore_wgts = false);
   void convert_dimacs(const std::string& dimacs_file, const std::string& output_file);
   void levelize();
-  
+
   void bfs_hybrid(
     const float alpha,
     int* ivs,
@@ -145,9 +160,9 @@ public:
   );
 
   void report_paths(
-    const int k, 
-    const int max_dev_lvls, 
-    const bool enable_compress, 
+    const int k,
+    const int max_dev_lvls,
+    const bool enable_compress,
     const PropDistMethod pd_method,
     const PfxtExpMethod pe_method,
     const bool enable_runtime_log_file = false,
@@ -166,10 +181,10 @@ public:
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
 
-  void dump_benchmark_with_wgts(const std::string& filename, std::ostream& os) const; 
+  void dump_benchmark_with_wgts(const std::string& filename, std::ostream& os, bool dump_unit_wgt = false) const;
   void sizeup_benchmark(
       const std::string& filename,
-      std::ostream& os, 
+      std::ostream& os,
       int multiplier) const;
 
   void dump_elist(std::ostream& os, bool dump_wgt = false) const;
@@ -180,7 +195,7 @@ public:
 
   void dump_csrs(std::ostream& os) const;
   void dump_lvls(std::ostream& os) const;
- 
+
   void reindex_verts(std::vector<int>& verts_by_lvl);
 
   size_t num_verts() const;
@@ -217,6 +232,14 @@ public:
     // reset generated paths per step
     paths_gen_per_step.clear();
     paths_gen_per_step.shrink_to_fit();
+    short_long_step_times.clear();
+    short_long_step_times.shrink_to_fit();
+  }
+
+  void dump_succ_dists(std::ostream& os) const {
+    for (size_t i = 0; i < _h_succs.size(); ++i) {
+      os << _h_succs[i] << ' ' << static_cast<float>(_h_dists[i])/SCALE_UP << '\n';
+    }
   }
 
   void dump_sfxt_by_vertex(std::ostream& os) const {
@@ -275,7 +298,6 @@ public:
     }
   }
 
-
   void write_to_csr_bin(std::string& filename) {
     auto graph = Graph(
       num_verts(),
@@ -305,6 +327,10 @@ public:
   std::chrono::duration<double, std::micro> corder_copy_to_gpu_time;
   std::chrono::duration<double, std::micro> corder_update_csr_time;
 
+  std::chrono::duration<double, std::micro> gpba_transfer_time{0};
+  std::chrono::duration<double, std::micro> gpba_pfxt_expand_time{0};
+  std::chrono::duration<double, std::micro> gpba_sort_and_prune_time{0};
+
   int short_long_expansion_steps{0};
 
   std::string benchmark_path;
@@ -312,19 +338,20 @@ public:
   int graph_diameter;
 
   std::vector<int> paths_gen_per_step;
+  std::vector<std::chrono::duration<double, std::micro>> short_long_step_times;
 
   int total_gen_paths{0};
 
 private:
   void _free();
- 
+
   int _get_num_ftrs();
 
   int _get_expansion_window_size(int* p_start, int* p_end);
 
   // convergence condition
   bool* _d_converged;
- 
+
   // unordered map for internal storage
   std::unordered_map<int, std::vector<std::pair<int, double>>> _h_fanin_edges;
   std::unordered_map<int, std::vector<std::pair<int, double>>> _h_fanout_edges;
@@ -349,7 +376,7 @@ private:
 
   // prefix tree nodes
   std::vector<PfxtNode> _h_pfxt_nodes;
-  
+
   // prefix tree level ets
   std::vector<int> _h_lvl_offsets;
 
@@ -365,6 +392,7 @@ private:
   // debugging
   thrust::host_vector<int> _h_dists;
   thrust::host_vector<int> _h_queue;
+  thrust::host_vector<int> _h_succs;
 
   // queue head and tail
   int* _d_qhead;
