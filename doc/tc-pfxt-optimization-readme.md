@@ -71,29 +71,30 @@ GATE 5 PASS
 |---|---:|---|
 | `GPUCPG_TC_PFXT_FUSION=1` | off | enables the TC PFXT integrated path |
 | `GPUCPG_TC_PFXT_SINGLE_PASS=1` | off | uses the single-pass TC PFXT window flow |
-| `GPUCPG_TC_PFXT_USE_BLOCK_PAIR_FILL=1` | off | opt-in block-per-pair candidate count/fill |
+| `GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE=1` | off | uses the single-work candidate materialization path |
 | `GPUCPG_TC_PFXT_USE_ATOMIC_FALLBACK=1` | off | force the atomic fallback path |
 
-The block-per-pair candidate fill is intentionally opt-in. It improves d20 but
-regresses d50, so the default remains the legacy one-thread-per-pair fill.
+The single-work candidate path is intentionally opt-in. It preserves exactness
+and reduces duplicate candidate classification work, but the default remains the
+legacy pair-meta count/scan/fill path while larger validation continues.
 
 ## Latest Runtime Reference
 
 These numbers are PFXT expansion time only. GPG and default TC values come from
-`experiments/tc_pfxt_packed_scan_profile_20260609/*_trials.log`; block-fill
-values come from `experiments/tc_pfxt_block_candidate_fill_20260609`.
+`experiments/tc_pfxt_packed_scan_profile_20260609/*_trials.log`; single-work
+values come from `experiments/tc_pfxt_single_work_candidate_20260610`.
 
-| density | K | GPG ms | TC default ms | TC block-fill opt-in ms | default TC/GPG | block TC/GPG |
+| density | K | GPG ms | TC default ms | TC single-work ms | default TC/GPG | single-work TC/GPG |
 |---|---:|---:|---:|---:|---:|---:|
-| d10 | 1M | 191.5 | 456.4 | not run | 2.38x | n/a |
-| d20 | 1M | 284.9 | 636.6 | 551.5 | 2.23x | 1.94x |
-| d30 | 200K | 81.1 | 326.2 | 327.6 | 4.02x | 4.04x |
-| d40 | 200K | 95.0 | 386.7 | 388.8 | 4.07x | 4.09x |
-| d50 | 100K | 78.0 | 295.5 | 320.2 | 3.79x | 4.10x |
+| d10 | 1M | 191.5 | 456.4 | 375.6 | 2.38x | 1.96x |
+| d20 | 1M | 284.9 | 636.6 | 531.6 | 2.23x | 1.87x |
+| d30 | 200K | 81.1 | 326.2 | 286.9 | 4.02x | 3.54x |
+| d40 | 200K | 95.0 | 386.7 | 328.9 | 4.07x | 3.46x |
+| d50 | 100K | 78.0 | 295.5 | 269.0 | 3.79x | 3.45x |
 
 ## Current Interpretation
 
 TC deviation discovery is cheap and exact, but end-to-end TC PFXT is dominated
-by CUDA candidate materialization and grouping. The block-per-pair fill confirms
-that candidate fill is optimizable, but a global default needs adaptive dispatch
-based on source-group size to avoid d50-style regressions.
+by CUDA candidate materialization and grouping. The single-work candidate path
+confirms that candidate fill is optimizable, but it remains opt-in until the
+larger benchmark matrix is fully revalidated.
