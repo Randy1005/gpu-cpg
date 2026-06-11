@@ -83,6 +83,7 @@ struct PairMeta {
   int src = -1;
   int dst = -1;
   int edge_id = -1;
+  float edge_weight = 0.0f;
 };
 
 struct WarpCandidateReservation {

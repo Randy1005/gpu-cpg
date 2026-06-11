@@ -3544,47 +3544,37 @@ __global__ void fill_tc_pfxt_pair_candidates_warp_reserved(
   }
 }
 
-__global__ void resolve_and_count_tc_pfxt_pair_candidates_single_pass(
-  const int2* pairs,
+__global__ void count_tc_pfxt_pair_meta_candidates_single_pass(
+  const tc_pfxt::PairMeta* pairs,
   const int n_pairs,
-  const int* verts,
-  const int* edges,
   const int* group_offsets,
   const int* path_indices,
   const PfxtNode* short_pile,
   const int window_start,
-  const float* wgts,
   const int* dists,
   const float split,
   const float final_split,
   const bool use_final_split,
   const bool skip_long_paths,
-  tc_pfxt::PairMeta* pair_meta,
   tc_pfxt::CandidateCounts* candidate_counts) {
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid >= n_pairs) {
     return;
   }
 
-  const auto raw_pair = pairs[tid];
-  const auto pair = tc_pfxt::PairMeta{
-    raw_pair.x,
-    raw_pair.y,
-    tc_pfxt::find_edge_id(verts, edges, raw_pair.x, raw_pair.y)};
-  pair_meta[tid] = pair;
+  const auto pair = pairs[tid];
   candidate_counts[tid] = tc_pfxt::CandidateCounts{};
   if (!tc_pfxt::pair_meta_is_valid(pair)
       || !tc_pfxt::candidate_is_reachable(dists[pair.src], dists[pair.dst])) {
     return;
   }
 
-  const auto wgt = wgts[pair.edge_id];
   tc_pfxt::CandidateCounts counts;
   for (int pos = group_offsets[pair.src]; pos < group_offsets[pair.src + 1]; ++pos) {
     const int active_idx = path_indices[pos];
     const auto& node = short_pile[window_start + active_idx];
     const auto new_slack = tc_pfxt::candidate_slack(
-      node.slack, dists[pair.src], dists[pair.dst], wgt);
+      node.slack, dists[pair.src], dists[pair.dst], pair.edge_weight);
     tc_pfxt::accumulate_candidate_class(
       tc_pfxt::classify_candidate(
         new_slack, split, final_split, use_final_split, skip_long_paths),
@@ -3621,7 +3611,7 @@ __global__ void fill_tc_pfxt_pair_candidates_single_pass(
     return;
   }
 
-  const auto wgt = wgts[pair.edge_id];
+  const auto wgt = pair.edge_weight;
   const auto offsets = candidate_offsets[tid];
   int short_pos = base_short + offsets.short_count;
   int long_pos = base_long + offsets.long_count;
@@ -3655,87 +3645,23 @@ __global__ void fill_tc_pfxt_pair_candidates_single_pass(
 
 constexpr int TC_PFXT_PAIR_BLOCK_THREADS = 128;
 
-__global__ void resolve_and_count_tc_pfxt_pair_candidates_block(
-  const int2* pairs,
+__global__ void count_tc_pfxt_pair_candidate_slots(
+  const tc_pfxt::PairMeta* pairs,
   const int n_pairs,
-  const int* verts,
-  const int* edges,
   const int* group_offsets,
-  const int* path_indices,
-  const PfxtNode* short_pile,
-  const int window_start,
-  const float* wgts,
-  const int* dists,
-  const float split,
-  const float final_split,
-  const bool use_final_split,
-  const bool skip_long_paths,
-  tc_pfxt::PairMeta* pair_meta,
-  tc_pfxt::CandidateCounts* candidate_counts) {
-  const int pair_idx = blockIdx.x;
-  if (pair_idx >= n_pairs) {
+  int* slot_count) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= n_pairs) {
     return;
   }
-
-  __shared__ tc_pfxt::PairMeta shared_pair;
-  __shared__ float shared_weight;
-  __shared__ int group_begin;
-  __shared__ int group_end;
-  __shared__ typename cub::BlockReduce<
-    int, TC_PFXT_PAIR_BLOCK_THREADS>::TempStorage reduce_storage;
-
-  if (threadIdx.x == 0) {
-    const auto raw_pair = pairs[pair_idx];
-    shared_pair = tc_pfxt::PairMeta{
-      raw_pair.x,
-      raw_pair.y,
-      tc_pfxt::find_edge_id(verts, edges, raw_pair.x, raw_pair.y)};
-    pair_meta[pair_idx] = shared_pair;
-    candidate_counts[pair_idx] = tc_pfxt::CandidateCounts{};
-    if (tc_pfxt::pair_meta_is_valid(shared_pair)
-        && tc_pfxt::candidate_is_reachable(
-          dists[shared_pair.src], dists[shared_pair.dst])) {
-      shared_weight = wgts[shared_pair.edge_id];
-      group_begin = group_offsets[shared_pair.src];
-      group_end = group_offsets[shared_pair.src + 1];
-    }
-    else {
-      group_begin = 0;
-      group_end = 0;
-    }
+  const auto pair = pairs[tid];
+  if (!tc_pfxt::pair_meta_is_valid(pair)) {
+    return;
   }
-  __syncthreads();
-
-  int local_short = 0;
-  int local_long = 0;
-  for (int pos = group_begin + threadIdx.x;
-       pos < group_end;
-       pos += blockDim.x) {
-    const int active_idx = path_indices[pos];
-    const auto& node = short_pile[window_start + active_idx];
-    const auto new_slack = tc_pfxt::candidate_slack(
-      node.slack,
-      dists[shared_pair.src],
-      dists[shared_pair.dst],
-      shared_weight);
-    const auto candidate_class = tc_pfxt::classify_candidate(
-      new_slack, split, final_split, use_final_split, skip_long_paths);
-    local_short += candidate_class == tc_pfxt::CandidateClass::SHORT;
-    local_long += candidate_class == tc_pfxt::CandidateClass::LONG;
-  }
-
-  const int short_total = cub::BlockReduce<
-    int, TC_PFXT_PAIR_BLOCK_THREADS>(reduce_storage).Sum(local_short);
-  __syncthreads();
-  const int long_total = cub::BlockReduce<
-    int, TC_PFXT_PAIR_BLOCK_THREADS>(reduce_storage).Sum(local_long);
-  if (threadIdx.x == 0) {
-    candidate_counts[pair_idx] = tc_pfxt::CandidateCounts{
-      short_total, long_total};
-  }
+  atomicAdd(slot_count, group_offsets[pair.src + 1] - group_offsets[pair.src]);
 }
 
-__global__ void fill_tc_pfxt_pair_candidates_block(
+__global__ void fill_tc_pfxt_pair_candidates_single_work(
   const tc_pfxt::PairMeta* pairs,
   const int n_pairs,
   const int* group_offsets,
@@ -3743,15 +3669,16 @@ __global__ void fill_tc_pfxt_pair_candidates_block(
   PfxtNode* short_pile,
   PfxtNode* long_pile,
   const int window_start,
-  const int base_short,
-  const int base_long,
-  const float* wgts,
   const int* dists,
   const float split,
   const float final_split,
   const bool use_final_split,
   const bool skip_long_paths,
-  const tc_pfxt::CandidateCounts* candidate_offsets) {
+  int* tail_short,
+  int* tail_long,
+  const int max_short_paths,
+  const int max_long_paths,
+  int* overflow) {
   const int pair_idx = blockIdx.x;
   if (pair_idx >= n_pairs) {
     return;
@@ -3760,7 +3687,6 @@ __global__ void fill_tc_pfxt_pair_candidates_block(
   __shared__ tc_pfxt::BlockCandidateOffsetStorage<
     TC_PFXT_PAIR_BLOCK_THREADS> offset_storage;
   __shared__ tc_pfxt::PairMeta shared_pair;
-  __shared__ float shared_weight;
   __shared__ int group_begin;
   __shared__ int group_end;
   __shared__ int short_tile_base;
@@ -3773,7 +3699,6 @@ __global__ void fill_tc_pfxt_pair_candidates_block(
     if (tc_pfxt::pair_meta_is_valid(shared_pair)
         && tc_pfxt::candidate_is_reachable(
           dists[shared_pair.src], dists[shared_pair.dst])) {
-      shared_weight = wgts[shared_pair.edge_id];
       group_begin = group_offsets[shared_pair.src];
       group_end = group_offsets[shared_pair.src + 1];
     }
@@ -3784,7 +3709,6 @@ __global__ void fill_tc_pfxt_pair_candidates_block(
   }
   __syncthreads();
 
-  const auto pair_offset = candidate_offsets[pair_idx];
   for (int tile_begin = group_begin;
        tile_begin < group_end;
        tile_begin += blockDim.x) {
@@ -3800,7 +3724,7 @@ __global__ void fill_tc_pfxt_pair_candidates_block(
         node.slack,
         dists[shared_pair.src],
         dists[shared_pair.dst],
-        shared_weight);
+        shared_pair.edge_weight);
       candidate_class = tc_pfxt::classify_candidate(
         new_slack, split, final_split, use_final_split, skip_long_paths);
     }
@@ -3808,30 +3732,43 @@ __global__ void fill_tc_pfxt_pair_candidates_block(
     const auto tile_offsets =
       tc_pfxt::block_candidate_tile_offsets<TC_PFXT_PAIR_BLOCK_THREADS>(
         candidate_class, offset_storage);
-    PfxtNode* new_path = nullptr;
-    if (candidate_class == tc_pfxt::CandidateClass::SHORT) {
-      new_path = &short_pile[
-        base_short + pair_offset.short_count
-        + short_tile_base + tile_offsets.short_offset];
+    if (threadIdx.x == 0 && tile_offsets.short_total > 0) {
+      short_tile_base = atomicAdd(tail_short, tile_offsets.short_total);
+      if (short_tile_base + tile_offsets.short_total > max_short_paths) {
+        *overflow = 1;
+      }
     }
-    else if (candidate_class == tc_pfxt::CandidateClass::LONG) {
-      new_path = &long_pile[
-        base_long + pair_offset.long_count
-        + long_tile_base + tile_offsets.long_offset];
-    }
-    if (new_path != nullptr) {
-      const auto& node = short_pile[parent_idx];
-      new_path->level = node.level + 1;
-      new_path->from = shared_pair.src;
-      new_path->to = shared_pair.dst;
-      new_path->parent = parent_idx;
-      new_path->num_children = 0;
-      new_path->slack = new_slack;
+    if (threadIdx.x == 0 && tile_offsets.long_total > 0) {
+      long_tile_base = atomicAdd(tail_long, tile_offsets.long_total);
+      if (long_tile_base + tile_offsets.long_total > max_long_paths) {
+        *overflow = 1;
+      }
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-      short_tile_base += tile_offsets.short_total;
-      long_tile_base += tile_offsets.long_total;
+
+    if (candidate_class == tc_pfxt::CandidateClass::SHORT
+        && short_tile_base + tile_offsets.short_offset < max_short_paths) {
+      auto& new_path =
+        short_pile[short_tile_base + tile_offsets.short_offset];
+      const auto& node = short_pile[parent_idx];
+      new_path.level = node.level + 1;
+      new_path.from = shared_pair.src;
+      new_path.to = shared_pair.dst;
+      new_path.parent = parent_idx;
+      new_path.num_children = 0;
+      new_path.slack = new_slack;
+    }
+    else if (candidate_class == tc_pfxt::CandidateClass::LONG
+        && long_tile_base + tile_offsets.long_offset < max_long_paths) {
+      auto& new_path =
+        long_pile[long_tile_base + tile_offsets.long_offset];
+      const auto& node = short_pile[parent_idx];
+      new_path.level = node.level + 1;
+      new_path.from = shared_pair.src;
+      new_path.to = shared_pair.dst;
+      new_path.parent = parent_idx;
+      new_path.num_children = 0;
+      new_path.slack = new_slack;
     }
     __syncthreads();
   }
@@ -4178,6 +4115,102 @@ struct TcPfxtStepTiming {
   std::chrono::duration<double, std::micro> adv{0};
   int max_active_vss = 0;
   int max_chain_substeps = 0;
+  int tc_discovery_substeps = 0;
+};
+
+struct TcPfxtStageBreakdownMs {
+  double total = 0.0;
+  double discovery = 0.0;
+  double candidate = 0.0;
+  double queue = 0.0;
+  double advance_sync = 0.0;
+};
+
+static TcPfxtStageBreakdownMs make_tc_pfxt_stage_breakdown_ms(
+  std::chrono::duration<double, std::micro> total_time,
+  const TcPfxtStepTiming& timing) {
+  constexpr auto to_ms = [](std::chrono::duration<double, std::micro> value) {
+    return value / 1ms;
+  };
+  TcPfxtStageBreakdownMs result;
+  result.total = to_ms(total_time);
+  result.discovery = to_ms(timing.tc);
+  result.candidate = to_ms(timing.cost);
+  result.queue = to_ms(timing.sort);
+  const auto classified =
+    result.discovery + result.candidate + result.queue + to_ms(timing.adv);
+  const auto residual = std::max(0.0, result.total - classified);
+  result.advance_sync = to_ms(timing.adv) + residual;
+  return result;
+}
+
+struct TcPfxtCudaEventPair {
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+};
+
+class TcPfxtLightStageProfiler {
+public:
+  explicit TcPfxtLightStageProfiler(bool enabled) : _enabled(enabled) {}
+  TcPfxtLightStageProfiler(const TcPfxtLightStageProfiler&) = delete;
+  TcPfxtLightStageProfiler& operator=(const TcPfxtLightStageProfiler&) = delete;
+
+  cudaEvent_t begin() const {
+    if (!_enabled) {
+      return nullptr;
+    }
+    cudaEvent_t event = nullptr;
+    cudaEventCreate(&event);
+    cudaEventRecord(event);
+    return event;
+  }
+
+  void end_queue(cudaEvent_t start) { end(_queue, start); }
+  void end_discovery(cudaEvent_t start) { end(_discovery, start); }
+  void end_candidate(cudaEvent_t start) { end(_candidate, start); }
+  void end_advance(cudaEvent_t start) { end(_advance, start); }
+
+  void add_to(TcPfxtStepTiming& timing) {
+    if (!_enabled) {
+      return;
+    }
+    timing.sort += collect(_queue);
+    timing.tc += collect(_discovery);
+    timing.cost += collect(_candidate);
+    timing.adv += collect(_advance);
+  }
+
+private:
+  static std::chrono::duration<double, std::micro> collect(
+    std::vector<TcPfxtCudaEventPair>& events) {
+    double total_ms = 0.0;
+    for (const auto& event : events) {
+      cudaEventSynchronize(event.stop);
+      float elapsed_ms = 0.0f;
+      cudaEventElapsedTime(&elapsed_ms, event.start, event.stop);
+      total_ms += elapsed_ms;
+      cudaEventDestroy(event.start);
+      cudaEventDestroy(event.stop);
+    }
+    events.clear();
+    return std::chrono::duration<double, std::micro>(total_ms * 1000.0);
+  }
+
+  void end(std::vector<TcPfxtCudaEventPair>& events, cudaEvent_t start) {
+    if (!_enabled || start == nullptr) {
+      return;
+    }
+    cudaEvent_t stop = nullptr;
+    cudaEventCreate(&stop);
+    cudaEventRecord(stop);
+    events.push_back({start, stop});
+  }
+
+  bool _enabled = false;
+  std::vector<TcPfxtCudaEventPair> _queue;
+  std::vector<TcPfxtCudaEventPair> _discovery;
+  std::vector<TcPfxtCudaEventPair> _candidate;
+  std::vector<TcPfxtCudaEventPair> _advance;
 };
 
 struct TcPfxtPairDiscovery {
@@ -4272,6 +4305,27 @@ static TcPfxtPairDiscovery tc_pfxt_discover_pair_count_for_current_v(
   return TcPfxtPairDiscovery{h_pair_count[0], h_active_vss_size};
 }
 
+__global__ void convert_tc_pfxt_pairs_to_meta(
+  const int2* raw_pairs,
+  const int n_pairs,
+  const int* verts,
+  const int* edges,
+  const float* wgts,
+  tc_pfxt::PairMeta* pair_meta) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= n_pairs) {
+    return;
+  }
+  const auto raw_pair = raw_pairs[tid];
+  const int edge_id = tc_pfxt::find_edge_id(
+    verts, edges, raw_pair.x, raw_pair.y);
+  pair_meta[tid] = tc_pfxt::PairMeta{
+    raw_pair.x,
+    raw_pair.y,
+    edge_id,
+    edge_id >= 0 ? wgts[edge_id] : 0.0f};
+}
+
 static void tc_pfxt_expand_window(
   const int n_nodes,
   const TcPfxtDeviceBvss& bvss,
@@ -4300,6 +4354,7 @@ static void tc_pfxt_expand_window(
   int active_check_interval,
   int fixed_discover_blocks,
   bool profile_tc_phases,
+  bool light_stage_profile,
   bool enable_candidate_opt,
   TcPfxtScratch& scratch,
   std::uint64_t& total_pair_count,
@@ -4315,6 +4370,7 @@ static void tc_pfxt_expand_window(
     phase_timer.stop();
     return phase_timer.get_elapsed_time();
   };
+  TcPfxtLightStageProfiler light_profiler(light_stage_profile && !profile_tc_phases);
   max_chain_substeps = std::max(1, max_chain_substeps);
   active_check_interval = std::max(1, active_check_interval);
   scratch.current_v.resize(n_active);
@@ -4360,6 +4416,7 @@ static void tc_pfxt_expand_window(
   while (h_active > 0 && chain_substep < max_chain_substeps) {
     Timer phase_timer;
     phase_timer.start();
+    auto light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_atomic_count_group_paths");
     thrust::fill(group_offsets.begin(), group_offsets.end(), 0);
     count_tc_pfxt_groups
@@ -4381,9 +4438,11 @@ static void tc_pfxt_expand_window(
         thrust::raw_pointer_cast(path_indices.data()));
     cudaCheckErrors("tc pfxt fill groups failed");
     step_timing.sort += sync_and_stop(phase_timer);
+    light_profiler.end_queue(light_stage_start);
     gpucpg_nvtx_pop();
 
     phase_timer.start();
+    light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_atomic_count_discover_pairs");
     const auto discovery = tc_pfxt_discover_pair_count_for_current_v(
       n_nodes,
@@ -4400,6 +4459,7 @@ static void tc_pfxt_expand_window(
       profile_tc_phases,
       fixed_discover_blocks);
     step_timing.tc += sync_and_stop(phase_timer);
+    light_profiler.end_discovery(light_stage_start);
     gpucpg_nvtx_pop();
     if (discovery.n_active_vss >= 0) {
       step_timing.max_active_vss = std::max(step_timing.max_active_vss, discovery.n_active_vss);
@@ -4408,6 +4468,7 @@ static void tc_pfxt_expand_window(
     total_pair_count += n_pairs;
     if (n_pairs > 0) {
       phase_timer.start();
+      light_stage_start = light_profiler.begin();
       gpucpg_nvtx_push("tc_atomic_count_candidates");
       if (enable_candidate_opt) {
         gpucpg_nvtx_push(use_legacy_atomic
@@ -4477,10 +4538,12 @@ static void tc_pfxt_expand_window(
       }
       cudaCheckErrors("tc pfxt count candidates failed");
       step_timing.cost += sync_and_stop(phase_timer);
+      light_profiler.end_candidate(light_stage_start);
       gpucpg_nvtx_pop();
     }
 
     phase_timer.start();
+    light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_atomic_count_advance_chain");
     thrust::fill(active_count.begin(), active_count.end(), 0);
     advance_tc_pfxt_current_v
@@ -4501,9 +4564,11 @@ static void tc_pfxt_expand_window(
       h_active = h_active_vec[0];
     }
     step_timing.adv += sync_and_stop(phase_timer);
+    light_profiler.end_advance(light_stage_start);
     gpucpg_nvtx_pop();
   }
   step_timing.max_chain_substeps = std::max(step_timing.max_chain_substeps, chain_substep);
+  step_timing.tc_discovery_substeps += chain_substep;
 
   thrust::host_vector<int> h_short_count(short_count);
   thrust::host_vector<int> h_long_count(long_count);
@@ -4543,6 +4608,7 @@ static void tc_pfxt_expand_window(
   while (h_active > 0 && chain_substep < max_chain_substeps) {
     Timer phase_timer;
     phase_timer.start();
+    auto light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_atomic_fill_group_paths");
     thrust::fill(group_offsets.begin(), group_offsets.end(), 0);
     count_tc_pfxt_groups
@@ -4564,9 +4630,11 @@ static void tc_pfxt_expand_window(
         thrust::raw_pointer_cast(path_indices.data()));
     cudaCheckErrors("tc pfxt fill path groups failed");
     step_timing.sort += sync_and_stop(phase_timer);
+    light_profiler.end_queue(light_stage_start);
     gpucpg_nvtx_pop();
 
     phase_timer.start();
+    light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_atomic_fill_discover_pairs");
     const auto discovery = tc_pfxt_discover_pair_count_for_current_v(
       n_nodes,
@@ -4583,6 +4651,7 @@ static void tc_pfxt_expand_window(
       profile_tc_phases,
       fixed_discover_blocks);
     step_timing.tc += sync_and_stop(phase_timer);
+    light_profiler.end_discovery(light_stage_start);
     gpucpg_nvtx_pop();
     if (discovery.n_active_vss >= 0) {
       step_timing.max_active_vss = std::max(step_timing.max_active_vss, discovery.n_active_vss);
@@ -4590,6 +4659,7 @@ static void tc_pfxt_expand_window(
     const auto n_pairs = discovery.n_pairs;
     if (n_pairs > 0) {
       phase_timer.start();
+      light_stage_start = light_profiler.begin();
       gpucpg_nvtx_push("tc_atomic_fill_candidates");
       if (enable_candidate_opt) {
         gpucpg_nvtx_push(use_legacy_atomic
@@ -4662,10 +4732,12 @@ static void tc_pfxt_expand_window(
       }
       cudaCheckErrors("tc pfxt fill candidates failed");
       step_timing.cost += sync_and_stop(phase_timer);
+      light_profiler.end_candidate(light_stage_start);
       gpucpg_nvtx_pop();
     }
 
     phase_timer.start();
+    light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_atomic_fill_advance_chain");
     thrust::fill(active_count.begin(), active_count.end(), 0);
     advance_tc_pfxt_current_v
@@ -4686,9 +4758,12 @@ static void tc_pfxt_expand_window(
       h_active = h_active_vec[0];
     }
     step_timing.adv += sync_and_stop(phase_timer);
+    light_profiler.end_advance(light_stage_start);
     gpucpg_nvtx_pop();
   }
   step_timing.max_chain_substeps = std::max(step_timing.max_chain_substeps, chain_substep);
+  step_timing.tc_discovery_substeps += chain_substep;
+  light_profiler.add_to(step_timing);
   if (h_active != 0) {
     throw std::runtime_error("tc pfxt Lemma 2 violation: fill pass ended before window completion");
   }
@@ -4722,14 +4797,18 @@ static void tc_pfxt_expand_window_single_pass(
   int active_check_interval,
   int fixed_discover_blocks,
   bool profile_tc_phases,
+  bool light_stage_profile,
   int fallback_long_pile_threshold,
   TcPfxtScratch& scratch,
   std::uint64_t& total_pair_count,
   TcPfxtStepTiming& step_timing) {
   const bool force_atomic_fallback =
     std::getenv("GPUCPG_TC_PFXT_USE_ATOMIC_FALLBACK") != nullptr;
-  const bool use_block_pair_fill =
-    std::getenv("GPUCPG_TC_PFXT_USE_BLOCK_PAIR_FILL") != nullptr;
+  const bool use_single_work_candidate =
+    std::getenv("GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE") != nullptr
+    && std::getenv("GPUCPG_TC_PFXT_DISABLE_SINGLE_WORK_CANDIDATE") == nullptr;
+  const int single_work_max_slots =
+    get_env_int_or_default("GPUCPG_TC_PFXT_SINGLE_WORK_MAX_SLOTS", 20000000);
   const bool candidate_fallback_needed =
     !skip_long_paths
     && tc_pfxt::should_use_atomic_candidate_fallback(
@@ -4781,6 +4860,7 @@ static void tc_pfxt_expand_window_single_pass(
       active_check_interval,
       fixed_discover_blocks,
       profile_tc_phases,
+      light_stage_profile,
       true,
       scratch,
       total_pair_count,
@@ -4798,11 +4878,14 @@ static void tc_pfxt_expand_window_single_pass(
     phase_timer.stop();
     return phase_timer.get_elapsed_time();
   };
+  TcPfxtLightStageProfiler light_profiler(light_stage_profile && !profile_tc_phases);
 
   max_chain_substeps = std::max(1, max_chain_substeps);
   active_check_interval = std::max(1, active_check_interval);
   scratch.current_v.resize(n_active);
   scratch.active_count.resize(1);
+  scratch.short_count.resize(1);
+  scratch.long_count.resize(1);
   scratch.group_offsets.resize(n_nodes + 1);
   scratch.group_cursor.resize(n_nodes);
   scratch.path_indices.resize(n_active);
@@ -4815,6 +4898,7 @@ static void tc_pfxt_expand_window_single_pass(
 
   auto& current_v = scratch.current_v;
   auto& active_count = scratch.active_count;
+  auto& short_count = scratch.short_count;
   auto& group_offsets = scratch.group_offsets;
   auto& group_cursor = scratch.group_cursor;
   auto& path_indices = scratch.path_indices;
@@ -4841,6 +4925,7 @@ static void tc_pfxt_expand_window_single_pass(
   int total_short = 0;
   int total_long = 0;
   bool reached_k_after_window = short_pile_size >= k;
+  int tc_discovery_substeps = 0;
   int chunked_candidate_substeps = 0;
   int chunked_candidate_chunks = 0;
   int max_chunk_pairs = 0;
@@ -4848,6 +4933,7 @@ static void tc_pfxt_expand_window_single_pass(
   while (h_active > 0 && chain_substep < max_chain_substeps) {
     Timer phase_timer;
     phase_timer.start();
+    auto light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_single_group_paths");
     thrust::fill(group_offsets.begin(), group_offsets.end(), 0);
     count_tc_pfxt_groups
@@ -4869,9 +4955,11 @@ static void tc_pfxt_expand_window_single_pass(
         thrust::raw_pointer_cast(path_indices.data()));
     cudaCheckErrors("tc pfxt single fill groups failed");
     step_timing.sort += sync_and_stop(phase_timer);
+    light_profiler.end_queue(light_stage_start);
     gpucpg_nvtx_pop();
 
     phase_timer.start();
+    light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_single_discover_pairs");
     const auto discovery = tc_pfxt_discover_pair_count_for_current_v(
       n_nodes,
@@ -4887,19 +4975,130 @@ static void tc_pfxt_expand_window_single_pass(
       overflow,
       profile_tc_phases,
       fixed_discover_blocks);
-    step_timing.tc += sync_and_stop(phase_timer);
-    gpucpg_nvtx_pop();
     if (discovery.n_active_vss >= 0) {
-      step_timing.max_active_vss = std::max(step_timing.max_active_vss, discovery.n_active_vss);
+      step_timing.max_active_vss = std::max(
+        step_timing.max_active_vss, discovery.n_active_vss);
     }
-
-    const auto n_pairs = discovery.n_pairs;
+    const int n_pairs = discovery.n_pairs;
+    if (n_pairs > 0) {
+      pair_meta.reserve(n_pairs);
+      convert_tc_pfxt_pairs_to_meta
+        <<<std::max(1, ROUNDUPBLOCKS(n_pairs, 256)), 256>>>(
+          pairs.data(),
+          n_pairs,
+          d_fanout_adjp,
+          d_fanout_adjncy,
+          d_fanout_wgts,
+          pair_meta.data());
+      cudaCheckErrors("tc pfxt convert discovered pairs to metadata failed");
+    }
     total_pair_count += n_pairs;
+    ++tc_discovery_substeps;
+    step_timing.tc += sync_and_stop(phase_timer);
+    light_profiler.end_discovery(light_stage_start);
+    gpucpg_nvtx_pop();
+
     if (n_pairs > 0) {
       phase_timer.start();
+      light_stage_start = light_profiler.begin();
       gpucpg_nvtx_push("tc_single_candidate_phase");
       const bool skip_long_this_substep = skip_long_paths || reached_k_after_window;
-      if (use_chunked_candidate_fallback) {
+      const bool use_single_work_this_substep =
+        use_single_work_candidate
+        && !use_chunked_candidate_fallback;
+      if (use_single_work_this_substep) {
+        gpucpg_nvtx_push("tc_single_work_candidate_phase");
+        const int base_short = short_pile_size;
+        const int base_long = long_pile_size;
+        const bool fill_longs = !skip_long_this_substep;
+        int candidate_slots = 0;
+        if (fill_longs) {
+          thrust::fill(short_count.begin(), short_count.end(), 0);
+          count_tc_pfxt_pair_candidate_slots
+            <<<std::max(1, ROUNDUPBLOCKS(n_pairs, 256)), 256>>>(
+              pair_meta.data(),
+              n_pairs,
+              thrust::raw_pointer_cast(group_offsets.data()),
+              thrust::raw_pointer_cast(short_count.data()));
+          cudaCheckErrors("tc pfxt single-work count candidate slots failed");
+
+          thrust::host_vector<int> h_slot_count(short_count);
+          candidate_slots = h_slot_count[0];
+          if (candidate_slots > single_work_max_slots) {
+            throw std::runtime_error(
+              "tc pfxt single-work candidate slot limit exceeded");
+          }
+        }
+        const int short_limit = fill_longs
+          ? base_short + candidate_slots
+          : static_cast<int>(short_pile.capacity());
+        short_pile.resize(short_limit);
+        if (fill_longs && candidate_slots > 0) {
+          long_pile.resize(base_long + candidate_slots);
+        }
+        set_kernel<<<1, 1>>>(d_tail_short, base_short);
+        set_kernel<<<1, 1>>>(d_tail_long, base_long);
+        thrust::fill(overflow.begin(), overflow.end(), 0);
+        cudaCheckErrors("tc pfxt single-work reset tails failed");
+
+        fill_tc_pfxt_pair_candidates_single_work
+          <<<n_pairs, TC_PFXT_PAIR_BLOCK_THREADS>>>(
+            pair_meta.data(),
+            n_pairs,
+            thrust::raw_pointer_cast(group_offsets.data()),
+            thrust::raw_pointer_cast(path_indices.data()),
+            thrust::raw_pointer_cast(short_pile.data()),
+            fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
+            window_start,
+            d_dists_cache,
+            split,
+            final_split,
+            use_final_split,
+            !fill_longs,
+            d_tail_short,
+            d_tail_long,
+            short_limit,
+            fill_longs ? base_long + candidate_slots : base_long,
+            thrust::raw_pointer_cast(overflow.data()));
+        cudaCheckErrors("tc pfxt single-work fill candidates failed");
+
+        int h_tail_short = base_short;
+        int h_tail_long = base_long;
+        cudaMemcpy(&h_tail_short, d_tail_short, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&h_tail_long, d_tail_long, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaCheckErrors("tc pfxt single-work copy tails failed");
+        thrust::host_vector<int> h_overflow(overflow);
+        if (h_overflow[0] != 0) {
+          throw std::runtime_error("tc pfxt single-work candidate output overflow");
+        }
+
+        int substep_short = h_tail_short - base_short;
+        int substep_long = fill_longs ? h_tail_long - base_long : 0;
+        short_pile_size = h_tail_short;
+        short_pile.resize(short_pile_size);
+        if (fill_longs) {
+          long_pile_size = h_tail_long;
+          long_pile.resize(long_pile_size);
+        }
+        else {
+          long_pile_size = base_long;
+        }
+        const bool substep_reaches_k = short_pile_size >= k;
+        if (substep_reaches_k && long_pile_size > 0) {
+          long_pile.clear();
+          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile_size = 0;
+          set_kernel<<<1, 1>>>(d_tail_long, 0);
+          cudaCheckErrors("tc pfxt single-work clear long tail failed");
+        }
+        total_short += substep_short;
+        total_long += substep_long;
+        if (substep_reaches_k) {
+          reached_k_after_window = true;
+        }
+        gpucpg_nvtx_pop();
+      }
+      else if (use_chunked_candidate_fallback) {
         gpucpg_nvtx_push("tc_chunked_candidate_phase");
         const int chunk_limit =
           get_env_int_or_default("GPUCPG_TC_PFXT_CHUNK_PAIRS", 1048576);
@@ -4912,53 +5111,24 @@ static void tc_pfxt_expand_window_single_pass(
                                const bool skip_long_for_count,
                                int& h_short_added,
                                int& h_long_added) {
-          pair_meta.reserve(chunk_n);
           pair_candidate_counts.resize(chunk_n + 1);
           pair_candidate_offsets.resize(chunk_n + 1);
           pair_candidate_counts[chunk_n] = tc_pfxt::CandidateCounts{};
 
-          if (use_block_pair_fill) {
-            gpucpg_nvtx_push("tc_block_pair_count_candidates");
-            resolve_and_count_tc_pfxt_pair_candidates_block
-              <<<chunk_n, TC_PFXT_PAIR_BLOCK_THREADS>>>(
-                pairs.data() + chunk_begin,
-                chunk_n,
-                d_fanout_adjp,
-                d_fanout_adjncy,
-                thrust::raw_pointer_cast(group_offsets.data()),
-                thrust::raw_pointer_cast(path_indices.data()),
-                thrust::raw_pointer_cast(short_pile.data()),
-                window_start,
-                d_fanout_wgts,
-                d_dists_cache,
-                split,
-                final_split,
-                use_final_split,
-                skip_long_for_count,
-                pair_meta.data(),
-                thrust::raw_pointer_cast(pair_candidate_counts.data()));
-            gpucpg_nvtx_pop();
-          }
-          else {
-            resolve_and_count_tc_pfxt_pair_candidates_single_pass
-              <<<std::max(1, ROUNDUPBLOCKS(chunk_n, 256)), 256>>>(
-                pairs.data() + chunk_begin,
-                chunk_n,
-                d_fanout_adjp,
-                d_fanout_adjncy,
-                thrust::raw_pointer_cast(group_offsets.data()),
-                thrust::raw_pointer_cast(path_indices.data()),
-                thrust::raw_pointer_cast(short_pile.data()),
-                window_start,
-                d_fanout_wgts,
-                d_dists_cache,
-                split,
-                final_split,
-                use_final_split,
-                skip_long_for_count,
-                pair_meta.data(),
-                thrust::raw_pointer_cast(pair_candidate_counts.data()));
-          }
+          count_tc_pfxt_pair_meta_candidates_single_pass
+            <<<std::max(1, ROUNDUPBLOCKS(chunk_n, 256)), 256>>>(
+              pair_meta.data() + chunk_begin,
+              chunk_n,
+              thrust::raw_pointer_cast(group_offsets.data()),
+              thrust::raw_pointer_cast(path_indices.data()),
+              thrust::raw_pointer_cast(short_pile.data()),
+              window_start,
+              d_dists_cache,
+              split,
+              final_split,
+              use_final_split,
+              skip_long_for_count,
+              thrust::raw_pointer_cast(pair_candidate_counts.data()));
           cudaCheckErrors("tc pfxt chunk resolve/count candidates failed");
 
           thrust::exclusive_scan(
@@ -5040,48 +5210,24 @@ static void tc_pfxt_expand_window_single_pass(
             h_long_added = 0;
           }
 
-          if (use_block_pair_fill) {
-            gpucpg_nvtx_push("tc_block_pair_fill_candidates");
-            fill_tc_pfxt_pair_candidates_block
-              <<<chunk_n, TC_PFXT_PAIR_BLOCK_THREADS>>>(
-                pair_meta.data(),
-                chunk_n,
-                thrust::raw_pointer_cast(group_offsets.data()),
-                thrust::raw_pointer_cast(path_indices.data()),
-                thrust::raw_pointer_cast(short_pile.data()),
-                fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
-                window_start,
-                chunk_short_base,
-                chunk_long_base,
-                d_fanout_wgts,
-                d_dists_cache,
-                split,
-                final_split,
-                use_final_split,
-                !fill_longs,
-                thrust::raw_pointer_cast(pair_candidate_offsets.data()));
-            gpucpg_nvtx_pop();
-          }
-          else {
-            fill_tc_pfxt_pair_candidates_single_pass
-              <<<std::max(1, ROUNDUPBLOCKS(chunk_n, 256)), 256>>>(
-                pair_meta.data(),
-                chunk_n,
-                thrust::raw_pointer_cast(group_offsets.data()),
-                thrust::raw_pointer_cast(path_indices.data()),
-                thrust::raw_pointer_cast(short_pile.data()),
-                fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
-                window_start,
-                chunk_short_base,
-                chunk_long_base,
-                d_fanout_wgts,
-                d_dists_cache,
-                split,
-                final_split,
-                use_final_split,
-                !fill_longs,
-                thrust::raw_pointer_cast(pair_candidate_offsets.data()));
-          }
+          fill_tc_pfxt_pair_candidates_single_pass
+            <<<std::max(1, ROUNDUPBLOCKS(chunk_n, 256)), 256>>>(
+              pair_meta.data() + chunk_begin,
+              chunk_n,
+              thrust::raw_pointer_cast(group_offsets.data()),
+              thrust::raw_pointer_cast(path_indices.data()),
+              thrust::raw_pointer_cast(short_pile.data()),
+              fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
+              window_start,
+              chunk_short_base,
+              chunk_long_base,
+              d_fanout_wgts,
+              d_dists_cache,
+              split,
+              final_split,
+              use_final_split,
+              !fill_longs,
+              thrust::raw_pointer_cast(pair_candidate_offsets.data()));
           cudaCheckErrors("tc pfxt chunk fill candidates failed");
 
           chunk_short_base += h_short_added;
@@ -5099,7 +5245,6 @@ static void tc_pfxt_expand_window_single_pass(
         gpucpg_nvtx_pop();
       }
       else {
-        pair_meta.reserve(n_pairs);
         gpucpg_nvtx_push("tc_single_prepare_count_buffers");
         pair_candidate_counts.resize(n_pairs + 1);
         pair_candidate_offsets.resize(n_pairs + 1);
@@ -5107,48 +5252,20 @@ static void tc_pfxt_expand_window_single_pass(
         gpucpg_nvtx_pop();
 
         gpucpg_nvtx_push("tc_single_resolve_count_candidates");
-        if (use_block_pair_fill) {
-          gpucpg_nvtx_push("tc_block_pair_count_candidates");
-          resolve_and_count_tc_pfxt_pair_candidates_block
-            <<<n_pairs, TC_PFXT_PAIR_BLOCK_THREADS>>>(
-              pairs.data(),
-              n_pairs,
-              d_fanout_adjp,
-              d_fanout_adjncy,
-              thrust::raw_pointer_cast(group_offsets.data()),
-              thrust::raw_pointer_cast(path_indices.data()),
-              thrust::raw_pointer_cast(short_pile.data()),
-              window_start,
-              d_fanout_wgts,
-              d_dists_cache,
-              split,
-              final_split,
-              use_final_split,
-              skip_long_this_substep,
-              pair_meta.data(),
-              thrust::raw_pointer_cast(pair_candidate_counts.data()));
-          gpucpg_nvtx_pop();
-        }
-        else {
-          resolve_and_count_tc_pfxt_pair_candidates_single_pass
-            <<<std::max(1, ROUNDUPBLOCKS(n_pairs, 256)), 256>>>(
-              pairs.data(),
-              n_pairs,
-              d_fanout_adjp,
-              d_fanout_adjncy,
-              thrust::raw_pointer_cast(group_offsets.data()),
-              thrust::raw_pointer_cast(path_indices.data()),
-              thrust::raw_pointer_cast(short_pile.data()),
-              window_start,
-              d_fanout_wgts,
-              d_dists_cache,
-              split,
-              final_split,
-              use_final_split,
-              skip_long_this_substep,
-              pair_meta.data(),
-              thrust::raw_pointer_cast(pair_candidate_counts.data()));
-        }
+        count_tc_pfxt_pair_meta_candidates_single_pass
+          <<<std::max(1, ROUNDUPBLOCKS(n_pairs, 256)), 256>>>(
+            pair_meta.data(),
+            n_pairs,
+            thrust::raw_pointer_cast(group_offsets.data()),
+            thrust::raw_pointer_cast(path_indices.data()),
+            thrust::raw_pointer_cast(short_pile.data()),
+            window_start,
+            d_dists_cache,
+            split,
+            final_split,
+            use_final_split,
+            skip_long_this_substep,
+            thrust::raw_pointer_cast(pair_candidate_counts.data()));
         cudaCheckErrors("tc pfxt single resolve/count candidates failed");
         gpucpg_nvtx_pop();
 
@@ -5200,48 +5317,24 @@ static void tc_pfxt_expand_window_single_pass(
         gpucpg_nvtx_pop();
 
         gpucpg_nvtx_push("tc_single_fill_candidates");
-        if (use_block_pair_fill) {
-          gpucpg_nvtx_push("tc_block_pair_fill_candidates");
-          fill_tc_pfxt_pair_candidates_block
-            <<<n_pairs, TC_PFXT_PAIR_BLOCK_THREADS>>>(
-              pair_meta.data(),
-              n_pairs,
-              thrust::raw_pointer_cast(group_offsets.data()),
-              thrust::raw_pointer_cast(path_indices.data()),
-              thrust::raw_pointer_cast(short_pile.data()),
-              fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
-              window_start,
-              base_short,
-              base_long,
-              d_fanout_wgts,
-              d_dists_cache,
-              split,
-              final_split,
-              use_final_split,
-              !fill_longs,
-              thrust::raw_pointer_cast(pair_candidate_offsets.data()));
-          gpucpg_nvtx_pop();
-        }
-        else {
-          fill_tc_pfxt_pair_candidates_single_pass
-            <<<std::max(1, ROUNDUPBLOCKS(n_pairs, 256)), 256>>>(
-              pair_meta.data(),
-              n_pairs,
-              thrust::raw_pointer_cast(group_offsets.data()),
-              thrust::raw_pointer_cast(path_indices.data()),
-              thrust::raw_pointer_cast(short_pile.data()),
-              fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
-              window_start,
-              base_short,
-              base_long,
-              d_fanout_wgts,
-              d_dists_cache,
-              split,
-              final_split,
-              use_final_split,
-              !fill_longs,
-              thrust::raw_pointer_cast(pair_candidate_offsets.data()));
-        }
+        fill_tc_pfxt_pair_candidates_single_pass
+          <<<std::max(1, ROUNDUPBLOCKS(n_pairs, 256)), 256>>>(
+            pair_meta.data(),
+            n_pairs,
+            thrust::raw_pointer_cast(group_offsets.data()),
+            thrust::raw_pointer_cast(path_indices.data()),
+            thrust::raw_pointer_cast(short_pile.data()),
+            fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
+            window_start,
+            base_short,
+            base_long,
+            d_fanout_wgts,
+            d_dists_cache,
+            split,
+            final_split,
+            use_final_split,
+            !fill_longs,
+            thrust::raw_pointer_cast(pair_candidate_offsets.data()));
         cudaCheckErrors("tc pfxt single fill candidates failed");
         gpucpg_nvtx_pop();
 
@@ -5252,10 +5345,12 @@ static void tc_pfxt_expand_window_single_pass(
         }
       }
       step_timing.cost += sync_and_stop(phase_timer);
+      light_profiler.end_candidate(light_stage_start);
       gpucpg_nvtx_pop();
     }
 
     phase_timer.start();
+    light_stage_start = light_profiler.begin();
     gpucpg_nvtx_push("tc_single_advance_chain");
     thrust::fill(active_count.begin(), active_count.end(), 0);
     advance_tc_pfxt_current_v
@@ -5276,10 +5371,13 @@ static void tc_pfxt_expand_window_single_pass(
       h_active = h_active_vec[0];
     }
     step_timing.adv += sync_and_stop(phase_timer);
+    light_profiler.end_advance(light_stage_start);
     gpucpg_nvtx_pop();
   }
 
   step_timing.max_chain_substeps = std::max(step_timing.max_chain_substeps, chain_substep);
+  step_timing.tc_discovery_substeps += tc_discovery_substeps;
+  light_profiler.add_to(step_timing);
   if (h_active != 0) {
     throw std::runtime_error("tc pfxt Lemma 2 violation: single-pass ended before window completion");
   }
@@ -6831,14 +6929,17 @@ void CpGen::report_paths(
   const int tc_pfxt_max_pairs =
     get_env_int_or_default("GPUCPG_TC_PFXT_MAX_PAIRS", default_tc_pfxt_max_pairs);
   const bool enable_tc_pfxt_fusion = std::getenv("GPUCPG_TC_PFXT_FUSION") != nullptr;
-  const bool enable_tc_pfxt_candidate_opt =
-    std::getenv("GPUCPG_TC_PFXT_CANDIDATE_OPT") != nullptr;
   const bool enable_tc_pfxt_single_pass =
     std::getenv("GPUCPG_TC_PFXT_SINGLE_PASS") != nullptr;
+  const bool enable_tc_pfxt_single_work_candidate =
+    std::getenv("GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE") != nullptr
+    && std::getenv("GPUCPG_TC_PFXT_DISABLE_SINGLE_WORK_CANDIDATE") == nullptr;
   const int tc_pfxt_single_pass_fallback_long_pile =
     get_env_int_or_default("GPUCPG_TC_PFXT_SINGLE_PASS_FALLBACK_LONG_PILE", 1000000);
   const bool profile_tc_pfxt_phases = enable_interm_perf_log
     && (!enable_tc_pfxt_fusion || std::getenv("GPUCPG_TC_PFXT_PROFILE_PHASES") != nullptr);
+  const bool light_tc_pfxt_stage_profile =
+    std::getenv("GPUCPG_TC_PFXT_LIGHT_STAGE_PROFILE") != nullptr;
   const int tc_pfxt_active_check_interval =
     enable_tc_pfxt_fusion
       ? get_env_int_or_default("GPUCPG_TC_PFXT_ACTIVE_CHECK_INTERVAL", 4)
@@ -6860,8 +6961,9 @@ void CpGen::report_paths(
       << ", active_check_interval=" << tc_pfxt_active_check_interval
       << ", discover_blocks=" << tc_pfxt_discover_blocks
       << ", profile_phases=" << (profile_tc_pfxt_phases ? 1 : 0)
-      << ", candidate_opt=" << (enable_tc_pfxt_candidate_opt ? 1 : 0)
+      << ", light_stage_profile=" << (light_tc_pfxt_stage_profile ? 1 : 0)
       << ", single_pass=" << (enable_tc_pfxt_single_pass ? 1 : 0)
+      << ", single_work_candidate=" << (enable_tc_pfxt_single_work_candidate ? 1 : 0)
       << ", single_pass_fallback_long_pile="
       << tc_pfxt_single_pass_fallback_long_pile << '\n';
   }
@@ -7356,6 +7458,15 @@ void CpGen::report_paths(
 	    TcPfxtStepTiming curr_step_tc_timing;
 	    std::uint64_t curr_step_hops{0};
 	    bool curr_step_dump_appended{false};
+	    double pfxt_summary_total_ms{0.0};
+	    double pfxt_summary_discovery_ms{0.0};
+	    double pfxt_summary_candidate_ms{0.0};
+	    double pfxt_summary_queue_ms{0.0};
+	    double pfxt_summary_advance_sync_ms{0.0};
+	    double pfxt_summary_dominant_step_ms{0.0};
+	    int pfxt_summary_dominant_step{0};
+	    int pfxt_summary_dominant_batch_size{0};
+        int pfxt_summary_tc_discovery_substeps{0};
 	    Timer timer;
 	    timer.start();
 	    while (true) {
@@ -7426,10 +7537,11 @@ void CpGen::report_paths(
 	              tc_pfxt_max_pairs,
 	              std::max(1, graph_diameter),
 	              tc_pfxt_active_check_interval,
-	              tc_pfxt_discover_blocks,
-	              profile_tc_pfxt_phases,
-	              tc_pfxt_single_pass_fallback_long_pile,
-	              tc_pfxt_scratch,
+		              tc_pfxt_discover_blocks,
+		              profile_tc_pfxt_phases,
+		              light_tc_pfxt_stage_profile,
+		              tc_pfxt_single_pass_fallback_long_pile,
+		              tc_pfxt_scratch,
 	              total_tc_pfxt_pairs,
 	              curr_step_tc_timing);
 	          }
@@ -7460,10 +7572,11 @@ void CpGen::report_paths(
 	              tc_pfxt_max_pairs,
 	              std::max(1, graph_diameter),
 	              tc_pfxt_active_check_interval,
-	              tc_pfxt_discover_blocks,
-	              profile_tc_pfxt_phases,
-	              enable_tc_pfxt_candidate_opt,
-	              tc_pfxt_scratch,
+		              tc_pfxt_discover_blocks,
+		              profile_tc_pfxt_phases,
+                  light_tc_pfxt_stage_profile,
+                  false,
+		              tc_pfxt_scratch,
 	              total_tc_pfxt_pairs,
 	              curr_step_tc_timing);
 	          }
@@ -7713,6 +7826,19 @@ void CpGen::report_paths(
 	        // record the paths generated per step
 	        const auto curr_step = short_long_expansion_steps + 1;
 	        const auto curr_step_paths = short_pile_size-prev_step_short_pile_size;
+	        const auto curr_step_breakdown =
+	          make_tc_pfxt_stage_breakdown_ms(curr_step_cuda_time, curr_step_tc_timing);
+	        pfxt_summary_total_ms += curr_step_breakdown.total;
+	        pfxt_summary_discovery_ms += curr_step_breakdown.discovery;
+	        pfxt_summary_candidate_ms += curr_step_breakdown.candidate;
+	        pfxt_summary_queue_ms += curr_step_breakdown.queue;
+	        pfxt_summary_advance_sync_ms += curr_step_breakdown.advance_sync;
+            pfxt_summary_tc_discovery_substeps += curr_step_tc_timing.tc_discovery_substeps;
+	        if (curr_step_breakdown.total > pfxt_summary_dominant_step_ms) {
+	          pfxt_summary_dominant_step_ms = curr_step_breakdown.total;
+	          pfxt_summary_dominant_step = curr_step;
+	          pfxt_summary_dominant_batch_size = short_pile_size;
+	        }
 	        paths_gen_per_step.emplace_back(curr_step_paths);
 	        short_long_step_times.emplace_back(curr_step_cuda_time);
 	        if (!pfxt_dump_dir.empty()) {
@@ -7727,6 +7853,11 @@ void CpGen::report_paths(
 	            << "new_paths " << curr_step_paths << '\n'
 	            << "hops_count " << curr_step_hops << '\n'
 	            << "cuda_ms " << curr_step_cuda_time/1ms << '\n'
+	            << "tc_total_ms " << curr_step_breakdown.total << '\n'
+	            << "discovery_ms " << curr_step_breakdown.discovery << '\n'
+	            << "candidate_ms " << curr_step_breakdown.candidate << '\n'
+	            << "queue_ms " << curr_step_breakdown.queue << '\n'
+	            << "advance_sync_ms " << curr_step_breakdown.advance_sync << '\n'
 	            << "tc_ms " << curr_step_tc_timing.tc/1ms << '\n'
 	            << "sort_ms " << curr_step_tc_timing.sort/1ms << '\n'
 	            << "cost_ms " << curr_step_tc_timing.cost/1ms << '\n'
@@ -7739,6 +7870,11 @@ void CpGen::report_paths(
 	          << ", new_paths=" << curr_step_paths
 	          << ", hops_count=" << curr_step_hops
 	          << ", cuda_ms=" << curr_step_cuda_time/1ms
+	          << ", tc_total_ms=" << curr_step_breakdown.total
+	          << ", discovery_ms=" << curr_step_breakdown.discovery
+	          << ", candidate_ms=" << curr_step_breakdown.candidate
+	          << ", queue_ms=" << curr_step_breakdown.queue
+	          << ", advance_sync_ms=" << curr_step_breakdown.advance_sync
 	          << ", tc_ms=" << curr_step_tc_timing.tc/1ms
 	          << ", sort_ms=" << curr_step_tc_timing.sort/1ms
 	          << ", cost_ms=" << curr_step_tc_timing.cost/1ms
@@ -7872,6 +8008,23 @@ void CpGen::report_paths(
     timer.stop();
     if (enable_tc_pfxt) {
       std::cout << "tc_pfxt_total_pairs=" << total_tc_pfxt_pairs << '\n';
+    }
+    std::cout << "runtime_summary mode=" << (enable_tc_pfxt ? "tc" : "gpg")
+      << " K=" << k
+      << " steps=" << short_long_expansion_steps
+      << " total_pfxt_ms=" << pfxt_summary_total_ms
+      << " dominant_step=" << pfxt_summary_dominant_step
+      << " dominant_step_ms=" << pfxt_summary_dominant_step_ms
+      << " dominant_batch_size=" << pfxt_summary_dominant_batch_size
+      << '\n';
+    if (enable_tc_pfxt) {
+      std::cout << "runtime_summary_tc_stages"
+        << " discovery_ms=" << pfxt_summary_discovery_ms
+        << " candidate_ms=" << pfxt_summary_candidate_ms
+        << " queue_ms=" << pfxt_summary_queue_ms
+        << " advance_sync_ms=" << pfxt_summary_advance_sync_ms
+        << " tc_discovery_substeps=" << pfxt_summary_tc_discovery_substeps
+        << '\n';
     }
     std::cout << "pfxt expansion completed in " << timer.get_elapsed_time()/1ms << " ms.\n";
 
