@@ -203,6 +203,8 @@ public:
 
   void reset() {
     _h_verts_lvlp.clear();
+    _h_verts_by_lvl.clear();
+    _h_lvl_of.clear();
     // reset sinks
     _sinks.clear();
     _sinks.shrink_to_fit();
@@ -228,12 +230,16 @@ public:
     // reset the pfxt storage
     _h_pfxt_nodes.clear();
     _h_lvl_offsets.clear();
+    _h_dists.clear();
+    _h_queue.clear();
+    _h_succs.clear();
 
     // reset generated paths per step
     paths_gen_per_step.clear();
     paths_gen_per_step.shrink_to_fit();
     short_long_step_times.clear();
     short_long_step_times.shrink_to_fit();
+    total_gen_paths = 0;
   }
 
   void dump_succ_dists(std::ostream& os) const {
