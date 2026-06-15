@@ -87,7 +87,7 @@ GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE=1 \
 ./build/examples/tc-pfxt-inprocess-exactness \
   --benchmark benchmarks/tc_pfxt_crossover/netcard_d20.txt \
   --baseline-file experiments/tc_pfxt_source_local_20260614/golden/netcard_d20_k1000000.golden.costs \
-  --ks 1000,10000,50000,1000000
+  --ks 1000
 ```
 
 Expected exactness line:
@@ -95,6 +95,9 @@ Expected exactness line:
 ```text
 INPROCESS EXACTNESS PASS
 ```
+
+After the smoke passes, run the full prefix check with
+`--ks 1000,10000,50000,1000000`.
 
 ## Primary Runtime Flags
 

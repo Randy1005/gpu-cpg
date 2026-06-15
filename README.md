@@ -98,8 +98,11 @@ GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE=1 \
 ./build/examples/tc-pfxt-inprocess-exactness \
   --benchmark benchmarks/tc_pfxt_crossover/netcard_d20.txt \
   --baseline-file experiments/tc_pfxt_source_local_20260614/golden/netcard_d20_k1000000.golden.costs \
-  --ks 1000,10000,50000,1000000
+  --ks 1000
 ```
+
+After the smoke passes, run the full prefix check with
+`--ks 1000,10000,50000,1000000`.
 
 The in-process drivers load the graph once and call `CpGen::reset()` between
 runs. They do not reset the CUDA device by default. Use `--reset-device` only

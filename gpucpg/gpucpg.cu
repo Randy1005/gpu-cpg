@@ -9862,7 +9862,6 @@ void CpGen::report_paths(
   h_queue.resize(N);
   thrust::device_vector<int> queue(h_queue);
 
-  thrust::device_vector<int> out_degs(_h_out_degrees);
   thrust::device_vector<int> deps(_h_out_degrees);
   thrust::device_vector<int> in_degs(_h_in_degrees);
   thrust::device_vector<int> accum_spurs(N, 0);
@@ -9872,7 +9871,6 @@ void CpGen::report_paths(
   checkError_t(cudaMemset(_d_qhead, 0, sizeof(int)), "memset qhead failed.");
   checkError_t(cudaMemset(_d_qtail, 0, sizeof(int)), "memset qtail failed.");
   int* d_queue = thrust::raw_pointer_cast(&queue[0]);
-  int* d_out_degs = thrust::raw_pointer_cast(&out_degs[0]);
   int* d_in_degs = thrust::raw_pointer_cast(&in_degs[0]);
   int* d_deps = thrust::raw_pointer_cast(&deps[0]);
   int* d_accum_spurs = thrust::raw_pointer_cast(&accum_spurs[0]);
@@ -10315,7 +10313,6 @@ void CpGen::report_paths(
       // device side updates
       // out degrees
       deps = h_new_out_degrees;
-      d_out_degs = thrust::raw_pointer_cast(deps.data());
 
       // queue
       queue = thrust::device_vector<int>(N, -1);
@@ -11689,7 +11686,6 @@ void CpGen::report_paths(
     // increment tail pointer to the current pfxt level size
     inc_kernel<<<1, 1>>>(_d_pfxt_tail, curr_lvl_size);
 
-    const float mem_limit = 4e9;
     size_t free_mem{0}, total_mem{0};
 
     Timer timer_gpba;

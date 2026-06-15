@@ -11,9 +11,23 @@ path? In a conventional CUDA implementation, this becomes many small irregular
 lookups and candidate writes. That is effective but leaves the GPU's tensor
 cores mostly unused.
 
-Tensor cores are built for dense matrix operations. The proposal is to expose
-the hidden matrix-like structure inside path generation and use tensor cores for
-the part that looks like massive batched set intersection.
+That matters because modern NVIDIA GPUs expose most of their peak arithmetic
+through tensor-core paths. H100 SXM is roughly `67 TFLOPS` FP32, but almost
+`4 PFLOPS` FP8 tensor-core throughput. HGX B200 is roughly `600 TFLOPS` FP32
+for 8 GPUs, but `36 PFLOPS` dense FP8/FP6 tensor-core throughput. The exact
+precision is not the point for CPG; the point is that the fastest hardware path
+on newer GPUs is a tiled many-to-many engine, while ordinary CPG uses mostly
+scalar CUDA graph traversal.
+
+The proposal is to expose the hidden many-to-many structure inside path
+generation. CPG is not a neural-network matrix multiply, but deviation
+discovery repeatedly asks a matrix-like question:
+
+> Which active spur sources can connect to which legal deviation destinations?
+
+If we express that question as tiled bit-vector overlap, tensor cores become a
+natural fit. They can test many source/destination relationships at once, while
+CUDA handles the exact path-dependent candidate records after discovery.
 
 ## Core Technical Challenge
 
@@ -55,6 +69,113 @@ The tensor core is used as a high-throughput engine for this batched overlap
 test. The exact path costs and HPQ/LPQ admission decisions remain exact CUDA
 logic after discovery.
 
+## Figure: From CPG to Tensor-Core Tiles
+
+A useful presentation figure is a three-panel transformation.
+
+### Panel A: CPG Graph View
+
+Show active paths reaching spur sources `u`, with legal deviation edges leaving
+those sources:
+
+```text
+active paths                  legal deviations
+
+  p1 -> u0 --------------------------> v1
+  p2 -> u1 -------------> v0
+  p3 -> u4 -------------> v2
+  p4 -> u6 --------------------------> v1
+```
+
+Here `u` is a spur source reached by at least one active parent path. A legal
+deviation edge is any fanout edge `u -> v` that is not the suffix-tree edge
+`succs[u]`.
+
+### Panel B: Matrix / Set-Overlap View
+
+The same graph relation becomes a binary deviation matrix:
+
+```text
+                 spur source u
+                 u0 u1 u2 u3 u4 u5 u6 u7
+active alpha      1  1  0  0  1  0  1  0
+
+A_dev row v0      0  1  0  0  0  0  0  1
+A_dev row v1      1  0  1  0  0  0  1  0
+A_dev row v2      0  0  0  1  1  0  0  0
+A_dev row v3      1  1  0  0  0  1  0  0
+```
+
+`A_dev[v, u] = 1` means:
+
+```text
+edge u -> v exists AND edge u -> v is not succs[u]
+```
+
+`alpha[u] = 1` means:
+
+```text
+at least one active parent path in the current PFXT chain sub-step reaches u
+```
+
+So discovery computes:
+
+```text
+hit_mask[v, :] = A_dev[v, :] AND alpha[:]
+```
+
+Example:
+
+```text
+A_dev[v1, :]   = [1 0 1 0 0 0 1 0]
+alpha[:]       = [1 1 0 0 1 0 1 0]
+hit_mask[v1]   = [1 0 0 0 0 0 1 0]
+```
+
+This means `v1` has active deviation sources `u0` and `u6`.
+
+### Panel C: Tensor-Core Tile View
+
+The matrix is processed in small dense tiles:
+
+```text
+          active frontier alpha tile
+          [u0 u1 u2 u3 u4 u5 u6 u7]
+
+A_dev  [ v0 row bit mask ]       TC tile overlap
+tile   [ v1 row bit mask ]  -->  overlap scores + hit masks
+       [ v2 row bit mask ]
+       [ v3 row bit mask ]
+```
+
+Conceptually, a TC tile computes overlap scores:
+
+```text
+score[v] = count(A_dev[v, :] AND alpha[:])
+```
+
+For the example above:
+
+```text
+score[v0] = 1
+score[v1] = 2
+score[v2] = 1
+score[v3] = 2
+```
+
+The score only says how many active source hits a destination row has. Exact
+pair emission still uses the bit mask:
+
+```text
+hit_mask[v1] = [1 0 0 0 0 0 1 0]
+set bits     = u0, u6
+emit         = (u0, v1), (u6, v1)
+```
+
+This distinction is important for correctness: tensor cores accelerate the
+batched overlap/filtering work, but exact CUDA logic still enumerates the
+surviving source bits and emits exact deviation pairs.
+
 ## Implementation Sketch
 
 The current implementation builds a transposed deviation matrix `A_dev`.
@@ -62,11 +183,37 @@ The current implementation builds a transposed deviation matrix `A_dev`.
 - Row `v`: a deviation destination.
 - Bit `u`: source `u` has a fanout edge to `v`, and that edge is not the suffix
   tree edge.
-- Frontier vector `alpha`: active spur sources from the current PFXT window.
+- Frontier vector `alpha`: active spur sources from the current PFXT chain
+  sub-step.
 
 Tensor-core discovery computes overlap between `A_dev` rows and `alpha`. Each
-hit emits a deviation pair `(u, v)`. The source-local candidate path then groups
-work by active source and materializes exact `(parent path, u, v)` candidates.
+hit emits a deviation pair `(u, v)`.
+
+That pair is not yet a full path. If many parent paths reach the same source
+`u`, the same deviation edge `u -> v` creates many distinct candidates:
+
+```text
+candidate(p, u, v) =
+  parent path p to u
+  + deviation edge u -> v
+  + suffix-tree path from v to sink
+```
+
+The source-local candidate path keeps the TC output grouped by source:
+
+```text
+source u
+  parent paths reaching u: p0, p1, p2, ...
+  deviation destinations:  v0, v1, v2, ...
+  exact candidates:        Cartesian product of parents and deviations
+```
+
+This is the key bridge between TC discovery and candidate generation. The TC
+tile tells us which `(u, v)` families are alive; candidate generation then
+expands each family into exact path records only after applying the current
+PFXT split/window rules. The current implementation still materializes those
+records with CUDA kernels, which is why candidate generation remains the main
+runtime bottleneck.
 
 This keeps the exactness invariant: the deviation edge alone does not define a
 path. Different parent paths reaching the same `u -> v` edge remain distinct
