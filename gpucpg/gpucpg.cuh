@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <optional>
 #include <iomanip>
+#include <memory>
 #include <thrust/host_vector.h>
 #include "timer.hpp"
 #include "graph.h"
@@ -117,7 +118,8 @@ struct pfxt_node_comp {
 
 class CpGen {
 public:
-  CpGen() = default;
+  CpGen();
+  ~CpGen();
   void read_input(const std::string& filename, bool ignore_wgts = false);
   void convert_dimacs(const std::string& dimacs_file, const std::string& output_file);
   void levelize();
@@ -180,6 +182,11 @@ public:
 
   std::vector<float> get_slacks(int k);
   std::vector<PfxtNode> get_pfxt_nodes(int k);
+
+  void enable_tc_pfxt_static_cache(bool enabled);
+  void clear_tc_pfxt_static_cache();
+  int tc_pfxt_static_cache_hits() const;
+  int tc_pfxt_static_cache_misses() const;
 
   void dump_benchmark_with_wgts(const std::string& filename, std::ostream& os, bool dump_unit_wgt = false) const;
   void sizeup_benchmark(
@@ -349,6 +356,8 @@ public:
   int total_gen_paths{0};
 
 private:
+  struct TcPfxtStaticCache;
+
   void _free();
 
   int _get_num_ftrs();
@@ -417,6 +426,8 @@ private:
   int* _d_window_end;
   int _h_window_beg;
   int _h_window_end;
+
+  std::unique_ptr<TcPfxtStaticCache> _tc_pfxt_static_cache;
 };
 
 } // namespace gpucpg

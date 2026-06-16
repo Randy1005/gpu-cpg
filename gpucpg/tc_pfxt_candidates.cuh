@@ -160,6 +160,12 @@ struct StaticDeviationCsr {
   std::vector<unsigned char> reachable;
 };
 
+struct CompactStaticDeviationCsr {
+  std::vector<int> offsets;
+  std::vector<int> dsts;
+  std::vector<float> deltas;
+};
+
 struct CompressedLpqFamily {
   int src = -1;
   int dst = -1;
@@ -276,6 +282,25 @@ __host__ __device__ inline bool should_use_source_major_candidate_path(
     && !exclusive_candidate_mode_enabled;
 }
 
+__host__ __device__ inline bool should_use_tile_native_short_only_candidate_path(
+  const bool tile_native_enabled,
+  const bool materialize_long_outputs,
+  const int tile_count,
+  const std::uint64_t product_count,
+  const std::uint64_t min_product_count) {
+  return tile_native_enabled
+    && !materialize_long_outputs
+    && tile_count > 0
+    && product_count >= min_product_count;
+}
+
+__host__ __device__ inline bool tile_native_product_work_within_limit(
+  const std::uint64_t product_count,
+  const int max_products) {
+  return max_products > 0
+    && product_count <= static_cast<std::uint64_t>(max_products);
+}
+
 __host__ __device__ inline int ceil_div_int(const int numerator,
                                             const int denominator) {
   return denominator <= 0 || numerator <= 0
@@ -365,6 +390,44 @@ inline StaticDeviationCsr build_static_deviation_csr(
     }
   }
   csr.offsets[n_nodes] = static_cast<int>(csr.edge_ids.size());
+  return csr;
+}
+
+inline CompactStaticDeviationCsr build_compact_static_deviation_csr(
+  const int n_nodes,
+  const std::vector<int>& row_ptr,
+  const std::vector<int>& col_idx,
+  const std::vector<float>& weights,
+  const std::vector<int>& succs,
+  const std::vector<int>& dists) {
+  CompactStaticDeviationCsr csr;
+  csr.offsets.resize(static_cast<std::size_t>(n_nodes) + 1, 0);
+  if (n_nodes <= 0) {
+    return csr;
+  }
+  for (int src = 0; src < n_nodes; ++src) {
+    csr.offsets[src] = static_cast<int>(csr.dsts.size());
+    const int succ = src < static_cast<int>(succs.size()) ? succs[src] : -1;
+    const int src_dist = src < static_cast<int>(dists.size()) ? dists[src] : INT_MAX;
+    const int begin = row_ptr[src];
+    const int end = row_ptr[src + 1];
+    for (int edge_id = begin; edge_id < end; ++edge_id) {
+      const int dst = col_idx[edge_id];
+      const int dst_dist = dst >= 0 && dst < static_cast<int>(dists.size())
+        ? dists[dst]
+        : INT_MAX;
+      if (!is_viable_static_deviation_neighbor(dst, succ, dst_dist)
+          || !candidate_is_reachable(src_dist, dst_dist)) {
+        continue;
+      }
+      csr.dsts.push_back(dst);
+      csr.deltas.push_back(candidate_slack_delta(
+        src_dist,
+        dst_dist,
+        edge_id < static_cast<int>(weights.size()) ? weights[edge_id] : 0.0f));
+    }
+  }
+  csr.offsets[n_nodes] = static_cast<int>(csr.dsts.size());
   return csr;
 }
 

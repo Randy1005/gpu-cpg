@@ -219,6 +219,30 @@ TEST_CASE("tc pfxt builds static deviation CSR from every non-suffix fanout edge
   CHECK(csr.deltas[4] == doctest::Approx(0.5f));
 }
 
+TEST_CASE("tc pfxt builds compact static deviation CSR with reachable deviations only") {
+  using gpucpg::tc_pfxt::build_compact_static_deviation_csr;
+
+  const std::vector<int> row_ptr {0, 4, 6, 7, 7};
+  const std::vector<int> col_idx {1, 2, 2, 3, 2, 0, 1};
+  const std::vector<float> weights {0.1f, 0.2f, 0.25f, 0.4f, 0.5f, 0.6f, 0.7f};
+  const std::vector<int> succs {1, -1, 1, -1};
+  const std::vector<int> dists {1000, 2000, INT_MAX, 3000};
+
+  const auto csr = build_compact_static_deviation_csr(
+    4,
+    row_ptr,
+    col_idx,
+    weights,
+    succs,
+    dists);
+
+  REQUIRE(csr.offsets == std::vector<int> {0, 1, 2, 2, 2});
+  REQUIRE(csr.dsts == std::vector<int> {3, 0});
+  REQUIRE(csr.deltas.size() == 2);
+  CHECK(csr.deltas[0] == doctest::Approx(0.6f));
+  CHECK(csr.deltas[1] == doctest::Approx(0.5f));
+}
+
 TEST_CASE("tc pfxt pair lower-bound pruning respects active output threshold") {
   using gpucpg::tc_pfxt::pair_can_emit_candidate;
 
@@ -557,6 +581,32 @@ TEST_CASE("source-major tiling keeps heavy sources parallel") {
   CHECK(source_major_tile_count(9, 8, 8, 8) == 2);
   CHECK(source_major_tile_count(9, 9, 8, 8) == 4);
   CHECK(source_major_tile_count(120, 173, 32, 16) == 44);
+}
+
+TEST_CASE("tile-native candidate path only handles short-only large tile work") {
+  using namespace gpucpg::tc_pfxt;
+
+  CHECK(should_use_tile_native_short_only_candidate_path(
+    true, false, 8, 4096, 4096));
+  CHECK_FALSE(should_use_tile_native_short_only_candidate_path(
+    false, false, 8, 4096, 4096));
+  CHECK_FALSE(should_use_tile_native_short_only_candidate_path(
+    true, true, 8, 4096, 4096));
+  CHECK_FALSE(should_use_tile_native_short_only_candidate_path(
+    true, false, 0, 4096, 4096));
+  CHECK_FALSE(should_use_tile_native_short_only_candidate_path(
+    true, false, 8, 4095, 4096));
+  CHECK(should_use_tile_native_short_only_candidate_path(
+    true, false, 8, 4095, 0));
+}
+
+TEST_CASE("tile-native source-local work still obeys configured product cap") {
+  using namespace gpucpg::tc_pfxt;
+
+  CHECK(tile_native_product_work_within_limit(4096, 4096));
+  CHECK_FALSE(tile_native_product_work_within_limit(4097, 4096));
+  CHECK_FALSE(tile_native_product_work_within_limit(1, 0));
+  CHECK_FALSE(tile_native_product_work_within_limit(1, -1));
 }
 
 TEST_CASE("compressed lpq split update matches family slack boundaries") {

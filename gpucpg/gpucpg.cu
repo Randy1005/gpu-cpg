@@ -397,6 +397,7 @@ static std::vector<int> build_tc_pfxt_next_dev_vertex(
 
 
 void CpGen::read_input(const std::string& filename, bool ignore_wgts) {
+  clear_tc_pfxt_static_cache();
   std::ifstream infile(filename);
   if (!infile) {
     throw std::runtime_error("Unable to open file: " + filename);
@@ -4529,7 +4530,7 @@ __global__ void count_tc_pfxt_source_local_tile_candidate_classes(
     const int local_parent = product / dev_count;
     const int local_dev = product - local_parent * dev_count;
     auto candidate_class = tc_pfxt::CandidateClass::SKIP;
-    if (dev_reachable[dev_base + local_dev] != 0) {
+    if (dev_reachable == nullptr || dev_reachable[dev_base + local_dev] != 0) {
       const int active_idx = path_indices[parent_base + local_parent];
       const int parent_idx = window_start + active_idx;
       const auto& node = short_pile[parent_idx];
@@ -4740,7 +4741,7 @@ __global__ void fill_tc_pfxt_source_local_tile_candidates(
       const int active_idx = path_indices[parent_base + local_parent];
       parent_idx = window_start + active_idx;
       dst = dev_dsts[dev_base + local_dev];
-      if (dev_reachable[dev_base + local_dev] != 0) {
+      if (dev_reachable == nullptr || dev_reachable[dev_base + local_dev] != 0) {
         const auto& node = short_pile[parent_idx];
         new_slack = node.slack + dev_deltas[dev_base + local_dev];
         candidate_class = tc_pfxt::classify_candidate(
@@ -4801,6 +4802,118 @@ __global__ void fill_tc_pfxt_source_local_tile_candidates(
       new_path.slack = new_slack;
     }
     __syncthreads();
+  }
+}
+
+__global__ void fill_tc_pfxt_source_local_tile_short_candidates_direct(
+  const int n_tiles,
+  const int4* tiles,
+  const int* active_sources,
+  const int* group_offsets,
+  const int* path_indices,
+  const int* dev_offsets,
+  const int* dev_dsts,
+  const float* dev_deltas,
+  const unsigned char* dev_reachable,
+  PfxtNode* short_pile,
+  const int window_start,
+  const float split,
+  const float final_split,
+  const bool use_final_split,
+  int* tail_short,
+  const int max_short_paths,
+  int* overflow,
+  unsigned long long* class_counts) {
+  const int tile_idx = blockIdx.x;
+  if (tile_idx >= n_tiles) {
+    return;
+  }
+
+  __shared__ tc_pfxt::BlockCandidateOffsetStorage<
+    TC_PFXT_PAIR_BLOCK_THREADS> offset_storage;
+  __shared__ int src;
+  __shared__ int parent_base;
+  __shared__ int dev_base;
+  __shared__ int parent_count;
+  __shared__ int dev_count;
+  __shared__ int short_tile_base;
+
+  if (threadIdx.x == 0) {
+    const auto tile = tiles[tile_idx];
+    src = active_sources[tile.x];
+    parent_base = group_offsets[src] + tile.y;
+    dev_base = dev_offsets[src] + tile.z;
+    parent_count = tile.w >> 16;
+    dev_count = tile.w & 0xffff;
+    short_tile_base = 0;
+  }
+  __syncthreads();
+
+  unsigned long long local_short = 0;
+  unsigned long long local_skip = 0;
+  const int n_products = parent_count * dev_count;
+  for (int tile_product = 0;
+       tile_product < n_products;
+       tile_product += blockDim.x) {
+    const int product = tile_product + threadIdx.x;
+    int parent_idx = -1;
+    int dst = -1;
+    float new_slack = 0.0f;
+    auto candidate_class = tc_pfxt::CandidateClass::SKIP;
+    if (product < n_products) {
+      const int local_parent = product / dev_count;
+      const int local_dev = product - local_parent * dev_count;
+      const int active_idx = path_indices[parent_base + local_parent];
+      parent_idx = window_start + active_idx;
+      dst = dev_dsts[dev_base + local_dev];
+      if (dev_reachable == nullptr || dev_reachable[dev_base + local_dev] != 0) {
+        const auto& node = short_pile[parent_idx];
+        new_slack = node.slack + dev_deltas[dev_base + local_dev];
+        candidate_class = tc_pfxt::classify_candidate(
+          new_slack, split, final_split, use_final_split, true);
+      }
+      if (candidate_class == tc_pfxt::CandidateClass::SHORT) {
+        ++local_short;
+      }
+      else {
+        ++local_skip;
+      }
+    }
+
+    const auto tile_offsets =
+      tc_pfxt::block_candidate_tile_offsets<TC_PFXT_PAIR_BLOCK_THREADS>(
+        candidate_class, offset_storage);
+    if (threadIdx.x == 0 && tile_offsets.short_total > 0) {
+      short_tile_base = atomicAdd(tail_short, tile_offsets.short_total);
+      if (short_tile_base + tile_offsets.short_total > max_short_paths) {
+        *overflow = 1;
+      }
+    }
+    __syncthreads();
+
+    if (candidate_class == tc_pfxt::CandidateClass::SHORT
+        && short_tile_base + tile_offsets.short_offset < max_short_paths) {
+      const auto& node = short_pile[parent_idx];
+      auto& new_path =
+        short_pile[short_tile_base + tile_offsets.short_offset];
+      new_path.level = node.level + 1;
+      new_path.from = src;
+      new_path.to = dst;
+      new_path.parent = parent_idx;
+      new_path.num_children = 0;
+      new_path.slack = new_slack;
+    }
+    __syncthreads();
+  }
+
+  using BlockReduce = cub::BlockReduce<unsigned long long, TC_PFXT_PAIR_BLOCK_THREADS>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage;
+  const auto block_short = BlockReduce(reduce_storage).Sum(local_short);
+  __syncthreads();
+  const auto block_skip = BlockReduce(reduce_storage).Sum(local_skip);
+  if (threadIdx.x == 0) {
+    atomicAdd(class_counts + 0, block_short);
+    atomicAdd(class_counts + 2, block_skip);
   }
 }
 
@@ -5157,6 +5270,120 @@ struct TcPfxtDeviceStaticDeviationCsr {
     thrust::device_vector<unsigned char>().swap(reachable);
   }
 };
+
+struct TcPfxtDeviceCompactStaticDeviationCsr {
+  thrust::device_vector<int> offsets;
+  thrust::device_vector<int> dsts;
+  thrust::device_vector<float> deltas;
+
+  bool empty() const {
+    return offsets.empty() || dsts.empty() || deltas.empty();
+  }
+
+  void release() {
+    thrust::device_vector<int>().swap(offsets);
+    thrust::device_vector<int>().swap(dsts);
+    thrust::device_vector<float>().swap(deltas);
+  }
+};
+
+struct CpGen::TcPfxtStaticCache {
+  bool enabled = false;
+  int hits = 0;
+  int misses = 0;
+  int n = 0;
+  int m = 0;
+  int graph_diameter = 0;
+  bool sfxt_valid = false;
+  bool bvss_valid = false;
+  bool compact_devs_valid = false;
+
+  thrust::host_vector<int> h_dists;
+  thrust::host_vector<int> h_queue;
+  thrust::host_vector<int> h_succs;
+  std::vector<int> h_verts_lvlp;
+  std::vector<int> h_verts_by_lvl;
+  std::vector<int> h_tc_pfxt_next_dev_vertex;
+
+  thrust::device_vector<int> dists_cache;
+  thrust::device_vector<int> queue;
+  thrust::device_vector<int> successors;
+  thrust::device_vector<int> tc_pfxt_next_dev_vertex;
+
+  TcPfxtDeviceBvss bvss;
+  TcPfxtDeviceCompactStaticDeviationCsr compact_devs;
+
+  bool matches_graph(const int candidate_n, const int candidate_m) const {
+    return n == candidate_n && m == candidate_m;
+  }
+
+  bool can_reuse_sfxt(const int candidate_n, const int candidate_m) const {
+    return enabled && sfxt_valid && matches_graph(candidate_n, candidate_m);
+  }
+
+  bool can_reuse_tc_static(const int candidate_n,
+                           const int candidate_m,
+                           const bool need_compact_devs) const {
+    return can_reuse_sfxt(candidate_n, candidate_m)
+      && bvss_valid
+      && (!need_compact_devs || compact_devs_valid);
+  }
+
+  void clear_static_payload() {
+    sfxt_valid = false;
+    bvss_valid = false;
+    compact_devs_valid = false;
+    n = 0;
+    m = 0;
+    graph_diameter = 0;
+    h_dists.clear();
+    h_queue.clear();
+    h_succs.clear();
+    h_verts_lvlp.clear();
+    h_verts_by_lvl.clear();
+    h_tc_pfxt_next_dev_vertex.clear();
+    thrust::device_vector<int>().swap(dists_cache);
+    thrust::device_vector<int>().swap(queue);
+    thrust::device_vector<int>().swap(successors);
+    thrust::device_vector<int>().swap(tc_pfxt_next_dev_vertex);
+    thrust::device_vector<int>().swap(bvss.real_ptrs);
+    thrust::device_vector<int>().swap(bvss.virtual_to_real);
+    thrust::device_vector<int>().swap(bvss.row_ids);
+    thrust::device_vector<unsigned int>().swap(bvss.masks);
+    bvss.n_intervals = 0;
+    bvss.n_vss = 0;
+    compact_devs.release();
+  }
+};
+
+CpGen::CpGen()
+  : _tc_pfxt_static_cache(std::make_unique<TcPfxtStaticCache>()) {
+}
+
+CpGen::~CpGen() = default;
+
+void CpGen::enable_tc_pfxt_static_cache(const bool enabled) {
+  if (!_tc_pfxt_static_cache) {
+    _tc_pfxt_static_cache = std::make_unique<TcPfxtStaticCache>();
+  }
+  _tc_pfxt_static_cache->enabled = enabled;
+}
+
+void CpGen::clear_tc_pfxt_static_cache() {
+  if (_tc_pfxt_static_cache) {
+    _tc_pfxt_static_cache->clear_static_payload();
+    _tc_pfxt_static_cache->hits = 0;
+    _tc_pfxt_static_cache->misses = 0;
+  }
+}
+
+int CpGen::tc_pfxt_static_cache_hits() const {
+  return _tc_pfxt_static_cache ? _tc_pfxt_static_cache->hits : 0;
+}
+
+int CpGen::tc_pfxt_static_cache_misses() const {
+  return _tc_pfxt_static_cache ? _tc_pfxt_static_cache->misses : 0;
+}
 
 struct TcPfxtStepTiming {
   std::chrono::duration<double, std::micro> tc{0};
@@ -7292,6 +7519,7 @@ static void tc_pfxt_expand_window_single_pass(
   const int n_nodes,
   const TcPfxtDeviceBvss& bvss,
   const TcPfxtDeviceStaticDeviationCsr& static_devs,
+  const TcPfxtDeviceCompactStaticDeviationCsr& compact_static_devs,
   int* d_fanout_adjp,
   int* d_fanout_adjncy,
   float* d_fanout_wgts,
@@ -7375,8 +7603,20 @@ static void tc_pfxt_expand_window_single_pass(
     std::getenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_PROFILE") != nullptr;
   const bool source_local_requested =
     std::getenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE") != nullptr;
+  const bool tile_native_candidate_requested =
+    std::getenv("GPUCPG_TC_PFXT_TILE_NATIVE_CANDIDATE") != nullptr;
+  const int tile_native_min_products = get_env_int_or_default(
+    "GPUCPG_TC_PFXT_TILE_NATIVE_MIN_PRODUCTS", 4096);
+  const bool use_compact_static_devs =
+    std::getenv("GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS") != nullptr
+    && !compact_static_devs.empty();
+  const bool has_source_local_devs =
+    use_compact_static_devs || !static_devs.empty();
   const int single_work_max_slots =
     get_env_int_or_default("GPUCPG_TC_PFXT_SINGLE_WORK_MAX_SLOTS", 20000000);
+  const int source_local_max_slots = get_env_int_or_default(
+    "GPUCPG_TC_PFXT_SOURCE_LOCAL_MAX_SLOTS",
+    use_compact_static_devs ? 150000000 : single_work_max_slots);
   const bool candidate_fallback_needed =
     !skip_long_paths
     && tc_pfxt::should_use_atomic_candidate_fallback(
@@ -7391,11 +7631,13 @@ static void tc_pfxt_expand_window_single_pass(
     && !atomic_fallback_for_memory;
   const bool use_source_major_for_window =
     use_source_major_candidate && !candidate_fallback_needed;
+  const bool source_local_can_replace_chunked =
+    use_compact_static_devs || !use_chunked_candidate_fallback;
   const bool use_source_local_for_window =
     source_local_requested
-    && !static_devs.empty()
+    && has_source_local_devs
     && !classify_use
-    && !use_chunked_candidate_fallback
+    && source_local_can_replace_chunked
     && !use_source_major_for_window
     && !use_compressed_lpq
     && !use_threshold_filter
@@ -7556,6 +7798,28 @@ static void tc_pfxt_expand_window_single_pass(
   auto& in_discovery_stats = scratch.in_discovery_stats;
   auto& work_equiv_gpg_stats = scratch.work_equiv_gpg_stats;
   auto& work_equiv_pair_stats = scratch.work_equiv_pair_stats;
+  const int* source_local_dev_offsets = nullptr;
+  const int* source_local_dev_dsts = nullptr;
+  const float* source_local_dev_deltas = nullptr;
+  const unsigned char* source_local_dev_reachable = nullptr;
+  if (use_compact_static_devs) {
+    source_local_dev_offsets =
+      thrust::raw_pointer_cast(compact_static_devs.offsets.data());
+    source_local_dev_dsts =
+      thrust::raw_pointer_cast(compact_static_devs.dsts.data());
+    source_local_dev_deltas =
+      thrust::raw_pointer_cast(compact_static_devs.deltas.data());
+  }
+  else if (!static_devs.empty()) {
+    source_local_dev_offsets =
+      thrust::raw_pointer_cast(static_devs.offsets.data());
+    source_local_dev_dsts =
+      thrust::raw_pointer_cast(static_devs.dsts.data());
+    source_local_dev_deltas =
+      thrust::raw_pointer_cast(static_devs.deltas.data());
+    source_local_dev_reachable =
+      thrust::raw_pointer_cast(static_devs.reachable.data());
+  }
   const bool profile_work_equivalence =
     std::getenv("GPUCPG_TC_PFXT_WORK_EQUIV_PROFILE") != nullptr;
   const char* work_equivalence_csv =
@@ -7996,7 +8260,7 @@ static void tc_pfxt_expand_window_single_pass(
           thrust::raw_pointer_cast(source_local_active_sources.data()),
           h_source_local_sources,
           thrust::raw_pointer_cast(group_offsets.data()),
-          thrust::raw_pointer_cast(static_devs.offsets.data()),
+          source_local_dev_offsets,
           thrust::raw_pointer_cast(source_local_stats.data()));
       cudaCheckErrors("tc pfxt source-local collect stats failed");
       const auto source_stats = thrust::reduce(
@@ -8539,7 +8803,7 @@ static void tc_pfxt_expand_window_single_pass(
             thrust::raw_pointer_cast(source_local_active_sources.data()),
             h_source_local_sources,
             thrust::raw_pointer_cast(group_offsets.data()),
-            thrust::raw_pointer_cast(static_devs.offsets.data()),
+            source_local_dev_offsets,
             source_local_parent_tile,
             source_local_dev_tile,
             thrust::raw_pointer_cast(source_local_tile_counts.data()));
@@ -8563,6 +8827,13 @@ static void tc_pfxt_expand_window_single_pass(
 	        light_profiler.end_candidate_scan(scan_detail_start);
 
         unsigned long long h_source_local_class_counts_raw[3] = {0ULL, 0ULL, 0ULL};
+        const bool use_tile_native_short_only =
+          tc_pfxt::should_use_tile_native_short_only_candidate_path(
+            tile_native_candidate_requested,
+            fill_longs,
+            h_n_tiles,
+            source_local_products,
+            static_cast<std::uint64_t>(std::max(0, tile_native_min_products)));
         if (h_n_tiles > 0) {
           auto count_detail_start = light_profiler.begin();
           source_local_class_counts.resize(3);
@@ -8576,53 +8847,65 @@ static void tc_pfxt_expand_window_single_pass(
               thrust::raw_pointer_cast(source_local_active_sources.data()),
               h_source_local_sources,
               thrust::raw_pointer_cast(group_offsets.data()),
-              thrust::raw_pointer_cast(static_devs.offsets.data()),
+              source_local_dev_offsets,
               thrust::raw_pointer_cast(source_local_tile_offsets.data()),
               source_local_parent_tile,
               source_local_dev_tile,
               thrust::raw_pointer_cast(source_local_tiles.data()));
           cudaCheckErrors("tc pfxt source-local fill tile descriptors failed");
-          count_tc_pfxt_source_local_tile_candidate_classes
-            <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
-              h_n_tiles,
-              thrust::raw_pointer_cast(source_local_tiles.data()),
-              thrust::raw_pointer_cast(source_local_active_sources.data()),
-              thrust::raw_pointer_cast(group_offsets.data()),
-              thrust::raw_pointer_cast(path_indices.data()),
-              thrust::raw_pointer_cast(static_devs.offsets.data()),
-              thrust::raw_pointer_cast(static_devs.deltas.data()),
-              thrust::raw_pointer_cast(static_devs.reachable.data()),
-              thrust::raw_pointer_cast(short_pile.data()),
-              window_start,
-              split,
-              final_split,
-              use_final_split,
-              !fill_longs,
-              thrust::raw_pointer_cast(source_local_class_counts.data()));
-          cudaCheckErrors("tc pfxt source-local count class outputs failed");
-          cudaMemcpy(
-            h_source_local_class_counts_raw,
-            thrust::raw_pointer_cast(source_local_class_counts.data()),
-            sizeof(h_source_local_class_counts_raw),
-            cudaMemcpyDeviceToHost);
-          cudaCheckErrors("tc pfxt source-local copy class outputs failed");
+          if (!use_tile_native_short_only) {
+            count_tc_pfxt_source_local_tile_candidate_classes
+              <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
+                h_n_tiles,
+                thrust::raw_pointer_cast(source_local_tiles.data()),
+                thrust::raw_pointer_cast(source_local_active_sources.data()),
+                thrust::raw_pointer_cast(group_offsets.data()),
+                thrust::raw_pointer_cast(path_indices.data()),
+                source_local_dev_offsets,
+                source_local_dev_deltas,
+                source_local_dev_reachable,
+                thrust::raw_pointer_cast(short_pile.data()),
+                window_start,
+                split,
+                final_split,
+                use_final_split,
+                !fill_longs,
+                thrust::raw_pointer_cast(source_local_class_counts.data()));
+            cudaCheckErrors("tc pfxt source-local count class outputs failed");
+            cudaMemcpy(
+              h_source_local_class_counts_raw,
+              thrust::raw_pointer_cast(source_local_class_counts.data()),
+              sizeof(h_source_local_class_counts_raw),
+              cudaMemcpyDeviceToHost);
+            cudaCheckErrors("tc pfxt source-local copy class outputs failed");
+          }
           light_profiler.end_candidate_count(count_detail_start);
         }
         if (h_source_local_class_counts_raw[0]
               > static_cast<unsigned long long>(std::numeric_limits<int>::max())
             || h_source_local_class_counts_raw[1]
               > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
-          throw std::runtime_error(
-            "tc pfxt source-local class count exceeds int capacity");
-        }
+	          throw std::runtime_error(
+	            "tc pfxt source-local class count exceeds int capacity");
+	        }
         const auto allocation_counts = tc_pfxt::source_local_allocation_counts(
           h_source_local_class_counts_raw[0],
           h_source_local_class_counts_raw[1]);
-        const int short_added_capacity = allocation_counts.short_count;
-        const int long_added_capacity = fill_longs
+        if (use_tile_native_short_only
+            && !tc_pfxt::tile_native_product_work_within_limit(
+              source_local_products,
+              source_local_max_slots)) {
+          throw std::runtime_error(
+            "tc pfxt tile-native source-local product limit exceeded");
+        }
+        int short_added_capacity = use_tile_native_short_only
+          ? 0
+          : allocation_counts.short_count;
+        int long_added_capacity = fill_longs
           ? allocation_counts.long_count
           : 0;
-        if (short_added_capacity + long_added_capacity > single_work_max_slots) {
+        if (!use_tile_native_short_only
+            && short_added_capacity + long_added_capacity > source_local_max_slots) {
           throw std::runtime_error(
             "tc pfxt source-local exact candidate slot limit exceeded");
         }
@@ -8635,44 +8918,69 @@ static void tc_pfxt_expand_window_single_pass(
         if (fill_longs && long_added_capacity > 0) {
           long_pile.resize(base_long + long_added_capacity);
         }
-	        reset_tc_pfxt_candidate_state<<<1, 1>>>(
-	          d_tail_short,
-	          base_short,
-	          d_tail_long,
-	          base_long,
-	          thrust::raw_pointer_cast(overflow.data()));
-	        cudaCheckErrors("tc pfxt source-local reset tails failed");
-	        light_profiler.end_candidate_resize(resize_detail_start);
+        reset_tc_pfxt_candidate_state<<<1, 1>>>(
+          d_tail_short,
+          base_short,
+          d_tail_long,
+          base_long,
+          thrust::raw_pointer_cast(overflow.data()));
+        cudaCheckErrors("tc pfxt source-local reset tails failed");
+        light_profiler.end_candidate_resize(resize_detail_start);
 
         if (h_n_tiles > 0) {
           auto fill_detail_start = light_profiler.begin();
-          fill_tc_pfxt_source_local_tile_candidates
-            <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
-              h_n_tiles,
-              thrust::raw_pointer_cast(source_local_tiles.data()),
-              thrust::raw_pointer_cast(source_local_active_sources.data()),
-              thrust::raw_pointer_cast(group_offsets.data()),
-              thrust::raw_pointer_cast(path_indices.data()),
-              thrust::raw_pointer_cast(static_devs.offsets.data()),
-              thrust::raw_pointer_cast(static_devs.dsts.data()),
-              thrust::raw_pointer_cast(static_devs.deltas.data()),
-              thrust::raw_pointer_cast(static_devs.reachable.data()),
-              thrust::raw_pointer_cast(short_pile.data()),
-              fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
-              window_start,
-              split,
-              final_split,
-              use_final_split,
-              !fill_longs,
-              d_tail_short,
-	              d_tail_long,
-	              short_limit,
-	              fill_longs ? base_long + long_added_capacity : base_long,
-	              thrust::raw_pointer_cast(overflow.data()),
-	              nullptr);
-	          cudaCheckErrors("tc pfxt source-local fill candidates failed");
-	          light_profiler.end_candidate_fill(fill_detail_start);
-	        }
+          if (use_tile_native_short_only) {
+            fill_tc_pfxt_source_local_tile_short_candidates_direct
+              <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
+                h_n_tiles,
+                thrust::raw_pointer_cast(source_local_tiles.data()),
+                thrust::raw_pointer_cast(source_local_active_sources.data()),
+                thrust::raw_pointer_cast(group_offsets.data()),
+                thrust::raw_pointer_cast(path_indices.data()),
+                source_local_dev_offsets,
+                source_local_dev_dsts,
+                source_local_dev_deltas,
+                source_local_dev_reachable,
+                thrust::raw_pointer_cast(short_pile.data()),
+                window_start,
+                split,
+                final_split,
+                use_final_split,
+                d_tail_short,
+                short_limit,
+                thrust::raw_pointer_cast(overflow.data()),
+                thrust::raw_pointer_cast(source_local_class_counts.data()));
+            cudaCheckErrors("tc pfxt source-local tile-native short fill failed");
+          }
+          else {
+            fill_tc_pfxt_source_local_tile_candidates
+              <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
+                h_n_tiles,
+                thrust::raw_pointer_cast(source_local_tiles.data()),
+                thrust::raw_pointer_cast(source_local_active_sources.data()),
+                thrust::raw_pointer_cast(group_offsets.data()),
+                thrust::raw_pointer_cast(path_indices.data()),
+                source_local_dev_offsets,
+                source_local_dev_dsts,
+                source_local_dev_deltas,
+                source_local_dev_reachable,
+                thrust::raw_pointer_cast(short_pile.data()),
+                fill_longs ? thrust::raw_pointer_cast(long_pile.data()) : nullptr,
+                window_start,
+                split,
+                final_split,
+                use_final_split,
+                !fill_longs,
+                d_tail_short,
+                d_tail_long,
+                short_limit,
+                fill_longs ? base_long + long_added_capacity : base_long,
+                thrust::raw_pointer_cast(overflow.data()),
+                nullptr);
+            cudaCheckErrors("tc pfxt source-local fill candidates failed");
+          }
+          light_profiler.end_candidate_fill(fill_detail_start);
+        }
 
         auto finalize_detail_start = light_profiler.begin();
         int h_tail_short = base_short;
@@ -8680,13 +8988,29 @@ static void tc_pfxt_expand_window_single_pass(
         cudaMemcpy(&h_tail_short, d_tail_short, sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(&h_tail_long, d_tail_long, sizeof(int), cudaMemcpyDeviceToHost);
         cudaCheckErrors("tc pfxt source-local copy tails failed");
-	        thrust::host_vector<int> h_overflow(overflow);
-	        if (h_overflow[0] != 0) {
-	          throw std::runtime_error("tc pfxt source-local candidate output overflow");
-	        }
+        thrust::host_vector<int> h_overflow(overflow);
+        if (h_overflow[0] != 0) {
+          throw std::runtime_error("tc pfxt source-local candidate output overflow");
+        }
         const int substep_short = h_tail_short - base_short;
         const int substep_long = fill_longs ? h_tail_long - base_long : 0;
-        if (substep_short != short_added_capacity
+        if (use_tile_native_short_only) {
+          cudaMemcpy(
+            h_source_local_class_counts_raw,
+            thrust::raw_pointer_cast(source_local_class_counts.data()),
+            sizeof(h_source_local_class_counts_raw),
+            cudaMemcpyDeviceToHost);
+          cudaCheckErrors("tc pfxt source-local copy tile-native class outputs failed");
+          short_added_capacity = substep_short;
+          long_added_capacity = 0;
+          if (h_source_local_class_counts_raw[0]
+                != static_cast<unsigned long long>(substep_short)
+              || h_source_local_class_counts_raw[1] != 0ULL) {
+            throw std::runtime_error(
+              "tc pfxt tile-native counted/fill output mismatch");
+          }
+        }
+        else if (substep_short != short_added_capacity
             || substep_long != long_added_capacity) {
           throw std::runtime_error(
             "tc pfxt source-local counted/fill output mismatch");
@@ -9928,6 +10252,19 @@ void CpGen::report_paths(
   auto d_dists_float = thrust::raw_pointer_cast(dists_float.data());
   bool* d_dists_updated = thrust::raw_pointer_cast(&dists_updated[0]);
   int* d_succs = thrust::raw_pointer_cast(&successors[0]);
+  std::vector<int> h_dists(N);
+
+  const bool tc_pfxt_static_cache_supported =
+    _tc_pfxt_static_cache
+    && _tc_pfxt_static_cache->enabled
+    && pd_method == PropDistMethod::LEVELIZE_THEN_RELAX
+    && cr_method == CsrReorderMethod::NONE
+    && !enable_reindex_cpu
+    && !enable_reindex_gpu
+    && !enable_fuse_steps;
+  const bool tc_pfxt_use_cached_sfxt =
+    tc_pfxt_static_cache_supported
+    && _tc_pfxt_static_cache->can_reuse_sfxt(N, M);
 
   // record whether a vertex is visited
   thrust::device_vector<bool> touched(N, false);
@@ -10004,6 +10341,36 @@ void CpGen::report_paths(
   }
 
 	Timer timer_cpg;
+  if (tc_pfxt_use_cached_sfxt) {
+    _tc_pfxt_static_cache->hits++;
+    std::cout << "tc_pfxt_static_cache=hit sfxt=1\n";
+    h_dists.assign(
+      _tc_pfxt_static_cache->h_dists.begin(),
+      _tc_pfxt_static_cache->h_dists.end());
+    _h_dists = _tc_pfxt_static_cache->h_dists;
+    _h_queue = _tc_pfxt_static_cache->h_queue;
+    _h_succs = _tc_pfxt_static_cache->h_succs;
+    _h_verts_lvlp = _tc_pfxt_static_cache->h_verts_lvlp;
+    _h_verts_by_lvl = _tc_pfxt_static_cache->h_verts_by_lvl;
+    graph_diameter = _tc_pfxt_static_cache->graph_diameter;
+    dists_cache = _tc_pfxt_static_cache->dists_cache;
+    queue = _tc_pfxt_static_cache->queue;
+    successors = _tc_pfxt_static_cache->successors;
+    d_queue = thrust::raw_pointer_cast(queue.data());
+    d_dists_cache = thrust::raw_pointer_cast(dists_cache.data());
+    d_succs = thrust::raw_pointer_cast(successors.data());
+    prop_time = std::chrono::duration<double, std::micro>{0};
+    if (enable_interm_perf_log) {
+      std::cout << "================== runtime breakdown ==================\n";
+      std::cout << "levelize time=0 ms (cached)\n";
+      std::cout << "relaxation time=0 ms (cached)\n";
+    }
+  }
+  else {
+    if (tc_pfxt_static_cache_supported && _tc_pfxt_static_cache->enabled) {
+      _tc_pfxt_static_cache->misses++;
+      std::cout << "tc_pfxt_static_cache=miss sfxt=0\n";
+    }
 	timer_cpg.start();
   if (pd_method == PropDistMethod::BASIC) {
     while (!h_converged) {
@@ -11272,7 +11639,6 @@ void CpGen::report_paths(
 	prop_time = timer_cpg.get_elapsed_time();
 
   // copy distance vector back to host
-  std::vector<int> h_dists(N);
   thrust::copy(dists_cache.begin(), dists_cache.end(), h_dists.begin());
   _h_dists = dists_cache;
   _h_queue = queue;
@@ -11309,9 +11675,30 @@ void CpGen::report_paths(
   // copy successors from device to host
   _h_succs.resize(N);
   thrust::copy(successors.begin(), successors.end(), _h_succs.begin());
+  if (tc_pfxt_static_cache_supported && _tc_pfxt_static_cache->enabled) {
+    _tc_pfxt_static_cache->n = N;
+    _tc_pfxt_static_cache->m = M;
+    _tc_pfxt_static_cache->graph_diameter = graph_diameter;
+    _tc_pfxt_static_cache->h_dists = _h_dists;
+    _tc_pfxt_static_cache->h_queue = _h_queue;
+    _tc_pfxt_static_cache->h_succs = _h_succs;
+    _tc_pfxt_static_cache->h_verts_lvlp = _h_verts_lvlp;
+    _tc_pfxt_static_cache->h_verts_by_lvl = _h_verts_by_lvl;
+    _tc_pfxt_static_cache->dists_cache = dists_cache;
+    _tc_pfxt_static_cache->queue = queue;
+    _tc_pfxt_static_cache->successors = successors;
+    _tc_pfxt_static_cache->sfxt_valid = true;
+  }
+  }
 
   std::vector<int> h_tc_pfxt_next_dev_vertex;
-  if (enable_reindex_gpu) {
+  if (tc_pfxt_static_cache_supported
+      && _tc_pfxt_static_cache->enabled
+      && !_tc_pfxt_static_cache->h_tc_pfxt_next_dev_vertex.empty()) {
+    h_tc_pfxt_next_dev_vertex =
+      _tc_pfxt_static_cache->h_tc_pfxt_next_dev_vertex;
+  }
+  else if (enable_reindex_gpu) {
     h_tc_pfxt_next_dev_vertex.resize(N);
     std::iota(
       h_tc_pfxt_next_dev_vertex.begin(),
@@ -11327,10 +11714,28 @@ void CpGen::report_paths(
       h_succs_std,
       h_dists);
   }
-  thrust::device_vector<int> tc_pfxt_next_dev_vertex(
-    h_tc_pfxt_next_dev_vertex);
-  int* d_tc_pfxt_next_dev_vertex =
-    thrust::raw_pointer_cast(tc_pfxt_next_dev_vertex.data());
+  if (tc_pfxt_static_cache_supported
+      && _tc_pfxt_static_cache->enabled
+      && _tc_pfxt_static_cache->h_tc_pfxt_next_dev_vertex.empty()) {
+    _tc_pfxt_static_cache->h_tc_pfxt_next_dev_vertex =
+      h_tc_pfxt_next_dev_vertex;
+    _tc_pfxt_static_cache->tc_pfxt_next_dev_vertex =
+      h_tc_pfxt_next_dev_vertex;
+  }
+  thrust::device_vector<int> tc_pfxt_next_dev_vertex;
+  int* d_tc_pfxt_next_dev_vertex = nullptr;
+  if (tc_pfxt_static_cache_supported
+      && _tc_pfxt_static_cache->enabled
+      && !_tc_pfxt_static_cache->tc_pfxt_next_dev_vertex.empty()) {
+    d_tc_pfxt_next_dev_vertex =
+      thrust::raw_pointer_cast(
+        _tc_pfxt_static_cache->tc_pfxt_next_dev_vertex.data());
+  }
+  else {
+    tc_pfxt_next_dev_vertex = h_tc_pfxt_next_dev_vertex;
+    d_tc_pfxt_next_dev_vertex =
+      thrust::raw_pointer_cast(tc_pfxt_next_dev_vertex.data());
+  }
 
   // host level offsets
   std::vector<int> _h_lvl_offsets(max_dev_lvls+1, 0);
@@ -11413,6 +11818,10 @@ void CpGen::report_paths(
     std::getenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_PROFILE") != nullptr;
   const bool enable_tc_pfxt_source_local_candidate =
     std::getenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE") != nullptr;
+  const bool enable_tc_pfxt_tile_native_candidate =
+    std::getenv("GPUCPG_TC_PFXT_TILE_NATIVE_CANDIDATE") != nullptr;
+  const bool enable_tc_pfxt_compact_static_devs =
+    std::getenv("GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS") != nullptr;
   const int tc_pfxt_single_pass_fallback_long_pile =
     get_env_int_or_default("GPUCPG_TC_PFXT_SINGLE_PASS_FALLBACK_LONG_PILE", 1000000);
   const bool disable_tc_pfxt_phase_profile =
@@ -11461,6 +11870,16 @@ void CpGen::report_paths(
         << (enable_tc_pfxt_source_local_profile ? 1 : 0)
         << ", source_local_candidate="
         << (enable_tc_pfxt_source_local_candidate ? 1 : 0)
+        << ", tile_native_candidate="
+        << (enable_tc_pfxt_tile_native_candidate ? 1 : 0)
+        << ", tile_native_min_products="
+        << get_env_int_or_default("GPUCPG_TC_PFXT_TILE_NATIVE_MIN_PRODUCTS", 4096)
+        << ", compact_static_devs="
+        << (enable_tc_pfxt_compact_static_devs ? 1 : 0)
+        << ", source_local_max_slots="
+        << get_env_int_or_default(
+          "GPUCPG_TC_PFXT_SOURCE_LOCAL_MAX_SLOTS",
+          enable_tc_pfxt_compact_static_devs ? 150000000 : 20000000)
 	      << ", single_pass_fallback_long_pile="
 	      << tc_pfxt_single_pass_fallback_long_pile << '\n';
   }
@@ -11927,13 +12346,42 @@ void CpGen::report_paths(
 	    const char* pfxt_dump_dir_env = std::getenv("GPUCPG_PFXT_STEP_DUMP_DIR");
 	    const std::string pfxt_dump_dir = pfxt_dump_dir_env ? pfxt_dump_dir_env : "";
 	    const char* pfxt_cand_dump_dir_env = std::getenv("GPUCPG_PFXT_CAND_DUMP_DIR");
-		    const std::string pfxt_cand_dump_dir =
+	    const std::string pfxt_cand_dump_dir =
 	        pfxt_cand_dump_dir_env ? pfxt_cand_dump_dir_env : "";
-		    TcPfxtDeviceBvss tc_pfxt_bvss;
-        TcPfxtDeviceStaticDeviationCsr tc_pfxt_static_devs;
+		    TcPfxtDeviceBvss local_tc_pfxt_bvss;
+        TcPfxtDeviceStaticDeviationCsr local_tc_pfxt_static_devs;
+        TcPfxtDeviceCompactStaticDeviationCsr local_tc_pfxt_compact_static_devs;
+        const bool tc_pfxt_need_compact_static_devs =
+          enable_tc_pfxt_compact_static_devs
+          && (enable_tc_pfxt_source_local_profile
+            || enable_tc_pfxt_source_local_candidate);
+        const bool tc_pfxt_use_static_cache =
+          tc_pfxt_static_cache_supported
+          && _tc_pfxt_static_cache
+          && _tc_pfxt_static_cache->enabled
+          && enable_tc_pfxt;
+        auto& tc_pfxt_bvss =
+          tc_pfxt_use_static_cache
+            ? _tc_pfxt_static_cache->bvss
+            : local_tc_pfxt_bvss;
+        auto& tc_pfxt_static_devs = local_tc_pfxt_static_devs;
+        auto& tc_pfxt_compact_static_devs =
+          tc_pfxt_use_static_cache
+            ? _tc_pfxt_static_cache->compact_devs
+            : local_tc_pfxt_compact_static_devs;
 		    TcPfxtScratch tc_pfxt_scratch;
 		    if (enable_tc_pfxt) {
 		      std::cout << "TC PFXT enabled.\n";
+          const bool tc_pfxt_static_hit =
+            tc_pfxt_use_static_cache
+            && _tc_pfxt_static_cache->can_reuse_tc_static(
+              N,
+              M,
+              tc_pfxt_need_compact_static_devs);
+          if (tc_pfxt_static_hit) {
+            std::cout << "tc_pfxt_static_cache=hit tc_static=1\n";
+          }
+          else {
 	      const auto h_bvss = tc_pfxt::build_adev_bvss_from_fanout_csr(
 	        N,
 	        _h_fanout_adjp,
@@ -11948,7 +12396,29 @@ void CpGen::report_paths(
 	      tc_pfxt_bvss.n_vss = h_bvss.n_vss;
 		      std::cout << "tc_pfxt_bvss_n_vss=" << h_bvss.n_vss
 		        << ", comp_ratio=" << h_bvss.compression_ratio() << '\n';
-          if (enable_tc_pfxt_source_local_profile
+          if (tc_pfxt_use_static_cache) {
+            _tc_pfxt_static_cache->bvss_valid = true;
+          }
+          if (enable_tc_pfxt_compact_static_devs
+              && (enable_tc_pfxt_source_local_profile
+                || enable_tc_pfxt_source_local_candidate)) {
+            const auto h_compact_devs = tc_pfxt::build_compact_static_deviation_csr(
+              N,
+              _h_fanout_adjp,
+              _h_fanout_adjncy,
+              _h_fanout_wgts,
+              std::vector<int>(_h_succs.begin(), _h_succs.end()),
+              h_dists);
+            tc_pfxt_compact_static_devs.offsets = h_compact_devs.offsets;
+            tc_pfxt_compact_static_devs.dsts = h_compact_devs.dsts;
+            tc_pfxt_compact_static_devs.deltas = h_compact_devs.deltas;
+            std::cout << "tc_pfxt_compact_static_deviation_edges="
+              << h_compact_devs.dsts.size() << '\n';
+            if (tc_pfxt_use_static_cache) {
+              _tc_pfxt_static_cache->compact_devs_valid = true;
+            }
+          }
+          else if (enable_tc_pfxt_source_local_profile
               || enable_tc_pfxt_source_local_candidate) {
             const auto h_static_devs = tc_pfxt::build_static_deviation_csr(
               N,
@@ -11964,6 +12434,7 @@ void CpGen::report_paths(
             tc_pfxt_static_devs.reachable = h_static_devs.reachable;
             std::cout << "tc_pfxt_static_deviation_edges="
               << h_static_devs.edge_ids.size() << '\n';
+          }
           }
 		      std::cout << "tc_pfxt_max_chain_substeps=" << std::max(1, graph_diameter) << '\n';
 		    }
@@ -12189,6 +12660,7 @@ void CpGen::report_paths(
 		              N,
 		              tc_pfxt_bvss,
                   tc_pfxt_static_devs,
+                  tc_pfxt_compact_static_devs,
 		              d_fanout_adjp,
 	              d_fanout_adjncy,
 	              d_fanout_wgts,
@@ -12269,6 +12741,7 @@ void CpGen::report_paths(
 	            d_long_pile = nullptr;
 	          }
 	          else if (enable_tc_pfxt_source_local_candidate
+	              && !enable_tc_pfxt_compact_static_devs
 	              && !enable_tc_pfxt_source_local_profile
 	              && !tc_pfxt_static_devs.empty()
 	              && tc_pfxt::should_use_atomic_candidate_fallback(

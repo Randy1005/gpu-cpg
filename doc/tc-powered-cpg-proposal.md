@@ -222,19 +222,38 @@ PFXT candidates.
 ## Current Result
 
 The current TC implementation is not faster than GPG yet. It is the first
-end-to-end exact implementation that uses tensor cores for deviation discovery.
+end-to-end exact implementation that uses tensor cores for deviation discovery,
+and the latest compact source-local path with tile-native short-only candidate
+emission is now close enough on the main K=1M density point to make
+optimization meaningful.
+
+Headline comparison against GPG:
 
 | density | K | GPG ms | TC ms | TC/GPG |
 |---|---:|---:|---:|---:|
-| d10 | 1M | 186.9 | 415.2 | 2.22x |
-| d20 | 1M | 264.1 | 468.9 | 1.78x |
-| d30 | 200K | 62.7 | 199.4 | 3.18x |
-| d40 | 200K | 64.1 | 226.9 | 3.54x |
-| d50 | 100K | 59.6 | 172.3 | 2.89x |
+| d10 | 1M | 186.9 | 314.5 | 1.68x |
+| d20 | 1M | 264.1 | 309.8 | 1.17x |
+| d30 | 200K | 62.7 | 113.2 | 1.81x |
+| d40 | 200K | 64.1 | 136.6 | 2.13x |
+| d50 | 100K | 59.6 | 95.3 | 1.60x |
 
-This table is still useful: it shows where the first implementation pays extra
-cost. Tensor-core deviation discovery is cheap; candidate materialization and
-queue work dominate.
+These are PFXT expansion times only. The compact static-deviation CSR is a
+one-time graph setup structure and is not counted in either GPG or TC PFXT
+runtime.
+
+The compact path keeps source-local candidate generation enabled in the late
+heavy steps instead of falling back to the older chunked path. Tile-native
+short-only emission then removes one source-local product pass when LPQ writes
+are already disabled. In the June 16 sweep this won on all five density points,
+with the clearest gain on d20 K=1M: `315.7 ms` without tile-native emission and
+`309.8 ms` with it. That is still slower than GPG, but only `1.17x` on the main
+K=1M density point.
+
+Candidate materialization is still the dominant cost. On the d20 K=1M exactness
+run, TC materialized `233.1M` parent/deviation products and skipped `122.9M`
+products that would not enter the current window. The next improvement must
+reduce materialization work or fuse it more tightly with the TC-discovered
+source-local tiles.
 
 ## Next TC-Specific Directions
 

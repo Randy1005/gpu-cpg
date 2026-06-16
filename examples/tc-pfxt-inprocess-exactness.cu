@@ -69,6 +69,7 @@ int main(int argc, char* argv[]) {
       gpucpg::tc_pfxt_inprocess::read_costs(args.baseline_file);
     gpucpg::CpGen cpgen;
     cpgen.read_input(args.benchmark);
+    cpgen.enable_tc_pfxt_static_cache(true);
     std::cout << "tc_pfxt_inprocess_exactness"
       << " benchmark=" << args.benchmark
       << " baseline_file=" << args.baseline_file

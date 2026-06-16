@@ -86,6 +86,7 @@ int main(int argc, char* argv[]) {
   try {
     gpucpg::CpGen cpgen;
     cpgen.read_input(args.benchmark);
+    cpgen.enable_tc_pfxt_static_cache(true);
     const bool enable_tc = args.mode == "tc";
     std::cout << "tc_pfxt_inprocess_timing"
       << " benchmark=" << args.benchmark

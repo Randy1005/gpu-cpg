@@ -27,8 +27,8 @@ cmake --build build -j8 --target \
 Expected current result:
 
 ```text
-tc_pfxt_candidates: 26 test cases, 443 assertions, SUCCESS
-tc_pfxt_inprocess:  4 test cases, 15 assertions, SUCCESS
+tc_pfxt_candidates: 29 test cases, 458 assertions, SUCCESS
+tc_pfxt_inprocess:  5 test cases, 18 assertions, SUCCESS
 ```
 
 ## Main Drivers
@@ -59,6 +59,8 @@ GPUCPG_ENABLE_TC_PFXT=1 \
 GPUCPG_TC_PFXT_SINGLE_PASS=1 \
 GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE=1 \
 GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE=1 \
+GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS=1 \
+GPUCPG_TC_PFXT_TILE_NATIVE_CANDIDATE=1 \
 GPUCPG_TC_PFXT_LIGHT_STAGE_PROFILE=1 \
 GPUCPG_TC_PFXT_DISABLE_PHASE_PROFILE=1 \
 ./build/examples/tc-pfxt-inprocess-timing \
@@ -84,6 +86,8 @@ GPUCPG_ENABLE_TC_PFXT=1 \
 GPUCPG_TC_PFXT_SINGLE_PASS=1 \
 GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE=1 \
 GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE=1 \
+GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS=1 \
+GPUCPG_TC_PFXT_TILE_NATIVE_CANDIDATE=1 \
 ./build/examples/tc-pfxt-inprocess-exactness \
   --benchmark benchmarks/tc_pfxt_crossover/netcard_d20.txt \
   --baseline-file experiments/tc_pfxt_source_local_20260614/golden/netcard_d20_k1000000.golden.costs \
@@ -97,7 +101,7 @@ INPROCESS EXACTNESS PASS
 ```
 
 After the smoke passes, run the full prefix check with
-`--ks 1000,10000,50000,1000000`.
+`--ks 1000,10000,50000,100000,1000000`.
 
 ## Primary Runtime Flags
 
@@ -107,6 +111,8 @@ After the smoke passes, run the full prefix check with
 | `GPUCPG_TC_PFXT_SINGLE_PASS=1` | off | uses the single-pass TC PFXT window flow |
 | `GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE=1` | off | uses the single-work candidate materialization path |
 | `GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE=1` | off | uses source-local candidate grouping, the current proposal configuration |
+| `GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS=1` | off | uses compact static-deviation CSR so source-local stays enabled in late heavy steps |
+| `GPUCPG_TC_PFXT_TILE_NATIVE_CANDIDATE=1` | off | skips the source-local pre-count pass in short-only windows and emits short candidates directly from tile descriptors |
 | `GPUCPG_TC_PFXT_LIGHT_STAGE_PROFILE=1` | off | prints high-level per-step runtime categories |
 | `GPUCPG_TC_PFXT_DISABLE_PHASE_PROFILE=1` | off | disables heavier phase profiling |
 
@@ -116,23 +122,30 @@ corresponding experiment section below says otherwise.
 
 ## Latest Runtime Reference
 
-These numbers are PFXT expansion time only. The comparison uses the same TC
-configuration across all densities: source-local candidate generation. GPG and
-previous single-work TC come from
-`experiments/tc_pfxt_chain_jump_singlework_retime_20260612_1920/`.
+These numbers are PFXT expansion time only. The comparison uses the latest
+compact source-local TC configuration with tile-native short-only candidate
+emission enabled across all densities. The compact static-deviation CSR is
+one-time graph setup/preprocessing and is not counted in the PFXT runtime. GPG
+and previous single-work TC come from
+`experiments/tc_pfxt_chain_jump_singlework_retime_20260612_1920/`; the compact
+TC retime logs are in
+`experiments/tc_pfxt_compact_source_local_retime_20260615_231413/`; the
+tile-native sweep is in
+`experiments/tc_pfxt_tile_native_sweep_20260616/`.
 
-| density | K | GPG ms | source-local TC ms | TC/GPG | prev single-work TC ms | source-local vs prev |
+| density | K | GPG ms | TC ms | TC/GPG | tile-native off ms | tile-native delta |
 |---|---:|---:|---:|---:|---:|---:|
-| d10 | 1M | 186.9 | 415.2 | 2.22x | 363.0 | 0.87x |
-| d20 | 1M | 264.1 | 468.9 | 1.78x | 513.5 | 1.10x |
-| d30 | 200K | 62.7 | 199.4 | 3.18x | 266.2 | 1.33x |
-| d40 | 200K | 64.1 | 226.9 | 3.54x | 306.7 | 1.35x |
-| d50 | 100K | 59.6 | 172.3 | 2.89x | 248.4 | 1.44x |
+| d10 | 1M | 186.9 | 314.5 | 1.68x | 318.7 | -4.2 ms |
+| d20 | 1M | 264.1 | 309.8 | 1.17x | 315.7 | -5.9 ms |
+| d30 | 200K | 62.7 | 113.2 | 1.81x | 114.5 | -1.3 ms |
+| d40 | 200K | 64.1 | 136.6 | 2.13x | 137.3 | -0.7 ms |
+| d50 | 100K | 59.6 | 95.3 | 1.60x | 95.9 | -0.7 ms |
 
-Source-local is still slower than GPG on every density point
-(`2.64x` geomean slowdown), but it improves the previous single-work TC path on
-d20/d30/d40/d50. It regresses d10 because one large materialization step
-dominates.
+Tile-native short-only emission won on all five density points in the June 16
+sweep, but the improvement is modest: about `0.5%` to `1.9%` on the stable
+d20-d50 rows. The path should remain gated, but it is part of the current
+known-good proposal configuration because it preserves exactness and removes one
+source-local product pass in short-only windows.
 
 ## Per-Step Runtime Reference
 
