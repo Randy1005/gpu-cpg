@@ -219,7 +219,7 @@ This keeps the exactness invariant: the deviation edge alone does not define a
 path. Different parent paths reaching the same `u -> v` edge remain distinct
 PFXT candidates.
 
-## Current Result
+## Data
 
 The current TC implementation is not faster than GPG yet. It is the first
 end-to-end exact implementation that uses tensor cores for deviation discovery,
@@ -227,7 +227,9 @@ and the latest compact source-local path with tile-native short-only candidate
 emission is now close enough on the main K=1M density point to make
 optimization meaningful.
 
-Headline comparison against GPG:
+### Density Sweep
+
+Headline comparison against GPG on densified netcard graphs:
 
 | density | K | GPG ms | TC ms | TC/GPG |
 |---|---:|---:|---:|---:|
@@ -248,6 +250,43 @@ are already disabled. In the June 16 sweep this won on all five density points,
 with the clearest gain on d20 K=1M: `315.7 ms` without tile-native emission and
 `309.8 ms` with it. That is still slower than GPG, but only `1.17x` on the main
 K=1M density point.
+
+### Original Circuit-Density Baseline
+
+The original undensified netcard graph is much sparser than the density sweep
+inputs. At K=1M, GPG finishes original netcard PFXT in `8.4 ms`, while the
+current TC path takes `105.3 ms`.
+
+| benchmark | K | GPG ms | TC ms | TC/GPG | note |
+|---|---:|---:|---:|---:|---|
+| original netcard | 1M | 8.4 | 105.3 | 12.6x | original circuit density |
+
+This is expected: the TC formulation needs many active source/deviation
+interactions to amortize the boundary overhead, while the original
+circuit-density graph is already easy for scalar CUDA expansion.
+
+### Stage Breakdown
+
+The timing breakdown below groups implementation counters into proposal-level
+stages. It uses one warmup and three measured in-process trials, so graph input,
+SFXT construction, and static deviation-matrix setup are cached outside the
+reported PFXT time. These rows are for attribution, not the headline speed
+comparison above.
+
+| benchmark | K | TC PFXT ms | prepare TC query | TC discovery | candidate materialization | CPG queue/window |
+|---|---:|---:|---:|---:|---:|---:|
+| original netcard | 1M | 105.3 | 3.8 | <0.1 | 35.5 | 65.9 |
+| netcard d20 | 1M | 329.8 | 4.1 | 18.7 | 213.6 | 93.4 |
+| netcard d40 | 200K | 147.3 | 2.6 | 2.4 | 83.3 | 59.0 |
+| netcard d50 | 100K | 106.1 | 2.8 | <0.1 | 47.7 | 55.6 |
+
+`Prepare TC query` includes active-frontier grouping and TC-hit preparation.
+`Candidate materialization` expands the TC-discovered `(u, v)` families into
+exact `(parent path, u, v)` records, computes their costs, and writes HPQ/LPQ
+outputs. `CPG queue/window` includes priority-queue work, split/window updates,
+chain advancement, and residual synchronization. The table shows the core
+systems issue: tensor-core discovery itself is small; the dominant cost is the
+interface back into exact CPG candidate records and queue state.
 
 Candidate materialization is still the dominant cost. On the d20 K=1M exactness
 run, TC materialized `233.1M` parent/deviation products and skipped `122.9M`
