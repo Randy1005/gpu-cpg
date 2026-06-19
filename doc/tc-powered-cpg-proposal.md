@@ -1,99 +1,82 @@
 # TC-Powered Critical Path Generation Proposal
 
-This is a working proposal draft. The wording is intentionally lightweight so
-we can revise it as the story changes.
+This is a working proposal draft for the current tensor-core CPG direction.
 
 ## Motivation
 
-Critical path generation repeatedly asks a simple question at very large scale:
-for each active path, which off-tree timing edges can create the next candidate
-path? In a conventional CUDA implementation, this becomes many small irregular
-lookups and candidate writes. That is effective but leaves the GPU's tensor
-cores mostly unused.
+Critical path generation repeatedly asks a large many-to-many question:
 
-That matters because modern NVIDIA GPUs expose most of their peak arithmetic
-through tensor-core paths. H100 SXM is roughly `67 TFLOPS` FP32, but almost
-`4 PFLOPS` FP8 tensor-core throughput. HGX B200 is roughly `600 TFLOPS` FP32
-for 8 GPUs, but `36 PFLOPS` dense FP8/FP6 tensor-core throughput. The exact
-precision is not the point for CPG; the point is that the fastest hardware path
-on newer GPUs is a tiled many-to-many engine, while ordinary CPG uses mostly
-scalar CUDA graph traversal.
+```text
+which active spur sources can take which legal deviation edges?
+```
 
-The proposal is to expose the hidden many-to-many structure inside path
-generation. CPG is not a neural-network matrix multiply, but deviation
-discovery repeatedly asks a matrix-like question:
+G-PathGen answers this efficiently with CUDA graph traversal, but the work is
+mostly scalar and irregular. Modern NVIDIA GPUs put much of their peak
+throughput behind tensor-core tile operations. CPG is not a neural network, but
+one part of PFXT has the right shape: deviation discovery is a tiled set-overlap
+problem.
 
-> Which active spur sources can connect to which legal deviation destinations?
+The proposal is to expose that structure while preserving exact k-critical path
+ordering.
 
-If we express that question as tiled bit-vector overlap, tensor cores become a
-natural fit. They can test many source/destination relationships at once, while
-CUDA handles the exact path-dependent candidate records after discovery.
+## Core Challenge
 
-## Core Technical Challenge
+PFXT is path dependent:
 
-CPG is not naturally a dense matrix multiply. It is path dependent:
+- each active parent path reaches a different spur source;
+- only non-suffix-tree fanout edges are legal deviations;
+- a deviation edge alone does not define a path;
+- exactness depends on G-PathGen's window ordering invariants.
 
-- only the current frontier paths are active;
-- each active path reaches different spur sources;
-- only non-suffix-tree fanout edges are valid deviations;
-- exactness depends on preserving G-PathGen's PFXT window ordering.
+The challenge is therefore not simply to run a graph algorithm on tensor cores.
+The challenge is to use tensor cores for the regular many-to-many part while
+keeping the exact candidate identity:
 
-The challenge is therefore not simply "run CPG on tensor cores." The challenge
-is to find a formulation that gives tensor cores regular work while keeping the
-same exact candidate set and path ranking.
+```text
+(parent path, deviation source u, deviation destination v)
+```
 
-## Core Innovation
+## Core Idea
 
-We reformulate deviation discovery as a compressed semiring-style matrix
-operation.
+Build a transposed deviation matrix:
 
-Informally, imagine a large checklist:
+```text
+A_dev[v, u] = 1 iff edge u -> v exists and edge u -> v is not succs[u]
+```
 
-- rows represent possible deviation destinations;
-- columns represent spur sources grouped into fixed-size bit-vector slots;
-- the active frontier marks which spur sources are currently reachable.
+For one PFXT suffix-chain walk step, the active frontier marks which spur
+sources are currently reached:
 
-For each destination, we ask: "Does this destination have any active spur source
-that can reach it through a non-tree edge?" That is a set-intersection question.
-Tensor cores can answer many of these overlap questions in parallel by treating
-the bit-vector masks like tiny matrix tiles.
+```text
+alpha[u] = 1 iff at least one active parent path currently reaches u
+```
 
-The operation is semiring-like because the math is not ordinary arithmetic for
-path costs. The useful operations are closer to:
+Deviation discovery becomes a set-overlap operation:
 
-- combine: intersect active-source bits with destination fanout bits;
-- reduce: report whether any bit survives, and which source/destination pairs
-  survived.
+```text
+hit_mask[v, :] = A_dev[v, :] AND alpha[:]
+```
 
-The tensor core is used as a high-throughput engine for this batched overlap
-test. The exact path costs and HPQ/LPQ admission decisions remain exact CUDA
-logic after discovery.
+Tensor cores accelerate this tiled overlap. CUDA then decodes the surviving
+bits and preserves exact candidate identity.
 
 ## Figure: From CPG to Tensor-Core Tiles
 
-A useful presentation figure is a three-panel transformation.
-
-### Panel A: CPG Graph View
-
-Show active paths reaching spur sources `u`, with legal deviation edges leaving
-those sources:
+### Panel A: Graph View
 
 ```text
-active paths                  legal deviations
+active parent paths              legal deviation edges
 
-  p1 -> u0 --------------------------> v1
-  p2 -> u1 -------------> v0
-  p3 -> u4 -------------> v2
-  p4 -> u6 --------------------------> v1
+  p1 -> u0 ------------------------------> v1
+  p2 -> u1 ----------------> v0
+  p3 -> u4 ----------------> v2
+  p4 -> u6 ------------------------------> v1
 ```
 
 Here `u` is a spur source reached by at least one active parent path. A legal
-deviation edge is any fanout edge `u -> v` that is not the suffix-tree edge
-`succs[u]`.
+deviation is any edge `u -> v` that is not the suffix-tree edge `succs[u]`.
 
 ### Panel B: Matrix / Set-Overlap View
-
-The same graph relation becomes a binary deviation matrix:
 
 ```text
                  spur source u
@@ -106,37 +89,21 @@ A_dev row v2      0  0  0  1  1  0  0  0
 A_dev row v3      1  1  0  0  0  1  0  0
 ```
 
-`A_dev[v, u] = 1` means:
+For `v1`:
 
 ```text
-edge u -> v exists AND edge u -> v is not succs[u]
+A_dev[v1, :] = [1 0 1 0 0 0 1 0]
+alpha[:]     = [1 1 0 0 1 0 1 0]
+hit_mask     = [1 0 0 0 0 0 1 0]
 ```
 
-`alpha[u] = 1` means:
+The set bits are `u0` and `u6`, so discovery emits:
 
 ```text
-at least one active parent path in the current PFXT chain sub-step reaches u
+(u0, v1), (u6, v1)
 ```
-
-So discovery computes:
-
-```text
-hit_mask[v, :] = A_dev[v, :] AND alpha[:]
-```
-
-Example:
-
-```text
-A_dev[v1, :]   = [1 0 1 0 0 0 1 0]
-alpha[:]       = [1 1 0 0 1 0 1 0]
-hit_mask[v1]   = [1 0 0 0 0 0 1 0]
-```
-
-This means `v1` has active deviation sources `u0` and `u6`.
 
 ### Panel C: Tensor-Core Tile View
-
-The matrix is processed in small dense tiles:
 
 ```text
           active frontier alpha tile
@@ -148,161 +115,107 @@ tile   [ v1 row bit mask ]  -->  overlap scores + hit masks
        [ v3 row bit mask ]
 ```
 
-Conceptually, a TC tile computes overlap scores:
+The score is only a compact way to find live rows:
 
 ```text
 score[v] = count(A_dev[v, :] AND alpha[:])
 ```
 
-For the example above:
+Exact pair emission still decodes the hit mask. This is what keeps the TC stage
+as a discovery accelerator rather than an approximate path generator.
+
+## Implementation
+
+The current meaningful implementation has three pieces.
+
+### 1. Tensor-Core Deviation Discovery
+
+The static deviation relation is stored as compressed bit-vector set storage.
+During a PFXT suffix-chain walk, TC kernels evaluate active-source overlap with
+destination rows and identify live deviation families `(u, v)`.
+
+This is the TC-specific part of the implementation.
+
+### 2. Spur-Source Grouped Candidate Generation
+
+For every discovered deviation source `u`, candidate generation must combine:
 
 ```text
-score[v0] = 1
-score[v1] = 2
-score[v2] = 1
-score[v3] = 2
+all parent paths currently at u
+*
+all deviation destinations v reachable from u
 ```
 
-The score only says how many active source hits a destination row has. Exact
-pair emission still uses the bit mask:
+The same edge `u -> v` can produce many exact paths because the parent path is
+part of the identity:
 
 ```text
-hit_mask[v1] = [1 0 0 0 0 0 1 0]
-set bits     = u0, u6
-emit         = (u0, v1), (u6, v1)
+candidate(parent, u, v)
 ```
 
-This distinction is important for correctness: tensor cores accelerate the
-batched overlap/filtering work, but exact CUDA logic still enumerates the
-surviving source bits and emits exact deviation pairs.
+Spur-source grouped candidate generation keeps the TC-discovered work grouped by
+deviation source, then materializes the exact Cartesian product for that source.
+This preserves exactness and avoids flattening the TC output into a less useful
+global pair stream.
 
-## Implementation Sketch
+### 3. Compact Active-Source Grouping
 
-The current implementation builds a transposed deviation matrix `A_dev`.
+The first spur-source grouped implementation still paid full-graph bookkeeping:
+group arrays were indexed by all graph nodes even though each suffix-chain
+substep only used a small active subset.
 
-- Row `v`: a deviation destination.
-- Bit `u`: source `u` has a fanout edge to `v`, and that edge is not the suffix
-  tree edge.
-- Frontier vector `alpha`: active spur sources from the current PFXT chain
-  sub-step.
-
-Tensor-core discovery computes overlap between `A_dev` rows and `alpha`. Each
-hit emits a deviation pair `(u, v)`.
-
-That pair is not yet a full path. If many parent paths reach the same source
-`u`, the same deviation edge `u -> v` creates many distinct candidates:
+Compact active-source grouping replaces that with dense slots for active spur
+sources only:
 
 ```text
-candidate(p, u, v) =
-  parent path p to u
-  + deviation edge u -> v
-  + suffix-tree path from v to sink
+active_sources = [u17, u42, u900000]
+slot[u17]      = 0
+slot[u42]      = 1
+slot[u900000]  = 2
 ```
 
-The source-local candidate path keeps the TC output grouped by source:
+This reduced the hidden interface cost between fast TC discovery and CUDA
+candidate materialization. It does not change the candidate set.
 
-```text
-source u
-  parent paths reaching u: p0, p1, p2, ...
-  deviation destinations:  v0, v1, v2, ...
-  exact candidates:        Cartesian product of parents and deviations
-```
+## Current Results
 
-This is the key bridge between TC discovery and candidate generation. The TC
-tile tells us which `(u, v)` families are alive; candidate generation then
-expands each family into exact path records only after applying the current
-PFXT split/window rules. The current implementation still materializes those
-records with CUDA kernels, which is why candidate generation remains the main
-runtime bottleneck.
-
-This keeps the exactness invariant: the deviation edge alone does not define a
-path. Different parent paths reaching the same `u -> v` edge remain distinct
-PFXT candidates.
-
-## Data
-
-The current TC implementation is not faster than GPG yet. It is the first
-end-to-end exact implementation that uses tensor cores for deviation discovery,
-and the latest compact source-local path with tile-native short-only candidate
-emission is now close enough on the main K=1M density point to make
-optimization meaningful.
-
-### Density Sweep
-
-Headline comparison against GPG on densified netcard graphs:
+Latest in-process retime: one warmup, three measured trials. GPG numbers are
+cached PFXT means from the same density sweep. TC uses the current best
+configuration: single-pass, single-work, spur-source grouped candidate
+generation, compact static deviations, tile-native short-only emission, and
+compact active-source grouping.
 
 | density | K | GPG ms | TC ms | TC/GPG |
 |---|---:|---:|---:|---:|
-| d10 | 1M | 186.9 | 314.5 | 1.68x |
-| d20 | 1M | 264.1 | 309.8 | 1.17x |
-| d30 | 200K | 62.7 | 113.2 | 1.81x |
-| d40 | 200K | 64.1 | 136.6 | 2.13x |
-| d50 | 100K | 59.6 | 95.3 | 1.60x |
+| d10 | 1M | 186.9 | 323.3 | 1.73x |
+| d20 | 1M | 264.1 | 266.7 | 1.01x |
+| d30 | 200K | 62.7 | 68.7 | 1.09x |
+| d40 | 200K | 64.1 | 104.3 | 1.63x |
+| d50 | 100K | 59.6 | 60.2 | 1.01x |
 
-These are PFXT expansion times only. The compact static-deviation CSR is a
-one-time graph setup structure and is not counted in either GPG or TC PFXT
-runtime.
+PFXT time only. Graph input, SFXT construction, and static deviation-matrix
+setup are cached outside the reported PFXT time in the in-process harness.
 
-The compact path keeps source-local candidate generation enabled in the late
-heavy steps instead of falling back to the older chunked path. Tile-native
-short-only emission then removes one source-local product pass when LPQ writes
-are already disabled. In the June 16 sweep this won on all five density points,
-with the clearest gain on d20 K=1M: `315.7 ms` without tile-native emission and
-`309.8 ms` with it. That is still slower than GPG, but only `1.17x` on the main
-K=1M density point.
+## Current Bottleneck
 
-### Original Circuit-Density Baseline
+TC discovery is fast. The remaining cost is candidate product handling:
 
-The original undensified netcard graph is much sparser than the density sweep
-inputs. At K=1M, GPG finishes original netcard PFXT in `8.4 ms`, while the
-current TC path takes `105.3 ms`.
+```text
+parent paths at u * deviation destinations from u
+```
 
-| benchmark | K | GPG ms | TC ms | TC/GPG | note |
-|---|---:|---:|---:|---:|---|
-| original netcard | 1M | 8.4 | 105.3 | 12.6x | original circuit density |
+On d20 K=1M, the current TC path still touches about `233M`
+parent/deviation products. `122.9M` of those products are classified as skipped
+for the current window. Compact active-source grouping removed a large setup
+cost, but it did not remove the product work itself.
 
-This is expected: the TC formulation needs many active source/deviation
-interactions to amortize the boundary overhead, while the original
-circuit-density graph is already easy for scalar CUDA expansion.
+## Next Directions
 
-### Stage Breakdown
+1. **Keep TC tiles alive longer.** Avoid converting TC-discovered structure into
+   expensive per-candidate records too early.
+2. **Reduce materialized products without extra compaction cost.** Use cheap
+   tile/source-level decisions to avoid visiting products that cannot enter
+   HPQ/LPQ, while preserving exactness.
 
-The timing breakdown below groups implementation counters into proposal-level
-stages. It uses one warmup and three measured in-process trials, so graph input,
-SFXT construction, and static deviation-matrix setup are cached outside the
-reported PFXT time. These rows are for attribution, not the headline speed
-comparison above.
-
-| benchmark | K | TC PFXT ms | prepare TC query | TC discovery | candidate materialization | CPG queue/window |
-|---|---:|---:|---:|---:|---:|---:|
-| original netcard | 1M | 105.3 | 3.8 | <0.1 | 35.5 | 65.9 |
-| netcard d20 | 1M | 329.8 | 4.1 | 18.7 | 213.6 | 93.4 |
-| netcard d40 | 200K | 147.3 | 2.6 | 2.4 | 83.3 | 59.0 |
-| netcard d50 | 100K | 106.1 | 2.8 | <0.1 | 47.7 | 55.6 |
-
-`Prepare TC query` includes active-frontier grouping and TC-hit preparation.
-`Candidate materialization` expands the TC-discovered `(u, v)` families into
-exact `(parent path, u, v)` records, computes their costs, and writes HPQ/LPQ
-outputs. `CPG queue/window` includes priority-queue work, split/window updates,
-chain advancement, and residual synchronization. The table shows the core
-systems issue: tensor-core discovery itself is small; the dominant cost is the
-interface back into exact CPG candidate records and queue state.
-
-Candidate materialization is still the dominant cost. On the d20 K=1M exactness
-run, TC materialized `233.1M` parent/deviation products and skipped `122.9M`
-products that would not enter the current window. The next improvement must
-reduce materialization work or fuse it more tightly with the TC-discovered
-source-local tiles.
-
-## Next TC-Specific Directions
-
-1. **Fuse discovery with less candidate materialization.** Keep the tensor-core
-   discovery result in a grouped/source-local form and avoid expanding work that
-   will not enter HPQ/LPQ.
-
-2. **Make candidate generation more tensor-core-shaped.** Treat candidate
-   families as tiles of parent paths by deviation edges, so later work can reuse
-   the same dense grouping that tensor cores already prefer.
-
-The proposal goal is to move more of PFXT from irregular per-candidate CUDA work
-into regular grouped operations without changing exactness.
+Failed optional paths and negative lessons are recorded separately in
+[tc-pfxt-lessons-learned.md](tc-pfxt-lessons-learned.md).

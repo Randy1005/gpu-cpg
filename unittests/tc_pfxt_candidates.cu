@@ -131,6 +131,122 @@ TEST_CASE("tc pfxt aggregates candidate classes per pair") {
   CHECK(counts.long_count == 1);
 }
 
+TEST_CASE("tc pfxt classifies source-local candidate tiles") {
+  using gpucpg::tc_pfxt::CandidateTileClass;
+  using gpucpg::tc_pfxt::classify_candidate_tile;
+
+  CHECK(classify_candidate_tile(0, 0, 0, 0)
+        == CandidateTileClass::ALL_SKIP);
+  CHECK(classify_candidate_tile(0, 0, 16, 16)
+        == CandidateTileClass::ALL_SKIP);
+  CHECK(classify_candidate_tile(16, 0, 0, 16)
+        == CandidateTileClass::ALL_SHORT);
+  CHECK(classify_candidate_tile(0, 16, 0, 16)
+        == CandidateTileClass::ALL_LONG);
+  CHECK(classify_candidate_tile(8, 8, 0, 16)
+        == CandidateTileClass::MIXED);
+  CHECK(classify_candidate_tile(8, 0, 8, 16)
+        == CandidateTileClass::MIXED);
+}
+
+TEST_CASE("tc pfxt short-only tile bounds are conservative") {
+  using gpucpg::tc_pfxt::ShortOnlyTileBoundClass;
+  using gpucpg::tc_pfxt::classify_short_only_tile_bounds;
+
+  CHECK(classify_short_only_tile_bounds(1.0f, 2.0f, 0.1f, 0.2f, 2.2f)
+        == ShortOnlyTileBoundClass::ALL_SHORT);
+  CHECK(classify_short_only_tile_bounds(3.0f, 4.0f, 0.1f, 0.2f, 2.2f)
+        == ShortOnlyTileBoundClass::ALL_SKIP);
+  CHECK(classify_short_only_tile_bounds(1.0f, 3.0f, 0.1f, 0.2f, 2.2f)
+        == ShortOnlyTileBoundClass::MIXED);
+  CHECK(classify_short_only_tile_bounds(1.0f, 2.1f, 0.1f, 0.2f, 2.2f)
+        == ShortOnlyTileBoundClass::MIXED);
+}
+
+TEST_CASE("tc pfxt tile-resident bounds classify exact product regions") {
+  using gpucpg::tc_pfxt::CandidateTileClass;
+  using gpucpg::tc_pfxt::classify_candidate;
+  using gpucpg::tc_pfxt::classify_source_local_tile_bounds;
+  using gpucpg::tc_pfxt::classify_source_local_tile_bounds_conservative;
+  using gpucpg::tc_pfxt::source_local_tile_bounds;
+
+  const auto all_short = source_local_tile_bounds(1.0f, 1.5f, 0.1f, 0.2f);
+  CHECK(all_short.min_slack == doctest::Approx(1.1f));
+  CHECK(all_short.max_slack == doctest::Approx(1.7f));
+  CHECK(classify_source_local_tile_bounds(all_short, 1.7f, 2.0f, true, false)
+        == CandidateTileClass::ALL_SHORT);
+
+  const float short_parents[] {1.0f, 1.2f, 1.5f};
+  const float short_devs[] {0.1f, 0.2f};
+  for (const float parent : short_parents) {
+    for (const float dev : short_devs) {
+      CHECK(classify_candidate(parent + dev, 1.7f, 2.0f, true, false)
+            == gpucpg::tc_pfxt::CandidateClass::SHORT);
+    }
+  }
+
+  const auto all_long = source_local_tile_bounds(1.8f, 2.0f, 0.1f, 0.3f);
+  CHECK(classify_source_local_tile_bounds(all_long, 1.7f, 2.3f, true, false)
+        == CandidateTileClass::ALL_LONG);
+
+  const float long_parents[] {1.8f, 2.0f};
+  const float long_devs[] {0.1f, 0.3f};
+  for (const float parent : long_parents) {
+    for (const float dev : long_devs) {
+      CHECK(classify_candidate(parent + dev, 1.7f, 2.3f, true, false)
+            == gpucpg::tc_pfxt::CandidateClass::LONG);
+    }
+  }
+
+  const auto mixed = source_local_tile_bounds(1.0f, 2.0f, 0.1f, 0.4f);
+  CHECK(classify_source_local_tile_bounds(mixed, 1.7f, 2.3f, true, false)
+        == CandidateTileClass::MIXED);
+
+  CHECK(classify_source_local_tile_bounds_conservative(
+          6, 2, 2, all_short, 1.7f, 2.0f, true, false)
+        == CandidateTileClass::ALL_SHORT);
+  CHECK(classify_source_local_tile_bounds_conservative(
+          6, 1, 2, all_short, 1.7f, 2.0f, true, false)
+        == CandidateTileClass::MIXED);
+  CHECK(classify_source_local_tile_bounds_conservative(
+          6, 1, 2, all_long, 1.7f, 2.3f, true, false)
+        == CandidateTileClass::MIXED);
+  CHECK(classify_source_local_tile_bounds_conservative(
+          6, 0, 2, all_short, 1.7f, 2.0f, true, false)
+        == CandidateTileClass::ALL_SKIP);
+  CHECK(classify_source_local_tile_bounds_conservative(
+          6, 1, 2, all_long, 1.7f, 2.3f, true, true)
+        == CandidateTileClass::ALL_SKIP);
+}
+
+TEST_CASE("tc pfxt tile-resident byte estimate subtracts descriptors") {
+  using gpucpg::tc_pfxt::estimated_tile_resident_lpq_bytes_avoided;
+
+  CHECK(estimated_tile_resident_lpq_bytes_avoided(10, 1000, 24, 24)
+        == 23760);
+  CHECK(estimated_tile_resident_lpq_bytes_avoided(1000, 10, 24, 24) == 0);
+}
+
+TEST_CASE("tc pfxt conceptual stage breakdown is non-overlapping") {
+  using gpucpg::tc_pfxt::RawRuntimeStageMs;
+  using gpucpg::tc_pfxt::conceptual_runtime_stage_breakdown;
+
+  const auto breakdown = conceptual_runtime_stage_breakdown(
+    RawRuntimeStageMs{
+      100.0,  // discovery
+      500.0,  // candidate total
+      70.0,   // queue
+      20.0,   // advance/sync
+      10.0,   // residual
+      30.0,   // pair metadata / hit decode
+      40.0}); // active frontier / candidate preparation
+
+  CHECK(breakdown.prepare_tc_query_ms == doctest::Approx(70.0));
+  CHECK(breakdown.tc_discovery_ms == doctest::Approx(100.0));
+  CHECK(breakdown.candidate_materialization_ms == doctest::Approx(430.0));
+  CHECK(breakdown.cpg_queue_window_ms == doctest::Approx(100.0));
+}
+
 TEST_CASE("tc pfxt packed candidate counts add component-wise") {
   using gpucpg::tc_pfxt::AddCandidateCounts;
   using gpucpg::tc_pfxt::CandidateCounts;
@@ -168,6 +284,17 @@ TEST_CASE("tc pfxt materialized output predicate ignores unfilled long outputs")
   CHECK(has_materialized_candidate_output(CandidateCounts{2, 3}, true));
   CHECK_FALSE(has_materialized_candidate_output(CandidateCounts{0, 1}, false));
   CHECK(has_materialized_candidate_output(CandidateCounts{1, 1}, false));
+}
+
+TEST_CASE("tc pfxt tile handoff fusion is only a short-only source-local path") {
+  using gpucpg::tc_pfxt::should_use_tile_handoff_fusion;
+
+  CHECK(should_use_tile_handoff_fusion(true, true, true, false, 4));
+  CHECK_FALSE(should_use_tile_handoff_fusion(false, true, true, false, 4));
+  CHECK_FALSE(should_use_tile_handoff_fusion(true, false, true, false, 4));
+  CHECK_FALSE(should_use_tile_handoff_fusion(true, true, false, false, 4));
+  CHECK_FALSE(should_use_tile_handoff_fusion(true, true, true, true, 4));
+  CHECK_FALSE(should_use_tile_handoff_fusion(true, true, true, false, 0));
 }
 
 TEST_CASE("tc pfxt source-local allocation uses exact class counts") {

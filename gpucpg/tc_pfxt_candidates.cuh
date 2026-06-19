@@ -1,6 +1,7 @@
 #pragma once
 
 #include <climits>
+#include <cfloat>
 #include <cstdint>
 #include <algorithm>
 #include <limits>
@@ -19,6 +20,19 @@ enum class CandidateClass : unsigned char {
   LONG
 };
 
+enum class CandidateTileClass : unsigned char {
+  ALL_SKIP,
+  ALL_SHORT,
+  ALL_LONG,
+  MIXED
+};
+
+enum class ShortOnlyTileBoundClass : unsigned char {
+  ALL_SKIP,
+  ALL_SHORT,
+  MIXED
+};
+
 struct CandidateCounts {
   int short_count = 0;
   int long_count = 0;
@@ -27,6 +41,32 @@ struct CandidateCounts {
 struct SourceLocalAllocationCounts {
   int short_count = 0;
   int long_count = 0;
+};
+
+struct SourceLocalTileBounds {
+  float min_slack = std::numeric_limits<float>::max();
+  float max_slack = -std::numeric_limits<float>::max();
+};
+
+struct TileResidentShadowCounts {
+  std::uint64_t tiles = 0;
+  std::uint64_t all_short_tiles = 0;
+  std::uint64_t all_long_tiles = 0;
+  std::uint64_t all_skip_tiles = 0;
+  std::uint64_t mixed_tiles = 0;
+  std::uint64_t products = 0;
+  std::uint64_t all_short_products = 0;
+  std::uint64_t all_long_products = 0;
+  std::uint64_t all_skip_products = 0;
+  std::uint64_t mixed_products = 0;
+  std::uint64_t short_products = 0;
+  std::uint64_t long_products = 0;
+  std::uint64_t skip_products = 0;
+  std::uint64_t min_mismatches = 0;
+  std::uint64_t max_mismatches = 0;
+  std::uint64_t all_short_mismatches = 0;
+  std::uint64_t all_long_mismatches = 0;
+  std::uint64_t all_skip_mismatches = 0;
 };
 
 __host__ __device__ inline SourceLocalAllocationCounts
@@ -43,6 +83,77 @@ __host__ __device__ inline bool has_materialized_candidate_output(
   const bool materialize_long_outputs) {
   return counts.short_count > 0
     || (materialize_long_outputs && counts.long_count > 0);
+}
+
+__host__ __device__ inline SourceLocalTileBounds
+source_local_tile_bounds(
+  const float parent_min_slack,
+  const float parent_max_slack,
+  const float dev_min_delta,
+  const float dev_max_delta) {
+  return SourceLocalTileBounds{
+    parent_min_slack + dev_min_delta,
+    parent_max_slack + dev_max_delta};
+}
+
+__host__ __device__ inline CandidateTileClass
+classify_source_local_tile_bounds(
+  const SourceLocalTileBounds bounds,
+  const float split,
+  const float final_split,
+  const bool use_final_split,
+  const bool skip_long_paths) {
+  if (bounds.max_slack <= split) {
+    return CandidateTileClass::ALL_SHORT;
+  }
+  if (bounds.min_slack > split) {
+    if (!skip_long_paths
+        && (!use_final_split || bounds.max_slack <= final_split)) {
+      return CandidateTileClass::ALL_LONG;
+    }
+    if (skip_long_paths
+        || (use_final_split && bounds.min_slack > final_split)) {
+      return CandidateTileClass::ALL_SKIP;
+    }
+  }
+  return CandidateTileClass::MIXED;
+}
+
+__host__ __device__ inline CandidateTileClass
+classify_source_local_tile_bounds_conservative(
+  const int product_count,
+  const int reachable_dev_count,
+  const int dev_count,
+  const SourceLocalTileBounds bounds,
+  const float split,
+  const float final_split,
+  const bool use_final_split,
+  const bool skip_long_paths) {
+  if (product_count <= 0 || reachable_dev_count <= 0) {
+    return CandidateTileClass::ALL_SKIP;
+  }
+  const auto tile_class = classify_source_local_tile_bounds(
+    bounds, split, final_split, use_final_split, skip_long_paths);
+  if (tile_class != CandidateTileClass::MIXED
+      && tile_class != CandidateTileClass::ALL_SKIP
+      && reachable_dev_count < dev_count) {
+    return CandidateTileClass::MIXED;
+  }
+  return tile_class;
+}
+
+__host__ __device__ inline std::uint64_t
+estimated_tile_resident_lpq_bytes_avoided(
+  const std::uint64_t all_long_tiles,
+  const std::uint64_t all_long_products,
+  const std::uint64_t descriptor_bytes,
+  const std::uint64_t materialized_node_bytes) {
+  const std::uint64_t descriptor_total = all_long_tiles * descriptor_bytes;
+  const std::uint64_t materialized_total =
+    all_long_products * materialized_node_bytes;
+  return materialized_total > descriptor_total
+    ? materialized_total - descriptor_total
+    : 0ULL;
 }
 
 __host__ __device__ inline bool is_viable_static_deviation_neighbor(
@@ -95,6 +206,40 @@ struct AddWorkEquivalenceStats {
       lhs.tc_long_candidates + rhs.tc_long_candidates};
   }
 };
+
+struct RawRuntimeStageMs {
+  double discovery_ms = 0.0;
+  double candidate_ms = 0.0;
+  double queue_ms = 0.0;
+  double advance_sync_ms = 0.0;
+  double residual_ms = 0.0;
+  double candidate_pair_meta_ms = 0.0;
+  double candidate_prepare_ms = 0.0;
+};
+
+struct ConceptualRuntimeStageMs {
+  double prepare_tc_query_ms = 0.0;
+  double tc_discovery_ms = 0.0;
+  double candidate_materialization_ms = 0.0;
+  double cpg_queue_window_ms = 0.0;
+};
+
+__host__ __device__ inline ConceptualRuntimeStageMs
+conceptual_runtime_stage_breakdown(const RawRuntimeStageMs raw) {
+  const double prepare_tc_query_ms =
+    raw.candidate_pair_meta_ms + raw.candidate_prepare_ms;
+  const double raw_candidate_materialization_ms =
+    raw.candidate_ms - prepare_tc_query_ms;
+  const double candidate_materialization_ms =
+    raw_candidate_materialization_ms > 0.0
+      ? raw_candidate_materialization_ms
+      : 0.0;
+  return ConceptualRuntimeStageMs{
+    prepare_tc_query_ms,
+    raw.discovery_ms,
+    candidate_materialization_ms,
+    raw.queue_ms + raw.advance_sync_ms + raw.residual_ms};
+}
 
 struct CandidateOffset {
   int short_offset = 0;
@@ -248,6 +393,39 @@ __host__ __device__ inline void accumulate_candidate_class(
   }
 }
 
+__host__ __device__ inline CandidateTileClass classify_candidate_tile(
+  const unsigned long long short_count,
+  const unsigned long long long_count,
+  const unsigned long long skip_count,
+  const unsigned long long total_count) {
+  if (total_count == 0 || skip_count == total_count) {
+    return CandidateTileClass::ALL_SKIP;
+  }
+  if (short_count == total_count) {
+    return CandidateTileClass::ALL_SHORT;
+  }
+  if (long_count == total_count) {
+    return CandidateTileClass::ALL_LONG;
+  }
+  return CandidateTileClass::MIXED;
+}
+
+__host__ __device__ inline ShortOnlyTileBoundClass
+classify_short_only_tile_bounds(
+  const float min_parent_slack,
+  const float max_parent_slack,
+  const float min_dev_delta,
+  const float max_dev_delta,
+  const float split) {
+  if (max_parent_slack + max_dev_delta <= split) {
+    return ShortOnlyTileBoundClass::ALL_SHORT;
+  }
+  if (min_parent_slack + min_dev_delta > split) {
+    return ShortOnlyTileBoundClass::ALL_SKIP;
+  }
+  return ShortOnlyTileBoundClass::MIXED;
+}
+
 __host__ __device__ inline bool candidate_is_reachable(
   const int src_dist,
   const int dst_dist) {
@@ -292,6 +470,19 @@ __host__ __device__ inline bool should_use_tile_native_short_only_candidate_path
     && !materialize_long_outputs
     && tile_count > 0
     && product_count >= min_product_count;
+}
+
+__host__ __device__ inline bool should_use_tile_handoff_fusion(
+  const bool handoff_enabled,
+  const bool source_local_enabled,
+  const bool tile_native_enabled,
+  const bool materialize_long_outputs,
+  const int tile_count) {
+  return handoff_enabled
+    && source_local_enabled
+    && tile_native_enabled
+    && !materialize_long_outputs
+    && tile_count > 0;
 }
 
 __host__ __device__ inline bool tile_native_product_work_within_limit(
@@ -420,11 +611,12 @@ inline CompactStaticDeviationCsr build_compact_static_deviation_csr(
           || !candidate_is_reachable(src_dist, dst_dist)) {
         continue;
       }
-      csr.dsts.push_back(dst);
-      csr.deltas.push_back(candidate_slack_delta(
+      const float delta = candidate_slack_delta(
         src_dist,
         dst_dist,
-        edge_id < static_cast<int>(weights.size()) ? weights[edge_id] : 0.0f));
+        edge_id < static_cast<int>(weights.size()) ? weights[edge_id] : 0.0f);
+      csr.dsts.push_back(dst);
+      csr.deltas.push_back(delta);
     }
   }
   csr.offsets[n_nodes] = static_cast<int>(csr.dsts.size());
