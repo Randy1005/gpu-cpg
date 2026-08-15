@@ -196,7 +196,7 @@ public:
 
   void dump_elist(std::ostream& os, bool dump_wgt = false) const;
 
-  void densify_graph(const int desired_avg_degree);
+  void densify_graph(const int desired_avg_degree, std::uint32_t seed = 1);
   void export_to_benchmark(const std::string& filename) const;
   void segsort_adjncy();
 

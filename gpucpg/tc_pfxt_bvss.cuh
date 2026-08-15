@@ -24,6 +24,7 @@ struct HostBvss {
   std::uint64_t total_set_bits = 0;
   std::vector<int> real_ptrs;
   std::vector<int> virtual_to_real;
+  std::vector<unsigned char> slice_counts;
   std::vector<int> row_ids;
   std::vector<std::uint32_t> masks;
 
@@ -94,6 +95,7 @@ inline void append_vss(
   out.masks.resize(out.masks.size() + warp_size, 0);
 
   const auto vss = out.n_vss++;
+  out.slice_counts.push_back(static_cast<unsigned char>(end - begin));
   const auto row_base = static_cast<std::size_t>(vss) * out.slice_capacity;
   const auto mask_base = static_cast<std::size_t>(vss) * warp_size;
 
@@ -282,6 +284,7 @@ static __global__ void build_active_vss_queue_from_frontier(
 
 static __global__ void tc_transposed_adev_discover_pairs(
   const int* virtual_to_real,
+  const unsigned char* slice_counts,
   const int* row_ids,
   const unsigned int* masks,
   const unsigned int* frontier_words,
@@ -291,7 +294,8 @@ static __global__ void tc_transposed_adev_discover_pairs(
   int* pair_count,
   int* overflow,
   const int max_pairs,
-  const int n_nodes) {
+  const int n_nodes,
+  const bool shape_dispatch) {
   const int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
   const int no_threads = gridDim.x * blockDim.x;
   const int no_warps = no_threads / 32;
@@ -323,8 +327,11 @@ static __global__ void tc_transposed_adev_discover_pairs(
     m8n8k128_tc_pfxt(frag_c, frag_a, frag_b);
 
     frag_c[2] = frag_c[3] = 0;
-    frag_a = (packed & 0xffff0000u) >> 16;
-    m8n8k128_tc_pfxt(&frag_c[2], frag_a, frag_b);
+    const bool use_upper_half = !shape_dispatch || slice_counts[vss] > 64;
+    if (use_upper_half) {
+      frag_a = (packed & 0xffff0000u) >> 16;
+      m8n8k128_tc_pfxt(&frag_c[2], frag_a, frag_b);
+    }
 
     for (int chunk = 0; chunk < 4; ++chunk) {
       if (frag_c[chunk] == 0) {
@@ -361,6 +368,7 @@ inline std::vector<std::pair<int, int>> discover_pairs_for_sources(
   thrust::device_vector<int> d_sources(sources);
   thrust::device_vector<int> d_real_ptrs(bvss.real_ptrs);
   thrust::device_vector<int> d_virtual_to_real(bvss.virtual_to_real);
+  thrust::device_vector<unsigned char> d_slice_counts(bvss.slice_counts);
   thrust::device_vector<int> d_row_ids(bvss.row_ids);
   thrust::device_vector<unsigned int> d_masks(bvss.masks);
   thrust::device_vector<unsigned int> d_frontier(bitmap_words, 0);
@@ -389,6 +397,7 @@ inline std::vector<std::pair<int, int>> discover_pairs_for_sources(
   const int blocks = std::max(1, std::min(4096, (h_active_vss_size[0] * 32 + 255) / 256));
   tc_transposed_adev_discover_pairs<<<blocks, 256>>>(
     thrust::raw_pointer_cast(d_virtual_to_real.data()),
+    thrust::raw_pointer_cast(d_slice_counts.data()),
     thrust::raw_pointer_cast(d_row_ids.data()),
     thrust::raw_pointer_cast(d_masks.data()),
     thrust::raw_pointer_cast(d_frontier.data()),
@@ -398,7 +407,8 @@ inline std::vector<std::pair<int, int>> discover_pairs_for_sources(
     thrust::raw_pointer_cast(d_pair_count.data()),
     thrust::raw_pointer_cast(d_overflow.data()),
     max_pairs,
-    n_nodes);
+    n_nodes,
+    true);
   throw_if_cuda_failed(cudaDeviceSynchronize(), "tc_transposed_adev_discover_pairs");
 
   const thrust::host_vector<int> h_overflow(d_overflow);

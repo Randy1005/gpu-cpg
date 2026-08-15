@@ -48,6 +48,24 @@ struct SourceLocalTileBounds {
   float max_slack = -std::numeric_limits<float>::max();
 };
 
+// Persistent representation for an ALL_LONG source-local 32x16 tile. Parent
+// indices are snapshotted because the source-local grouping arrays are scratch
+// storage; deviation data remains in the query-lifetime static CSR. One bit
+// per Cartesian product records candidates already promoted to the short pile.
+constexpr int DEFERRED_LPQ_MAX_PARENTS = 32;
+constexpr int DEFERRED_LPQ_MAX_DEVS = 16;
+constexpr int DEFERRED_LPQ_MASK_WORDS =
+  (DEFERRED_LPQ_MAX_PARENTS * DEFERRED_LPQ_MAX_DEVS + 31) / 32;
+
+struct DeferredLpqTile {
+  int src = -1;
+  int dev_begin = 0;
+  unsigned short parent_count = 0;
+  unsigned short dev_count = 0;
+  int parent_indices[DEFERRED_LPQ_MAX_PARENTS]{};
+  unsigned int promoted[DEFERRED_LPQ_MASK_WORDS]{};
+};
+
 struct TileResidentShadowCounts {
   std::uint64_t tiles = 0;
   std::uint64_t all_short_tiles = 0;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-ROOT=/home/cchang289/Research/gpu-cpg
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OUT_DIR=${1:-"$ROOT/experiments/tc_pfxt_current_best_inprocess_$(date +%Y%m%d_%H%M%S)"}
 mkdir -p "$OUT_DIR/logs"
 

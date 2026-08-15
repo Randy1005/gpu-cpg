@@ -10,7 +10,7 @@ include(cmake/CPM.cmake)
 CPMAddPackage(
     NAME CCCL
     GITHUB_REPOSITORY "nvidia/cccl" 
-    GIT_TAG "main"
+    GIT_TAG "v3.3.3"
 )
 
 set(CMAKE_C_STANDARD    17)
@@ -25,8 +25,11 @@ if(NOT DEFINED CMAKE_CUDA20_STANDARD_COMPILE_OPTION)
 endif()
 
 
-# Default to building for the GPU on the current system
-set(CMAKE_CUDA_ARCHITECTURES 86)
+# Preserve the historical Ampere default while allowing callers to select the
+# architecture of the current machine with -DCMAKE_CUDA_ARCHITECTURES=...
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 86)
+endif()
 
 
 # compile and link CUDA code separately from the rest of your code to

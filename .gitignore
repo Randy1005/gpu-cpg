@@ -6,6 +6,7 @@
 *.fatbin
 
 reports/
+.local/
 build/
 build*/
 tags
