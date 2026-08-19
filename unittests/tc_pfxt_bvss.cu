@@ -70,3 +70,31 @@ TEST_CASE("tc pfxt tensor-core discovery emits active source destination pairs")
 
   CHECK(pairs == std::vector<std::pair<int, int>>({{0, 1}, {2, 9}}));
 }
+
+TEST_CASE("tc pfxt aligned BVSS preserves compact deviation families") {
+  const int n = 10;
+  const std::vector<int> offsets {0, 2, 3, 3, 3, 3, 3, 3, 3, 5, 5};
+  const auto bvss =
+    gpucpg::tc_pfxt::build_adev_bvss_from_compact_deviation_offsets(
+      n, offsets, 8);
+  CHECK(bvss.n_intervals == 2);
+  CHECK(bvss.unpadded_slices == 5);
+  CHECK(bvss.total_set_bits == 5);
+  std::vector<std::pair<int, int>> recovered;
+  for (int vss = 0; vss < bvss.n_vss; ++vss) {
+    const int interval = bvss.virtual_to_real[vss];
+    for (int lane = 0; lane < 32; ++lane) {
+      const auto packed = bvss.masks[vss * 32 + lane];
+      for (int chunk = 0; chunk < 4; ++chunk) {
+        const int dev = bvss.row_ids[vss * 128 + lane * 4 + chunk];
+        if (dev < 0) continue;
+        const auto mask = (packed >> (chunk * 8)) & 0xffu;
+        REQUIRE(mask != 0);
+        recovered.emplace_back(interval * 8 + __builtin_ctz(mask), dev);
+      }
+    }
+  }
+  std::sort(recovered.begin(), recovered.end());
+  CHECK(recovered == std::vector<std::pair<int, int>>(
+    {{0, 0}, {0, 1}, {1, 2}, {8, 3}, {8, 4}}));
+}

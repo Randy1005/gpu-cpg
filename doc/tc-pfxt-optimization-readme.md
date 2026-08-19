@@ -13,8 +13,30 @@ The current proposal configuration uses:
 - tile-native short-only candidate emission;
 - compact active-source grouping.
 
-Candidate materialization, split/window management, and HPQ/LPQ state remain
-CUDA work.
+Candidate materialization, split/window management, and HPQ/LPQ state remain CUDA work.
+
+## Execution-Path Naming and TC Attribution
+
+The deferred headline configuration is a source-local CUDA PFXT path. When
+`GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE=1` is eligible, each suffix-chain
+substep already has its active spur sources. The implementation enumerates the
+precomputed compact static deviations for those sources directly, sets
+`handled_source_local_substep`, and skips the subsequent BVSS pair-discovery
+branch. This avoids reconstructing information already present in the compact
+CSR and is why this path is fast, but it also means BVSS tensor-core MMA is not
+executed in the normal headline run.
+
+Runtime output must be used to attribute results:
+
+- `execution_path=source_local_cuda bvss_mma_executed=0` means no production
+  BVSS MMA discovery ran;
+- `execution_path=bvss_tensor_core bvss_mma_executed=1` means at least one
+  production BVSS discovery substep ran;
+- `bvss_mma_discovery_substeps` reports the exact number of such substeps.
+
+Performance reports should keep three arms distinct: GPG, genuine BVSS
+tensor-core discovery, and deferred source-local CUDA PFXT. Do not attribute a
+source-local speedup to tensor-core utilization.
 
 ## Build
 

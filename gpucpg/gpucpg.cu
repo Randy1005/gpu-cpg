@@ -21,6 +21,7 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cuda/functional>
+#include <mma.h>
 #include <cuda_runtime_api.h>
 #include <cooperative_groups.h>
 #if GPUCPG_HAS_NVTX
@@ -29,6 +30,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cmath>
+#include <bit>
 #include <charconv>
 #include <climits>
 #include <cfloat>
@@ -4631,6 +4633,12 @@ __global__ void profile_tc_pfxt_source_local_tile_filter(
 
   unsigned long long local_admit = 0;
   unsigned long long local_skip = 0;
+  unsigned long long local_tf32_reachable = 0;
+  unsigned long long local_tf32_raw_mismatch = 0;
+  unsigned long long local_tf32_safe = 0;
+  unsigned long long local_tf32_fallback = 0;
+  unsigned long long local_tf32_post_fallback_mismatch = 0;
+  float local_tf32_max_abs_error = 0.0f;
   const int n_products = parent_count * dev_count;
   for (int tile_product = 0;
        tile_product < n_products;
@@ -4644,9 +4652,30 @@ __global__ void profile_tc_pfxt_source_local_tile_filter(
       const int parent_idx = window_start + active_idx;
       if (dev_reachable == nullptr || dev_reachable[dev_base + local_dev] != 0) {
         const auto& node = short_pile[parent_idx];
-        const float new_slack = node.slack + dev_deltas[dev_base + local_dev];
+        const float dev_delta = dev_deltas[dev_base + local_dev];
+        const float new_slack = node.slack + dev_delta;
         candidate_class = tc_pfxt::classify_candidate(
           new_slack, split, final_split, use_final_split, skip_long_paths);
+        const float tf32_slack = nvcuda::wmma::__float_to_tf32(node.slack);
+        const float tf32_delta = nvcuda::wmma::__float_to_tf32(dev_delta);
+        const float tf32_sum = tf32_slack + tf32_delta;
+        const auto tf32_class = tc_pfxt::classify_candidate(
+          tf32_sum, split, final_split, use_final_split, skip_long_paths);
+        const float magnitude = fabsf(node.slack) + fabsf(dev_delta);
+        const float error_bound = magnitude * 0x1.002p-11f + 0x1p-126f;
+        const auto low_class = tc_pfxt::classify_candidate(
+          tf32_sum - error_bound, split, final_split, use_final_split, skip_long_paths);
+        const auto high_class = tc_pfxt::classify_candidate(
+          tf32_sum + error_bound, split, final_split, use_final_split, skip_long_paths);
+        const bool safe = low_class == high_class;
+        ++local_tf32_reachable;
+        local_tf32_raw_mismatch += tf32_class != candidate_class ? 1ULL : 0ULL;
+        local_tf32_safe += safe ? 1ULL : 0ULL;
+        local_tf32_fallback += safe ? 0ULL : 1ULL;
+        const auto final_class = safe ? tf32_class : candidate_class;
+        local_tf32_post_fallback_mismatch += final_class != candidate_class ? 1ULL : 0ULL;
+        local_tf32_max_abs_error =
+          fmaxf(local_tf32_max_abs_error, fabsf(tf32_sum - new_slack));
       }
     }
     if (candidate_class == tc_pfxt::CandidateClass::SKIP) {
@@ -4663,6 +4692,22 @@ __global__ void profile_tc_pfxt_source_local_tile_filter(
   const auto tile_admit = BlockReduce(reduce_storage).Sum(local_admit);
   __syncthreads();
   const auto tile_skip = BlockReduce(reduce_storage).Sum(local_skip);
+  __syncthreads();
+  const auto tile_tf32_reachable = BlockReduce(reduce_storage).Sum(local_tf32_reachable);
+  __syncthreads();
+  const auto tile_tf32_raw_mismatch = BlockReduce(reduce_storage).Sum(local_tf32_raw_mismatch);
+  __syncthreads();
+  const auto tile_tf32_safe = BlockReduce(reduce_storage).Sum(local_tf32_safe);
+  __syncthreads();
+  const auto tile_tf32_fallback = BlockReduce(reduce_storage).Sum(local_tf32_fallback);
+  __syncthreads();
+  const auto tile_tf32_post_fallback_mismatch =
+    BlockReduce(reduce_storage).Sum(local_tf32_post_fallback_mismatch);
+  __syncthreads();
+  using FloatBlockReduce = cub::BlockReduce<float, TC_PFXT_PAIR_BLOCK_THREADS>;
+  __shared__ typename FloatBlockReduce::TempStorage float_reduce_storage;
+  const auto tile_tf32_max_abs_error = FloatBlockReduce(float_reduce_storage).Reduce(
+    local_tf32_max_abs_error, cuda::maximum<>{});
 
   __shared__ int oracle_bin;
   if (threadIdx.x == 0) {
@@ -4688,6 +4733,13 @@ __global__ void profile_tc_pfxt_source_local_tile_filter(
     atomicAdd(stats + 5, products);
     atomicAdd(stats + 6, tile_admit);
     atomicAdd(stats + 7, tile_skip);
+    atomicAdd(stats + 58, tile_tf32_reachable);
+    atomicAdd(stats + 59, tile_tf32_raw_mismatch);
+    atomicAdd(stats + 60, tile_tf32_safe);
+    atomicAdd(stats + 61, tile_tf32_fallback);
+    atomicAdd(stats + 62, tile_tf32_post_fallback_mismatch);
+    atomicMax(stats + 63,
+      static_cast<unsigned long long>(__float_as_uint(tile_tf32_max_abs_error)));
     if (products == 0 || tile_skip == products) {
       atomicAdd(stats + 1, 1ULL);
     }
@@ -5343,6 +5395,180 @@ __global__ void fill_tc_pfxt_source_local_tiles(
         dev_begin,
         (parent_count_this << 16) | (dev_count_this & 0xffff));
     }
+  }
+}
+
+__global__ void profile_tc_pfxt_scalar_tile_classification(
+  const int n_tiles,
+  const int4* tiles,
+  const int* active_sources,
+  const int* group_offsets,
+  const int* path_indices,
+  const int* dev_offsets,
+  const float* dev_deltas,
+  const unsigned char* dev_reachable,
+  const PfxtNode* short_pile,
+  const int window_start,
+  const float split,
+  const float final_split,
+  const bool use_final_split,
+  const bool skip_long_paths,
+  const bool compact_group_offsets,
+  unsigned long long* stats) {
+  if (blockIdx.x >= n_tiles || threadIdx.x >= 32) return;
+  const int lane = threadIdx.x;
+  const auto tile = tiles[blockIdx.x];
+  const int src = active_sources[tile.x];
+  const int parent_base =
+    tc_pfxt_source_group_begin(group_offsets, src, tile.x, compact_group_offsets)
+    + tile.y;
+  const int dev_base = dev_offsets[src] + tile.z;
+  const int parent_count = tile.w >> 16;
+  const int dev_count = tile.w & 0xffff;
+  unsigned long long local[4] {};
+  const int products = parent_count * dev_count;
+  for (int product = lane; product < products; product += 32) {
+    const int row = product / dev_count;
+    const int col = product - row * dev_count;
+    const int dev_idx = dev_base + col;
+    if (dev_reachable != nullptr && dev_reachable[dev_idx] == 0) continue;
+    const int active_idx = path_indices[parent_base + row];
+    const int parent_idx = window_start + active_idx;
+    const auto candidate_class = tc_pfxt::classify_candidate(
+      short_pile[parent_idx].slack + dev_deltas[dev_idx],
+      split, final_split, use_final_split, skip_long_paths);
+    ++local[0];
+    local[1] += candidate_class == tc_pfxt::CandidateClass::SHORT;
+    local[2] += candidate_class == tc_pfxt::CandidateClass::LONG;
+    local[3] += candidate_class == tc_pfxt::CandidateClass::SKIP;
+  }
+  for (int stat = 0; stat < 4; ++stat) {
+    unsigned long long value = local[stat];
+    for (int offset = 16; offset > 0; offset >>= 1)
+      value += __shfl_down_sync(0xffffffffu, value, offset);
+    if (lane == 0) atomicAdd(stats + stat, value);
+  }
+}
+
+template<bool ValidateExact>
+__global__ void profile_tc_pfxt_tf32_mma_tile_classification(
+  const int n_tiles,
+  const int4* tiles,
+  const int* active_sources,
+  const int* group_offsets,
+  const int* path_indices,
+  const int* dev_offsets,
+  const float* dev_deltas,
+  const unsigned char* dev_reachable,
+  const PfxtNode* short_pile,
+  const int window_start,
+  const float split,
+  const float final_split,
+  const bool use_final_split,
+  const bool skip_long_paths,
+  const bool compact_group_offsets,
+  unsigned long long* stats) {
+  if (blockIdx.x >= n_tiles || threadIdx.x >= 32) return;
+  const int lane = threadIdx.x;
+  const auto tile = tiles[blockIdx.x];
+  const int src = active_sources[tile.x];
+  const int parent_base =
+    tc_pfxt_source_group_begin(group_offsets, src, tile.x, compact_group_offsets)
+    + tile.y;
+  const int dev_base = dev_offsets[src] + tile.z;
+  const int parent_count = tile.w >> 16;
+  const int dev_count = tile.w & 0xffff;
+
+  __shared__ __align__(16) float matrix_a[16 * 8];
+  __shared__ __align__(16) float matrix_b[8 * 16];
+  __shared__ __align__(16) float matrix_c[16 * 16];
+
+  unsigned long long local[8] {};
+  for (int parent_tile = 0; parent_tile < parent_count; parent_tile += 16) {
+    const int parents_this = min(16, parent_count - parent_tile);
+    for (int dev_tile = 0; dev_tile < dev_count; dev_tile += 16) {
+      const int devs_this = min(16, dev_count - dev_tile);
+      for (int i = lane; i < 16 * 8; i += 32) matrix_a[i] = 0.0f;
+      for (int i = lane; i < 8 * 16; i += 32) matrix_b[i] = 0.0f;
+      for (int row = lane; row < parents_this; row += 32) {
+        const int active_idx = path_indices[parent_base + parent_tile + row];
+        const int parent_idx = window_start + active_idx;
+        matrix_a[row * 8] =
+          nvcuda::wmma::__float_to_tf32(short_pile[parent_idx].slack);
+        matrix_a[row * 8 + 1] = 1.0f;
+      }
+      for (int col = lane; col < devs_this; col += 32) {
+        matrix_b[col] = 1.0f;
+        matrix_b[16 + col] =
+          nvcuda::wmma::__float_to_tf32(dev_deltas[dev_base + dev_tile + col]);
+      }
+      __syncwarp();
+
+      nvcuda::wmma::fragment<
+        nvcuda::wmma::matrix_a, 16, 16, 8,
+        nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> frag_a;
+      nvcuda::wmma::fragment<
+        nvcuda::wmma::matrix_b, 16, 16, 8,
+        nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> frag_b;
+      nvcuda::wmma::fragment<
+        nvcuda::wmma::accumulator, 16, 16, 8, float> frag_c;
+      nvcuda::wmma::load_matrix_sync(frag_a, matrix_a, 8);
+      nvcuda::wmma::load_matrix_sync(frag_b, matrix_b, 16);
+      nvcuda::wmma::fill_fragment(frag_c, 0.0f);
+      nvcuda::wmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
+      nvcuda::wmma::store_matrix_sync(
+        matrix_c, frag_c, 16, nvcuda::wmma::mem_row_major);
+      __syncwarp();
+
+      for (int product = lane;
+           product < parents_this * devs_this;
+           product += 32) {
+        const int row = product / devs_this;
+        const int col = product - row * devs_this;
+        const int dev_idx = dev_base + dev_tile + col;
+        if (dev_reachable != nullptr && dev_reachable[dev_idx] == 0) continue;
+        const int active_idx = path_indices[parent_base + parent_tile + row];
+        const int parent_idx = window_start + active_idx;
+        const float parent_slack = short_pile[parent_idx].slack;
+        const float dev_delta = dev_deltas[dev_idx];
+        const float tf32_sum = matrix_c[row * 16 + col];
+        const float error_bound =
+          (fabsf(parent_slack) + fabsf(dev_delta)) * 0x1.002p-11f + 0x1p-126f;
+        const auto tf32_class = tc_pfxt::classify_candidate(
+          tf32_sum, split, final_split, use_final_split, skip_long_paths);
+        const auto low_class = tc_pfxt::classify_candidate(
+          tf32_sum - error_bound,
+          split, final_split, use_final_split, skip_long_paths);
+        const auto high_class = tc_pfxt::classify_candidate(
+          tf32_sum + error_bound,
+          split, final_split, use_final_split, skip_long_paths);
+        const bool safe = low_class == high_class;
+        auto exact_class = tf32_class;
+        if (!safe || ValidateExact) {
+          exact_class = tc_pfxt::classify_candidate(
+            parent_slack + dev_delta,
+            split, final_split, use_final_split, skip_long_paths);
+        }
+        const auto final_class = safe ? tf32_class : exact_class;
+        ++local[0];
+        local[1] += safe;
+        local[2] += !safe;
+        if constexpr (ValidateExact) {
+          local[3] += tf32_class != exact_class;
+          local[4] += final_class != exact_class;
+        }
+        local[5] += final_class == tc_pfxt::CandidateClass::SHORT;
+        local[6] += final_class == tc_pfxt::CandidateClass::LONG;
+        local[7] += final_class == tc_pfxt::CandidateClass::SKIP;
+      }
+      __syncwarp();
+    }
+  }
+  for (int stat = 0; stat < 8; ++stat) {
+    unsigned long long value = local[stat];
+    for (int offset = 16; offset > 0; offset >>= 1)
+      value += __shfl_down_sync(0xffffffffu, value, offset);
+    if (lane == 0) atomicAdd(stats + stat, value);
   }
 }
 
@@ -6713,6 +6939,7 @@ struct CpGen::TcPfxtStaticCache {
   int graph_diameter = 0;
   bool sfxt_valid = false;
   bool bvss_valid = false;
+  bool aligned_bvss_valid = false;
   bool compact_devs_valid = false;
 
   thrust::host_vector<int> h_dists;
@@ -6728,6 +6955,7 @@ struct CpGen::TcPfxtStaticCache {
   thrust::device_vector<int> tc_pfxt_next_dev_vertex;
 
   TcPfxtDeviceBvss bvss;
+  TcPfxtDeviceBvss aligned_bvss;
   TcPfxtDeviceCompactStaticDeviationCsr compact_devs;
 
   bool matches_graph(const int candidate_n, const int candidate_m) const {
@@ -6749,6 +6977,7 @@ struct CpGen::TcPfxtStaticCache {
   void clear_static_payload() {
     sfxt_valid = false;
     bvss_valid = false;
+    aligned_bvss_valid = false;
     compact_devs_valid = false;
     n = 0;
     m = 0;
@@ -6770,6 +6999,13 @@ struct CpGen::TcPfxtStaticCache {
     thrust::device_vector<unsigned int>().swap(bvss.masks);
     bvss.n_intervals = 0;
     bvss.n_vss = 0;
+    thrust::device_vector<int>().swap(aligned_bvss.real_ptrs);
+    thrust::device_vector<int>().swap(aligned_bvss.virtual_to_real);
+    thrust::device_vector<unsigned char>().swap(aligned_bvss.slice_counts);
+    thrust::device_vector<int>().swap(aligned_bvss.row_ids);
+    thrust::device_vector<unsigned int>().swap(aligned_bvss.masks);
+    aligned_bvss.n_intervals = 0;
+    aligned_bvss.n_vss = 0;
     compact_devs.release();
   }
 };
@@ -6904,6 +7140,7 @@ struct TcPfxtStepTiming {
   int source_local_max_parent_count = 0;
   int source_local_max_dev_count = 0;
   std::uint64_t source_local_max_products_per_source = 0;
+  int bvss_mma_discovery_substeps = 0;
   int max_active_vss = 0;
   int max_chain_substeps = 0;
   int sfx_chain_walk_steps = 0;
@@ -7657,6 +7894,310 @@ static void write_tc_pfxt_mma_feasibility_row(
     << dispatch.safely_rejected_products << '\n';
 }
 
+__global__ void tc_pfxt_pair_interval_histogram(
+  const int2* pairs,
+  const int n_pairs,
+  const int n_intervals,
+  unsigned long long* interval_pairs) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  for (int i = tid; i < n_pairs; i += gridDim.x * blockDim.x) {
+    const int interval = pairs[i].x / 8;
+    if (interval >= 0 && interval < n_intervals) {
+      atomicAdd(interval_pairs + interval, 1ULL);
+    }
+  }
+}
+
+__global__ void profile_tc_pfxt_vss_descriptor_density(
+  const int* virtual_to_real,
+  const int* row_ids,
+  const unsigned int* masks,
+  const unsigned int* frontier_words,
+  const int* active_vss,
+  const int* active_vss_size,
+  const int n_nodes,
+  unsigned long long* stats) {
+  const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const int warp = global_thread / 32;
+  const int lane = threadIdx.x & 31;
+  const int n_warps = gridDim.x * blockDim.x / 32;
+  const int queue_size = *active_vss_size;
+  for (int q = warp; q < queue_size; q += n_warps) {
+    const int vss = active_vss[q];
+    const int interval = virtual_to_real[vss];
+    const unsigned int frontier_byte =
+      (frontier_words[interval >> 2] >> ((interval & 3) * 8)) & 0xffu;
+    const unsigned int packed = masks[vss * 32 + lane];
+    int lane_pairs = 0;
+    #pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+      const int dst = row_ids[vss * 128 + lane * 4 + chunk];
+      if (dst >= 0 && dst < n_nodes) {
+        lane_pairs += __popc(
+          ((packed >> (chunk * 8)) & 0xffu) & frontier_byte);
+      }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      lane_pairs += __shfl_down_sync(0xffffffffu, lane_pairs, offset);
+    }
+    if (lane == 0) {
+      const auto pairs = static_cast<unsigned long long>(lane_pairs);
+      atomicAdd(stats + 0, 1ULL);
+      atomicAdd(stats + 1, lane_pairs > 0 ? 1ULL : 0ULL);
+      atomicAdd(stats + 2, pairs);
+      atomicAdd(stats + 3, lane_pairs >= 4 ? pairs : 0ULL);
+      atomicAdd(stats + 4, lane_pairs >= 8 ? pairs : 0ULL);
+      int bin = 11;
+      if (lane_pairs == 0) bin = 5;
+      else if (lane_pairs == 1) bin = 6;
+      else if (lane_pairs == 2) bin = 7;
+      else if (lane_pairs == 3) bin = 8;
+      else if (lane_pairs < 8) bin = 9;
+      else if (lane_pairs < 16) bin = 10;
+      atomicAdd(stats + bin, 1ULL);
+    }
+  }
+}
+
+struct TcPfxtVssDescriptor {
+  int vss;
+  unsigned int frontier_byte;
+};
+
+__device__ __forceinline__ unsigned long long tc_pfxt_pair_hash(
+  const int src, const int dst) {
+  unsigned long long x =
+    (static_cast<unsigned long long>(static_cast<unsigned int>(src)) << 32)
+    | static_cast<unsigned int>(dst);
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+__global__ void tc_pfxt_emit_vss_descriptors(
+  const int* virtual_to_real,
+  const unsigned char* slice_counts,
+  const unsigned int* masks,
+  const unsigned int* frontier_words,
+  const int* active_vss,
+  const int* active_vss_size,
+  TcPfxtVssDescriptor* descriptors,
+  int* descriptor_count,
+  const int max_descriptors,
+  int* overflow,
+  const bool shape_dispatch) {
+  const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const int warp = global_thread / 32;
+  const int lane = threadIdx.x & 31;
+  const int n_warps = gridDim.x * blockDim.x / 32;
+  const int queue_size = *active_vss_size;
+  for (int q = warp; q < queue_size; q += n_warps) {
+    const int vss = active_vss[q];
+    const int interval = virtual_to_real[vss];
+    const unsigned int frontier_byte =
+      (frontier_words[interval >> 2] >> ((interval & 3) * 8)) & 0xffu;
+    const unsigned int packed = masks[vss * 32 + lane];
+    unsigned int frag_b = 0;
+    const unsigned int res = lane % 9;
+    if (res == 0) frag_b = frontier_byte;
+    else if (res == 4) frag_b = frontier_byte << 8;
+    unsigned int frag_c[4] {0, 0, 0, 0};
+    tc_pfxt::m8n8k128_tc_pfxt(frag_c, packed & 0x0000ffffu, frag_b);
+    if (!shape_dispatch || slice_counts[vss] > 64) {
+      tc_pfxt::m8n8k128_tc_pfxt(
+        &frag_c[2], (packed & 0xffff0000u) >> 16, frag_b);
+    }
+    const bool lane_nonempty =
+      frag_c[0] != 0 || frag_c[1] != 0 || frag_c[2] != 0 || frag_c[3] != 0;
+    if (__any_sync(0xffffffffu, lane_nonempty) && lane == 0) {
+      const int pos = atomicAdd(descriptor_count, 1);
+      if (pos < max_descriptors) {
+        descriptors[pos] = TcPfxtVssDescriptor{vss, frontier_byte};
+      } else {
+        *overflow = 1;
+      }
+    }
+  }
+}
+
+__global__ void tc_pfxt_consume_vss_descriptors_fingerprint(
+  const TcPfxtVssDescriptor* descriptors,
+  const int* descriptor_count,
+  const int* virtual_to_real,
+  const int* row_ids,
+  const unsigned int* masks,
+  const int n_nodes,
+  unsigned long long* result) {
+  const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const int warp = global_thread / 32;
+  const int lane = threadIdx.x & 31;
+  const int n_warps = gridDim.x * blockDim.x / 32;
+  unsigned long long local_count = 0;
+  unsigned long long local_sum = 0;
+  unsigned long long local_xor = 0;
+  for (int q = warp; q < *descriptor_count; q += n_warps) {
+    const auto descriptor = descriptors[q];
+    const int interval = virtual_to_real[descriptor.vss];
+    const unsigned int packed = masks[descriptor.vss * 32 + lane];
+    #pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+      const int dst = row_ids[descriptor.vss * 128 + lane * 4 + chunk];
+      if (dst < 0 || dst >= n_nodes) continue;
+      unsigned int hits =
+        ((packed >> (chunk * 8)) & 0xffu) & descriptor.frontier_byte;
+      while (hits != 0) {
+        const int bit = __ffs(hits) - 1;
+        const int src = interval * 8 + bit;
+        if (src < n_nodes) {
+          const auto hash = tc_pfxt_pair_hash(src, dst);
+          ++local_count;
+          local_sum += hash;
+          local_xor ^= hash;
+        }
+        hits &= hits - 1;
+      }
+    }
+  }
+  if (local_count != 0) {
+    atomicAdd(result + 0, local_count);
+    atomicAdd(result + 1, local_sum);
+    atomicXor(result + 2, local_xor);
+  }
+}
+
+__global__ void fill_tc_pfxt_aligned_vss_short_candidates(
+  const TcPfxtVssDescriptor* descriptors,
+  const int* descriptor_count,
+  const int* virtual_to_real,
+  const int* row_dev_ids,
+  const unsigned int* masks,
+  const int n_nodes,
+  const int n_devs,
+  const int* dev_dsts,
+  const float* dev_deltas,
+  const int* source_slots,
+  const int* group_offsets,
+  const int* path_indices,
+  PfxtNode* short_pile,
+  const int window_start,
+  const float split,
+  const float final_split,
+  const bool use_final_split,
+  const bool compact_group_offsets,
+  int* tail_short,
+  const int max_short_paths,
+  int* overflow,
+  unsigned long long* class_counts) {
+  const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const int warp = global_thread / 32;
+  const int lane = threadIdx.x & 31;
+  const int n_warps = gridDim.x * blockDim.x / 32;
+  unsigned long long local_short = 0;
+  unsigned long long local_skip = 0;
+  unsigned long long local_products = 0;
+  for (int q = warp; q < *descriptor_count; q += n_warps) {
+    const auto descriptor = descriptors[q];
+    const int interval = virtual_to_real[descriptor.vss];
+    const unsigned int packed = masks[descriptor.vss * 32 + lane];
+    #pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+      const int dev_idx = row_dev_ids[descriptor.vss * 128 + lane * 4 + chunk];
+      if (dev_idx < 0 || dev_idx >= n_devs) continue;
+      unsigned int hits =
+        ((packed >> (chunk * 8)) & 0xffu) & descriptor.frontier_byte;
+      while (hits != 0) {
+        const int bit = __ffs(hits) - 1;
+        hits &= hits - 1;
+        const int src = interval * 8 + bit;
+        if (src < 0 || src >= n_nodes) continue;
+        const int source_slot = compact_group_offsets ? source_slots[src] : src;
+        if (source_slot < 0) continue;
+        const int parent_begin = tc_pfxt_source_group_begin(
+          group_offsets, src, source_slot, compact_group_offsets);
+        const int parent_end = tc_pfxt_source_group_end(
+          group_offsets, src, source_slot, compact_group_offsets);
+        for (int pos = parent_begin; pos < parent_end; ++pos) {
+          ++local_products;
+          const int active_idx = path_indices[pos];
+          const int parent_idx = window_start + active_idx;
+          const auto& node = short_pile[parent_idx];
+          const float new_slack = node.slack + dev_deltas[dev_idx];
+          const auto candidate_class = tc_pfxt::classify_candidate(
+            new_slack, split, final_split, use_final_split, true);
+          if (candidate_class == tc_pfxt::CandidateClass::SHORT) {
+            ++local_short;
+            const int out = atomicAdd(tail_short, 1);
+            if (out < max_short_paths) {
+              auto& new_path = short_pile[out];
+              new_path.level = node.level + 1;
+              new_path.from = src;
+              new_path.to = dev_dsts[dev_idx];
+              new_path.parent = parent_idx;
+              new_path.num_children = 0;
+              new_path.slack = new_slack;
+            }
+            else {
+              *overflow = 1;
+            }
+          }
+          else {
+            ++local_skip;
+          }
+        }
+      }
+    }
+  }
+  if (local_products != 0) {
+    atomicAdd(class_counts + 0, local_short);
+    atomicAdd(class_counts + 2, local_skip);
+    atomicAdd(class_counts + 3, local_products);
+  }
+}
+
+__global__ void tc_pfxt_pair_fingerprint_dynamic(
+  const int2* pairs,
+  const int* pair_count,
+  unsigned long long* result) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned long long local_count = 0;
+  unsigned long long local_sum = 0;
+  unsigned long long local_xor = 0;
+  for (int i = tid; i < *pair_count; i += gridDim.x * blockDim.x) {
+    const auto hash = tc_pfxt_pair_hash(pairs[i].x, pairs[i].y);
+    ++local_count;
+    local_sum += hash;
+    local_xor ^= hash;
+  }
+  if (local_count != 0) {
+    atomicAdd(result + 0, local_count);
+    atomicAdd(result + 1, local_sum);
+    atomicXor(result + 2, local_xor);
+  }
+}
+
+__global__ void tc_pfxt_pair_fingerprint(
+  const int2* pairs,
+  const int n_pairs,
+  unsigned long long* fingerprint) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned long long local_sum = 0;
+  unsigned long long local_xor = 0;
+  for (int i = tid; i < n_pairs; i += gridDim.x * blockDim.x) {
+    unsigned long long x =
+      (static_cast<unsigned long long>(static_cast<unsigned int>(pairs[i].x)) << 32)
+      | static_cast<unsigned int>(pairs[i].y);
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    local_sum += x;
+    local_xor ^= x;
+  }
+  atomicAdd(fingerprint, local_sum);
+  atomicXor(fingerprint + 1, local_xor);
+}
+
 static TcPfxtPairDiscovery tc_pfxt_discover_pair_count_for_current_v(
   const int n_nodes,
   const TcPfxtDeviceBvss& bvss,
@@ -7703,21 +8244,53 @@ static TcPfxtPairDiscovery tc_pfxt_discover_pair_count_for_current_v(
       4096,
       ROUNDUPBLOCKS(std::max(1, h_active_vss_size) * 32, 256)));
   }
-  tc_pfxt::tc_transposed_adev_discover_pairs
-    <<<blocks, 256>>>(
-      thrust::raw_pointer_cast(bvss.virtual_to_real.data()),
-      thrust::raw_pointer_cast(bvss.slice_counts.data()),
-      thrust::raw_pointer_cast(bvss.row_ids.data()),
-      thrust::raw_pointer_cast(bvss.masks.data()),
-      thrust::raw_pointer_cast(frontier.data()),
-      thrust::raw_pointer_cast(active_vss.data()),
-      thrust::raw_pointer_cast(active_vss_size.data()),
-      pairs,
-      thrust::raw_pointer_cast(pair_count.data()),
-      thrust::raw_pointer_cast(overflow.data()),
-      max_pairs,
-      n_nodes,
-      shape_dispatch);
+  if (std::getenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY") != nullptr) {
+    tc_pfxt::scalar_transposed_adev_discover_pairs
+      <<<blocks, 256>>>(
+        thrust::raw_pointer_cast(bvss.virtual_to_real.data()),
+        thrust::raw_pointer_cast(bvss.row_ids.data()),
+        thrust::raw_pointer_cast(bvss.masks.data()),
+        thrust::raw_pointer_cast(frontier.data()),
+        thrust::raw_pointer_cast(active_vss.data()),
+        thrust::raw_pointer_cast(active_vss_size.data()),
+        pairs,
+        thrust::raw_pointer_cast(pair_count.data()),
+        thrust::raw_pointer_cast(overflow.data()),
+        max_pairs,
+        n_nodes);
+  } else if (std::getenv("GPUCPG_TC_PFXT_COUNTED_COMPACTION") != nullptr) {
+    tc_pfxt::tc_transposed_adev_discover_pairs_counted
+      <<<blocks, 256>>>(
+        thrust::raw_pointer_cast(bvss.virtual_to_real.data()),
+        thrust::raw_pointer_cast(bvss.slice_counts.data()),
+        thrust::raw_pointer_cast(bvss.row_ids.data()),
+        thrust::raw_pointer_cast(bvss.masks.data()),
+        thrust::raw_pointer_cast(frontier.data()),
+        thrust::raw_pointer_cast(active_vss.data()),
+        thrust::raw_pointer_cast(active_vss_size.data()),
+        pairs,
+        thrust::raw_pointer_cast(pair_count.data()),
+        thrust::raw_pointer_cast(overflow.data()),
+        max_pairs,
+        n_nodes,
+        shape_dispatch);
+  } else {
+    tc_pfxt::tc_transposed_adev_discover_pairs
+      <<<blocks, 256>>>(
+        thrust::raw_pointer_cast(bvss.virtual_to_real.data()),
+        thrust::raw_pointer_cast(bvss.slice_counts.data()),
+        thrust::raw_pointer_cast(bvss.row_ids.data()),
+        thrust::raw_pointer_cast(bvss.masks.data()),
+        thrust::raw_pointer_cast(frontier.data()),
+        thrust::raw_pointer_cast(active_vss.data()),
+        thrust::raw_pointer_cast(active_vss_size.data()),
+        pairs,
+        thrust::raw_pointer_cast(pair_count.data()),
+        thrust::raw_pointer_cast(overflow.data()),
+        max_pairs,
+        n_nodes,
+        shape_dispatch);
+  }
   cudaCheckErrors("tc pfxt discover pairs failed");
 
   thrust::host_vector<int> h_overflow(overflow);
@@ -8199,7 +8772,6 @@ __global__ void tc_pfxt_discover_short_only_candidates(
       shared_invalid_edges[0]};
   }
 }
-
 __global__ void convert_tc_pfxt_pairs_to_meta(
   const int2* raw_pairs,
   const int n_pairs,
@@ -8227,7 +8799,6 @@ __global__ void convert_tc_pfxt_pairs_to_meta(
       group_offsets[raw_pair.x + 1] - group_offsets[raw_pair.x]);
   }
 }
-
 __global__ void set_int_at_index_kernel(
   int* values,
   const int index,
@@ -8699,6 +9270,7 @@ static void tc_pfxt_expand_window(
     if (discovery.n_active_vss >= 0) {
       step_timing.max_active_vss = std::max(step_timing.max_active_vss, discovery.n_active_vss);
     }
+    ++step_timing.bvss_mma_discovery_substeps;
     const auto n_pairs = discovery.n_pairs;
     total_pair_count += n_pairs;
     if (n_pairs > 0) {
@@ -8913,6 +9485,7 @@ static void tc_pfxt_expand_window(
     if (discovery.n_active_vss >= 0) {
       step_timing.max_active_vss = std::max(step_timing.max_active_vss, discovery.n_active_vss);
     }
+    ++step_timing.bvss_mma_discovery_substeps;
     const auto n_pairs = discovery.n_pairs;
     if (n_pairs > 0) {
       phase_timer.start();
@@ -9032,6 +9605,7 @@ static void tc_pfxt_expand_window(
 static void tc_pfxt_expand_window_single_pass(
   const int n_nodes,
   const TcPfxtDeviceBvss& bvss,
+  const TcPfxtDeviceBvss& aligned_bvss,
   const TcPfxtDeviceStaticDeviationCsr& static_devs,
   const TcPfxtDeviceCompactStaticDeviationCsr& compact_static_devs,
   int* d_fanout_adjp,
@@ -9115,8 +9689,14 @@ static void tc_pfxt_expand_window_single_pass(
     std::getenv("GPUCPG_TC_PFXT_DIRECT_PAIR_META") != nullptr;
   const int direct_pair_meta_capacity =
     get_env_int_or_default("GPUCPG_TC_PFXT_DIRECT_PAIR_META_CAP", 4194304);
+  const bool use_aligned_bvss_consumer =
+    std::getenv("GPUCPG_TC_PFXT_ALIGNED_BVSS") != nullptr
+    && aligned_bvss.n_vss > 0
+    && !compact_static_devs.empty();
   const bool profile_source_local =
     std::getenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_PROFILE") != nullptr;
+  const bool profile_tf32_mma_classification =
+    std::getenv("GPUCPG_TC_PFXT_TF32_MMA_CLASS_PROFILE") != nullptr;
   const bool source_local_requested =
     std::getenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE") != nullptr;
   const bool tile_native_candidate_requested =
@@ -9271,7 +9851,7 @@ static void tc_pfxt_expand_window_single_pass(
     }
   }
   scratch.frontier.resize(std::max(1, ROUNDUPBLOCKS(n_nodes, 32)));
-  scratch.active_vss.resize(std::max(1, bvss.n_vss));
+  scratch.active_vss.resize(std::max({1, bvss.n_vss, aligned_bvss.n_vss}));
   scratch.active_vss_size.resize(1);
   if (direct_pair_meta) {
     scratch.pair_meta.reserve(std::max(1, direct_pair_meta_capacity));
@@ -9406,6 +9986,12 @@ static void tc_pfxt_expand_window_single_pass(
   }
   const bool profile_work_equivalence =
     std::getenv("GPUCPG_TC_PFXT_WORK_EQUIV_PROFILE") != nullptr;
+  const bool profile_cross_frontier_reuse =
+    std::getenv("GPUCPG_TC_PFXT_CROSS_FRONTIER_PROFILE") != nullptr;
+  const bool profile_vss_descriptors =
+    std::getenv("GPUCPG_TC_PFXT_VSS_DESCRIPTOR_PROFILE") != nullptr;
+  const bool replay_vss_descriptors =
+    std::getenv("GPUCPG_TC_PFXT_VSS_DESCRIPTOR_REPLAY") != nullptr;
   const char* work_equivalence_csv =
     std::getenv("GPUCPG_TC_PFXT_WORK_EQUIV_CSV");
   const char* source_selectivity_csv =
@@ -9460,6 +10046,31 @@ static void tc_pfxt_expand_window_single_pass(
   std::uint64_t threshold_short_materialized = 0;
   std::uint64_t threshold_long_materialized = 0;
   std::uint64_t threshold_skipped = 0;
+  std::vector<std::vector<std::pair<int, unsigned long long>>>
+    cross_frontier_depth_pairs;
+  thrust::device_vector<unsigned long long> cross_frontier_interval_pairs;
+  thrust::device_vector<unsigned long long> vss_descriptor_stats;
+  unsigned long long vss_descriptor_expected_pairs = 0;
+  if (profile_vss_descriptors) {
+    vss_descriptor_stats.resize(12);
+    thrust::fill(vss_descriptor_stats.begin(), vss_descriptor_stats.end(), 0ULL);
+  }
+  thrust::device_vector<TcPfxtVssDescriptor> vss_descriptors;
+  thrust::device_vector<int> vss_descriptor_count;
+  thrust::device_vector<unsigned long long> vss_replay_pair_fingerprint;
+  thrust::device_vector<unsigned long long> vss_replay_descriptor_fingerprint;
+  double vss_replay_pair_us = 0.0;
+  double vss_replay_descriptor_us = 0.0;
+  unsigned long long vss_replay_pairs = 0;
+  int vss_replay_substeps = 0;
+  if (replay_vss_descriptors || use_aligned_bvss_consumer) {
+    vss_descriptors.resize(std::max(1, std::max(bvss.n_vss, aligned_bvss.n_vss)));
+    vss_descriptor_count.resize(1);
+    if (replay_vss_descriptors) {
+    vss_replay_pair_fingerprint.resize(3);
+    vss_replay_descriptor_fingerprint.resize(3);
+    }
+  }
 
   const char* family_capture_dir_env =
     std::getenv("GPUCPG_TC_PFXT_FAMILY_CAPTURE_DIR");
@@ -9948,6 +10559,260 @@ static void tc_pfxt_expand_window_single_pass(
       source_local_pair_count = static_cast<int>(std::min<std::uint64_t>(
         source_stats.deviation_families,
         static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
+      if (std::getenv("GPUCPG_TC_PFXT_DISCOVERY_REPLAY_ORACLE") != nullptr) {
+        const bool scalar_was_set =
+          std::getenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY") != nullptr;
+        auto replay = [&](const bool scalar) {
+          if (scalar) setenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY", "1", 1);
+          else unsetenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY");
+          Timer replay_timer;
+          replay_timer.start();
+          const auto result = tc_pfxt_discover_pair_count_for_current_v(
+            n_nodes,
+            bvss,
+            thrust::raw_pointer_cast(source_local_active_sources.data()),
+            h_source_local_sources,
+            frontier,
+            active_vss,
+            active_vss_size,
+            pairs.data(),
+            pairs.capacity(),
+            pair_count,
+            overflow,
+            false,
+            fixed_discover_blocks,
+            shape_dispatch);
+          cudaDeviceSynchronize();
+          replay_timer.stop();
+          thrust::device_vector<unsigned long long> fingerprint(2, 0);
+          tc_pfxt_pair_fingerprint
+            <<<std::max(1, std::min(4096, ROUNDUPBLOCKS(result.n_pairs, 256))), 256>>>(
+              pairs.data(),
+              result.n_pairs,
+              thrust::raw_pointer_cast(fingerprint.data()));
+          cudaCheckErrors("tc pfxt replay fingerprint failed");
+          thrust::host_vector<unsigned long long> host_fingerprint(fingerprint);
+          return std::tuple{
+            result.n_pairs,
+            host_fingerprint[0],
+            host_fingerprint[1],
+            replay_timer.get_elapsed_time() / 1us};
+        };
+        (void)replay(false);
+        (void)replay(true);
+        const bool scalar_first = ((outer_step + substep_number) & 1) != 0;
+        const auto first_replay = replay(scalar_first);
+        const auto second_replay = replay(!scalar_first);
+        const auto& tc_replay = scalar_first ? second_replay : first_replay;
+        const auto& scalar_replay = scalar_first ? first_replay : second_replay;
+        if (scalar_was_set) setenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY", "1", 1);
+        else unsetenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY");
+        const bool replay_match =
+          std::get<0>(tc_replay) == std::get<0>(scalar_replay)
+          && std::get<1>(tc_replay) == std::get<1>(scalar_replay)
+          && std::get<2>(tc_replay) == std::get<2>(scalar_replay);
+        std::cout << "tc_pfxt_discovery_replay"
+          << " step=" << outer_step
+          << " substep=" << substep_number
+          << " active_sources=" << h_source_local_sources
+          << " pairs=" << std::get<0>(tc_replay)
+          << " tc_us=" << std::get<3>(tc_replay)
+          << " scalar_us=" << std::get<3>(scalar_replay)
+          << " match=" << (replay_match ? 1 : 0)
+          << '\n';
+        if (!replay_match) {
+          throw std::runtime_error("tc/scalar discovery replay mismatch");
+        }
+      }
+      if (profile_vss_descriptors || replay_vss_descriptors) {
+        const bool scalar_was_set =
+          std::getenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY") != nullptr;
+        unsetenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY");
+        const auto descriptor_discovery =
+          tc_pfxt_discover_pair_count_for_current_v(
+            n_nodes,
+            bvss,
+            thrust::raw_pointer_cast(source_local_active_sources.data()),
+            h_source_local_sources,
+            frontier,
+            active_vss,
+            active_vss_size,
+            pairs.data(),
+            pairs.capacity(),
+            pair_count,
+            overflow,
+            false,
+            fixed_discover_blocks,
+            shape_dispatch);
+        if (scalar_was_set) setenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY", "1", 1);
+        if (profile_vss_descriptors) {
+          profile_tc_pfxt_vss_descriptor_density
+            <<<std::max(1, fixed_discover_blocks), 256>>>(
+              thrust::raw_pointer_cast(bvss.virtual_to_real.data()),
+              thrust::raw_pointer_cast(bvss.row_ids.data()),
+              thrust::raw_pointer_cast(bvss.masks.data()),
+              thrust::raw_pointer_cast(frontier.data()),
+              thrust::raw_pointer_cast(active_vss.data()),
+              thrust::raw_pointer_cast(active_vss_size.data()),
+              n_nodes,
+              thrust::raw_pointer_cast(vss_descriptor_stats.data()));
+          cudaCheckErrors("tc pfxt VSS descriptor density profile failed");
+          vss_descriptor_expected_pairs += descriptor_discovery.n_pairs;
+        }
+        if (replay_vss_descriptors) {
+          auto run_pair_replay = [&]() {
+            thrust::fill(pair_count.begin(), pair_count.end(), 0);
+            thrust::fill(overflow.begin(), overflow.end(), 0);
+            thrust::fill(
+              vss_replay_pair_fingerprint.begin(),
+              vss_replay_pair_fingerprint.end(),
+              0ULL);
+            Timer timer;
+            timer.start();
+            tc_pfxt::tc_transposed_adev_discover_pairs
+              <<<std::max(1, fixed_discover_blocks), 256>>>(
+                thrust::raw_pointer_cast(bvss.virtual_to_real.data()),
+                thrust::raw_pointer_cast(bvss.slice_counts.data()),
+                thrust::raw_pointer_cast(bvss.row_ids.data()),
+                thrust::raw_pointer_cast(bvss.masks.data()),
+                thrust::raw_pointer_cast(frontier.data()),
+                thrust::raw_pointer_cast(active_vss.data()),
+                thrust::raw_pointer_cast(active_vss_size.data()),
+                pairs.data(),
+                thrust::raw_pointer_cast(pair_count.data()),
+                thrust::raw_pointer_cast(overflow.data()),
+                pairs.capacity(),
+                n_nodes,
+                shape_dispatch);
+            tc_pfxt_pair_fingerprint_dynamic
+              <<<4096, 256>>>(
+                pairs.data(),
+                thrust::raw_pointer_cast(pair_count.data()),
+                thrust::raw_pointer_cast(vss_replay_pair_fingerprint.data()));
+            cudaCheckErrors("tc pfxt pair replay failed");
+            cudaDeviceSynchronize();
+            timer.stop();
+            const thrust::host_vector<unsigned long long> fingerprint(
+              vss_replay_pair_fingerprint);
+            return std::pair{timer.get_elapsed_time() / 1us, fingerprint};
+          };
+          auto run_descriptor_replay = [&]() {
+            thrust::fill(vss_descriptor_count.begin(), vss_descriptor_count.end(), 0);
+            thrust::fill(overflow.begin(), overflow.end(), 0);
+            thrust::fill(
+              vss_replay_descriptor_fingerprint.begin(),
+              vss_replay_descriptor_fingerprint.end(),
+              0ULL);
+            Timer timer;
+            timer.start();
+            tc_pfxt_emit_vss_descriptors
+              <<<std::max(1, fixed_discover_blocks), 256>>>(
+                thrust::raw_pointer_cast(bvss.virtual_to_real.data()),
+                thrust::raw_pointer_cast(bvss.slice_counts.data()),
+                thrust::raw_pointer_cast(bvss.masks.data()),
+                thrust::raw_pointer_cast(frontier.data()),
+                thrust::raw_pointer_cast(active_vss.data()),
+                thrust::raw_pointer_cast(active_vss_size.data()),
+                thrust::raw_pointer_cast(vss_descriptors.data()),
+                thrust::raw_pointer_cast(vss_descriptor_count.data()),
+                vss_descriptors.size(),
+                thrust::raw_pointer_cast(overflow.data()),
+                shape_dispatch);
+            tc_pfxt_consume_vss_descriptors_fingerprint
+              <<<std::max(1, fixed_discover_blocks), 256>>>(
+                thrust::raw_pointer_cast(vss_descriptors.data()),
+                thrust::raw_pointer_cast(vss_descriptor_count.data()),
+                thrust::raw_pointer_cast(bvss.virtual_to_real.data()),
+                thrust::raw_pointer_cast(bvss.row_ids.data()),
+                thrust::raw_pointer_cast(bvss.masks.data()),
+                n_nodes,
+                thrust::raw_pointer_cast(
+                  vss_replay_descriptor_fingerprint.data()));
+            cudaCheckErrors("tc pfxt descriptor replay failed");
+            cudaDeviceSynchronize();
+            timer.stop();
+            const thrust::host_vector<unsigned long long> fingerprint(
+              vss_replay_descriptor_fingerprint);
+            return std::pair{timer.get_elapsed_time() / 1us, fingerprint};
+          };
+          const bool descriptor_first = ((outer_step + substep_number) & 1) != 0;
+          const auto first = descriptor_first
+            ? run_descriptor_replay() : run_pair_replay();
+          const auto second = descriptor_first
+            ? run_pair_replay() : run_descriptor_replay();
+          const auto& pair_result = descriptor_first ? second : first;
+          const auto& descriptor_result = descriptor_first ? first : second;
+          const bool match =
+            pair_result.second[0] == descriptor_result.second[0]
+            && pair_result.second[1] == descriptor_result.second[1]
+            && pair_result.second[2] == descriptor_result.second[2]
+            && pair_result.second[0] ==
+              static_cast<unsigned long long>(descriptor_discovery.n_pairs);
+          if (!match) {
+            throw std::runtime_error(
+              "TC-PFXT VSS descriptor replay fingerprint mismatch");
+          }
+          vss_replay_pair_us += pair_result.first;
+          vss_replay_descriptor_us += descriptor_result.first;
+          vss_replay_pairs += pair_result.second[0];
+          ++vss_replay_substeps;
+        }
+      }
+      if (profile_cross_frontier_reuse) {
+        const bool scalar_was_set =
+          std::getenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY") != nullptr;
+        unsetenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY");
+        const auto profile_discovery = tc_pfxt_discover_pair_count_for_current_v(
+          n_nodes,
+          bvss,
+          thrust::raw_pointer_cast(source_local_active_sources.data()),
+          h_source_local_sources,
+          frontier,
+          active_vss,
+          active_vss_size,
+          pairs.data(),
+          pairs.capacity(),
+          pair_count,
+          overflow,
+          false,
+          fixed_discover_blocks,
+          shape_dispatch);
+        if (scalar_was_set) setenv("GPUCPG_TC_PFXT_SCALAR_DISCOVERY", "1", 1);
+        cross_frontier_interval_pairs.resize(bvss.n_intervals);
+        thrust::fill(
+          cross_frontier_interval_pairs.begin(),
+          cross_frontier_interval_pairs.end(),
+          0ULL);
+        tc_pfxt_pair_interval_histogram
+          <<<std::max(1, std::min(4096,
+               ROUNDUPBLOCKS(profile_discovery.n_pairs, 256))), 256>>>(
+            pairs.data(),
+            profile_discovery.n_pairs,
+            bvss.n_intervals,
+            thrust::raw_pointer_cast(cross_frontier_interval_pairs.data()));
+        cudaCheckErrors("tc pfxt cross-frontier interval histogram failed");
+        const thrust::host_vector<unsigned long long> h_interval_pairs(
+          cross_frontier_interval_pairs);
+        std::vector<std::pair<int, unsigned long long>> depth_pairs;
+        unsigned long long histogram_pairs = 0;
+        for (int interval = 0; interval < bvss.n_intervals; ++interval) {
+          const auto count = h_interval_pairs[interval];
+          if (count != 0) depth_pairs.emplace_back(interval, count);
+          histogram_pairs += count;
+        }
+        if (histogram_pairs != static_cast<unsigned long long>(
+              profile_discovery.n_pairs)) {
+          std::cerr << "tc_pfxt_cross_frontier_mismatch"
+            << " step=" << outer_step
+            << " substep=" << substep_number
+            << " histogram_pairs=" << histogram_pairs
+            << " discovery_pairs=" << profile_discovery.n_pairs
+            << std::endl;
+          throw std::runtime_error(
+            "TC-PFXT cross-frontier interval histogram mismatch");
+        }
+        cross_frontier_depth_pairs.push_back(std::move(depth_pairs));
+      }
       if (use_source_local_for_window) {
         handled_source_local_substep = true;
         total_pair_count += source_stats.deviation_families;
@@ -9969,7 +10834,7 @@ static void tc_pfxt_expand_window_single_pass(
 			    light_stage_start = light_profiler.begin();
 			    gpucpg_nvtx_push("tc_single_discover_pairs");
 		    const bool try_direct_pair_meta =
-	      direct_pair_meta
+      direct_pair_meta
 	      && !fused_interface_shadow
 	      && !use_source_major_for_window
 	      && !use_compressed_lpq
@@ -10035,6 +10900,7 @@ static void tc_pfxt_expand_window_single_pass(
 	      step_timing.max_active_vss = std::max(
 	        step_timing.max_active_vss, discovery.n_active_vss);
 	    }
+      ++step_timing.bvss_mma_discovery_substeps;
 		    n_pairs = discovery.n_pairs;
 	    if (n_pairs > 0) {
 	      auto detail_start = light_profiler.begin();
@@ -10690,6 +11556,112 @@ static void tc_pfxt_expand_window_single_pass(
               use_compact_source_groups,
 	              thrust::raw_pointer_cast(source_local_tiles.data()));
 	          cudaCheckErrors("tc pfxt source-local fill tile descriptors failed");
+          if (profile_tf32_mma_classification) {
+            thrust::device_vector<unsigned long long> scalar_class_stats(4, 0ULL);
+            const auto scalar_class_start = std::chrono::steady_clock::now();
+            profile_tc_pfxt_scalar_tile_classification
+              <<<h_n_tiles, 32>>>(
+                h_n_tiles,
+                thrust::raw_pointer_cast(source_local_tiles.data()),
+                thrust::raw_pointer_cast(source_local_active_sources.data()),
+                active_group_offsets,
+                thrust::raw_pointer_cast(path_indices.data()),
+                source_local_dev_offsets,
+                source_local_dev_deltas,
+                source_local_dev_reachable,
+                thrust::raw_pointer_cast(short_pile.data()),
+                window_start,
+                split,
+                final_split,
+                use_final_split,
+                !fill_longs,
+                use_compact_source_groups,
+                thrust::raw_pointer_cast(scalar_class_stats.data()));
+            cudaCheckErrors("tc pfxt scalar classification profile failed");
+            const thrust::host_vector<unsigned long long> h_scalar_class_stats(
+              scalar_class_stats);
+            const auto scalar_class_us = std::chrono::duration<double, std::micro>(
+              std::chrono::steady_clock::now() - scalar_class_start).count();
+            thrust::device_vector<unsigned long long> tf32_mma_stats(8, 0ULL);
+            const auto tf32_mma_start = std::chrono::steady_clock::now();
+            profile_tc_pfxt_tf32_mma_tile_classification<true>
+              <<<h_n_tiles, 32>>>(
+                h_n_tiles,
+                thrust::raw_pointer_cast(source_local_tiles.data()),
+                thrust::raw_pointer_cast(source_local_active_sources.data()),
+                active_group_offsets,
+                thrust::raw_pointer_cast(path_indices.data()),
+                source_local_dev_offsets,
+                source_local_dev_deltas,
+                source_local_dev_reachable,
+                thrust::raw_pointer_cast(short_pile.data()),
+                window_start,
+                split,
+                final_split,
+                use_final_split,
+                !fill_longs,
+                use_compact_source_groups,
+                thrust::raw_pointer_cast(tf32_mma_stats.data()));
+            cudaCheckErrors("tc pfxt TF32 MMA classification profile failed");
+            const thrust::host_vector<unsigned long long> h_tf32_mma_stats(
+              tf32_mma_stats);
+            const auto tf32_mma_us = std::chrono::duration<double, std::micro>(
+              std::chrono::steady_clock::now() - tf32_mma_start).count();
+            thrust::device_vector<unsigned long long> tf32_prod_stats(8, 0ULL);
+            const auto tf32_prod_start = std::chrono::steady_clock::now();
+            profile_tc_pfxt_tf32_mma_tile_classification<false>
+              <<<h_n_tiles, 32>>>(
+                h_n_tiles,
+                thrust::raw_pointer_cast(source_local_tiles.data()),
+                thrust::raw_pointer_cast(source_local_active_sources.data()),
+                active_group_offsets,
+                thrust::raw_pointer_cast(path_indices.data()),
+                source_local_dev_offsets,
+                source_local_dev_deltas,
+                source_local_dev_reachable,
+                thrust::raw_pointer_cast(short_pile.data()),
+                window_start,
+                split,
+                final_split,
+                use_final_split,
+                !fill_longs,
+                use_compact_source_groups,
+                thrust::raw_pointer_cast(tf32_prod_stats.data()));
+            cudaCheckErrors("tc pfxt production TF32 classification profile failed");
+            const thrust::host_vector<unsigned long long> h_tf32_prod_stats(
+              tf32_prod_stats);
+            const auto tf32_prod_us = std::chrono::duration<double, std::micro>(
+              std::chrono::steady_clock::now() - tf32_prod_start).count();
+            std::cout << "tc_pfxt_tf32_mma_classification"
+              << " tiles=" << h_n_tiles
+              << " reachable=" << h_tf32_mma_stats[0]
+              << " safe=" << h_tf32_mma_stats[1]
+              << " fallback=" << h_tf32_mma_stats[2]
+              << " raw_mismatches=" << h_tf32_mma_stats[3]
+              << " post_fallback_mismatches=" << h_tf32_mma_stats[4]
+              << " short=" << h_tf32_mma_stats[5]
+              << " long=" << h_tf32_mma_stats[6]
+              << " skip=" << h_tf32_mma_stats[7]
+              << " scalar_ms=" << scalar_class_us / 1000.0
+              << " prod_ms=" << tf32_prod_us / 1000.0
+              << " elapsed_ms=" << tf32_mma_us / 1000.0
+              << std::endl;
+            if (h_scalar_class_stats[0] != h_tf32_mma_stats[0]
+                || h_scalar_class_stats[1] != h_tf32_mma_stats[5]
+                || h_scalar_class_stats[2] != h_tf32_mma_stats[6]
+                || h_scalar_class_stats[0] != h_tf32_prod_stats[0]
+                || h_scalar_class_stats[1] != h_tf32_prod_stats[5]
+                || h_scalar_class_stats[2] != h_tf32_prod_stats[6]
+                || h_scalar_class_stats[3] != h_tf32_prod_stats[7]
+                || h_scalar_class_stats[3] != h_tf32_mma_stats[7]) {
+              throw std::runtime_error(
+                "TC-PFXT scalar/TF32 MMA classification count mismatch");
+            }
+            if (h_tf32_mma_stats[4] != 0) {
+              throw std::runtime_error(
+                "TC-PFXT TF32 MMA classification fallback mismatch");
+            }
+          }
 	          if (tile_resident_lpq_cheap_shadow_requested) {
             const auto cheap_shadow_start = std::chrono::steady_clock::now();
             build_source_local_tile_bounds();
@@ -10788,7 +11760,7 @@ static void tc_pfxt_expand_window_single_pass(
             step_timing.tile_resident_shadow_all_skip_mismatches += h_shadow_stats[17];
           }
           if (profile_source_local_tile_filter) {
-            source_local_filter_stats.resize(58);
+            source_local_filter_stats.resize(64);
             thrust::fill(
               source_local_filter_stats.begin(),
               source_local_filter_stats.end(),
@@ -10823,6 +11795,15 @@ static void tc_pfxt_expand_window_single_pass(
             step_timing.source_local_filter_products += h_filter_stats[5];
             step_timing.source_local_filter_admit_products += h_filter_stats[6];
             step_timing.source_local_filter_skip_products += h_filter_stats[7];
+            std::cout << "tc_pfxt_tf32_score_oracle"
+              << " reachable=" << h_filter_stats[58]
+              << " raw_mismatches=" << h_filter_stats[59]
+              << " safe=" << h_filter_stats[60]
+              << " fallback=" << h_filter_stats[61]
+              << " post_fallback_mismatches=" << h_filter_stats[62]
+              << " max_abs_error="
+              << std::bit_cast<float>(static_cast<unsigned int>(h_filter_stats[63]))
+              << std::endl;
             static constexpr const char* oracle_bins[] = {
               "lt1k", "1k_10k", "10k_100k", "100k_1m", "ge1m"};
             for (int bin = 0; bin < 5; ++bin) {
@@ -10992,48 +11973,114 @@ static void tc_pfxt_expand_window_single_pass(
             if (source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion) {
               build_source_local_tile_bounds();
             }
-            auto launch_tile_native_fill = [&]() {
-              fill_tc_pfxt_source_local_tile_short_candidates_direct
-                <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
-                h_n_tiles,
-                thrust::raw_pointer_cast(source_local_tiles.data()),
-                thrust::raw_pointer_cast(source_local_active_sources.data()),
-                active_group_offsets,
-                thrust::raw_pointer_cast(path_indices.data()),
-                source_local_dev_offsets,
-                source_local_dev_dsts,
-                source_local_dev_deltas,
-                source_local_dev_reachable,
-                thrust::raw_pointer_cast(short_pile.data()),
-                window_start,
-                split,
-                final_split,
-                use_final_split,
-                collect_bound_stats && !source_local_short_tile_bounds_o1,
-                source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion,
-                source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion
-                  ? thrust::raw_pointer_cast(source_local_parent_tile_offsets.data())
-                  : nullptr,
-                source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion
-                  ? thrust::raw_pointer_cast(source_local_dev_tile_offsets.data())
-                  : nullptr,
-                source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion
-                  ? thrust::raw_pointer_cast(source_local_parent_tile_bounds.data())
-                  : nullptr,
-                source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion
-                  ? thrust::raw_pointer_cast(source_local_dev_tile_bounds.data())
-                  : nullptr,
-                source_local_parent_tile,
-                source_local_dev_tile,
-                d_tail_short,
-                short_limit,
+            const bool use_aligned_short_fill = use_aligned_bvss_consumer;
+            if (use_aligned_short_fill) {
+              thrust::fill(frontier.begin(), frontier.end(), 0u);
+              thrust::fill(active_vss_size.begin(), active_vss_size.end(), 0);
+              thrust::fill(vss_descriptor_count.begin(), vss_descriptor_count.end(), 0);
+              tc_pfxt::build_frontier_from_sources
+                <<<std::max(1, ROUNDUPBLOCKS(h_source_local_sources, 256)), 256>>>(
+                  thrust::raw_pointer_cast(source_local_active_sources.data()),
+                  h_source_local_sources,
+                  thrust::raw_pointer_cast(frontier.data()));
+              cudaCheckErrors("tc pfxt aligned build frontier failed");
+              tc_pfxt::build_active_vss_queue_from_frontier
+                <<<std::max(1, ROUNDUPBLOCKS(aligned_bvss.n_intervals, 256)), 256>>>(
+                  thrust::raw_pointer_cast(frontier.data()),
+                  thrust::raw_pointer_cast(aligned_bvss.real_ptrs.data()),
+                  aligned_bvss.n_intervals,
+                  thrust::raw_pointer_cast(active_vss.data()),
+                  thrust::raw_pointer_cast(active_vss_size.data()),
+                  aligned_bvss.n_vss);
+              cudaCheckErrors("tc pfxt aligned active vss queue failed");
+              tc_pfxt_emit_vss_descriptors<<<std::max(1, fixed_discover_blocks), 256>>>(
+                thrust::raw_pointer_cast(aligned_bvss.virtual_to_real.data()),
+                thrust::raw_pointer_cast(aligned_bvss.slice_counts.data()),
+                thrust::raw_pointer_cast(aligned_bvss.masks.data()),
+                thrust::raw_pointer_cast(frontier.data()),
+                thrust::raw_pointer_cast(active_vss.data()),
+                thrust::raw_pointer_cast(active_vss_size.data()),
+                thrust::raw_pointer_cast(vss_descriptors.data()),
+                thrust::raw_pointer_cast(vss_descriptor_count.data()),
+                aligned_bvss.n_vss,
                 thrust::raw_pointer_cast(overflow.data()),
-                collect_bound_stats
-                  ? thrust::raw_pointer_cast(source_local_bound_stats.data())
-                  : nullptr,
-                use_compact_source_groups,
-                thrust::raw_pointer_cast(source_local_class_counts.data()));
-              cudaCheckErrors("tc pfxt source-local tile-native short fill failed");
+                shape_dispatch);
+              cudaCheckErrors("tc pfxt aligned emit descriptors failed");
+              ++step_timing.bvss_mma_discovery_substeps;
+            }
+            auto launch_tile_native_fill = [&]() {
+              if (use_aligned_short_fill) {
+                fill_tc_pfxt_aligned_vss_short_candidates
+                  <<<4096, 256>>>(
+                    thrust::raw_pointer_cast(vss_descriptors.data()),
+                    thrust::raw_pointer_cast(vss_descriptor_count.data()),
+                    thrust::raw_pointer_cast(aligned_bvss.virtual_to_real.data()),
+                    thrust::raw_pointer_cast(aligned_bvss.row_ids.data()),
+                    thrust::raw_pointer_cast(aligned_bvss.masks.data()),
+                    n_nodes,
+                    static_cast<int>(compact_static_devs.dsts.size()),
+                    thrust::raw_pointer_cast(compact_static_devs.dsts.data()),
+                    thrust::raw_pointer_cast(compact_static_devs.deltas.data()),
+                    use_compact_source_groups
+                      ? thrust::raw_pointer_cast(source_local_slots.data())
+                      : nullptr,
+                    active_group_offsets,
+                    thrust::raw_pointer_cast(path_indices.data()),
+                    thrust::raw_pointer_cast(short_pile.data()),
+                    window_start,
+                    split,
+                    final_split,
+                    use_final_split,
+                    use_compact_source_groups,
+                    d_tail_short,
+                    short_limit,
+                    thrust::raw_pointer_cast(overflow.data()),
+                    thrust::raw_pointer_cast(source_local_class_counts.data()));
+                cudaCheckErrors("tc pfxt aligned descriptor short fill failed");
+              }
+              else {
+                fill_tc_pfxt_source_local_tile_short_candidates_direct
+                  <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
+                    h_n_tiles,
+                    thrust::raw_pointer_cast(source_local_tiles.data()),
+                    thrust::raw_pointer_cast(source_local_active_sources.data()),
+                    active_group_offsets,
+                    thrust::raw_pointer_cast(path_indices.data()),
+                    source_local_dev_offsets,
+                    source_local_dev_dsts,
+                    source_local_dev_deltas,
+                    source_local_dev_reachable,
+                    thrust::raw_pointer_cast(short_pile.data()),
+                    window_start,
+                    split,
+                    final_split,
+                    use_final_split,
+                    collect_bound_stats && !source_local_short_tile_bounds_o1,
+                    source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion,
+                    source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion
+                      ? thrust::raw_pointer_cast(source_local_parent_tile_offsets.data())
+                      : nullptr,
+                    source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion
+                      ? thrust::raw_pointer_cast(source_local_dev_tile_offsets.data())
+                      : nullptr,
+                    source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion
+                      ? thrust::raw_pointer_cast(source_local_parent_tile_bounds.data())
+                      : nullptr,
+                    source_local_short_tile_bounds_o1 && !use_tile_handoff_fusion
+                      ? thrust::raw_pointer_cast(source_local_dev_tile_bounds.data())
+                      : nullptr,
+                    source_local_parent_tile,
+                    source_local_dev_tile,
+                    d_tail_short,
+                    short_limit,
+                    thrust::raw_pointer_cast(overflow.data()),
+                    collect_bound_stats
+                      ? thrust::raw_pointer_cast(source_local_bound_stats.data())
+                      : nullptr,
+                    use_compact_source_groups,
+                    thrust::raw_pointer_cast(source_local_class_counts.data()));
+                cudaCheckErrors("tc pfxt source-local tile-native short fill failed");
+              }
             };
             launch_tile_native_fill();
 
@@ -11762,9 +12809,53 @@ static void tc_pfxt_expand_window_single_pass(
           }
           light_profiler.end_candidate_count(count_detail_start);
         }
-        const int short_limit = fill_longs
+        else {
+          // Once long outputs are no longer needed, the number of surviving
+          // short candidates can be much larger than short_pile.capacity().
+          // Count the exact output instead of treating the existing reserve as
+          // a hard limit. Truncating here is not correct: all short candidates
+          // must remain available to the subsequent top-k selection.
+          auto count_detail_start = light_profiler.begin();
+          pair_candidate_counts.resize(n_pairs);
+          count_tc_pfxt_pair_meta_candidates_single_pass
+            <<<std::max(1, ROUNDUPBLOCKS(n_pairs, 256)), 256>>>(
+              pair_meta.data(),
+              n_pairs,
+              thrust::raw_pointer_cast(group_offsets.data()),
+              thrust::raw_pointer_cast(path_indices.data()),
+              thrust::raw_pointer_cast(short_pile.data()),
+              window_start,
+              nullptr,
+              nullptr,
+              d_dists_cache,
+              split,
+              final_split,
+              use_final_split,
+              true,
+              thrust::raw_pointer_cast(pair_candidate_counts.data()));
+          cudaCheckErrors("tc pfxt single-work exact short count failed");
+          const auto exact_short_slots = thrust::transform_reduce(
+            pair_candidate_counts.begin(),
+            pair_candidate_counts.end(),
+            [] __host__ __device__ (const tc_pfxt::CandidateCounts counts) {
+              return static_cast<std::uint64_t>(counts.short_count);
+            },
+            std::uint64_t{0},
+            thrust::plus<std::uint64_t>{});
+          if (exact_short_slots > static_cast<std::uint64_t>(
+                std::numeric_limits<int>::max() - base_short)) {
+            throw std::runtime_error(
+              "tc pfxt single-work short candidate count exceeds index range");
+          }
+          candidate_slots = static_cast<int>(exact_short_slots);
+          light_profiler.end_candidate_count(count_detail_start);
+        }
+        int short_limit = fill_longs
           ? base_short + candidate_slots
-          : static_cast<int>(short_pile.capacity());
+          : base_short + candidate_slots;
+        if (!fill_longs && short_limit <= std::numeric_limits<int>::max() - 4096) {
+          short_limit += 4096;
+        }
         auto resize_detail_start = light_profiler.begin();
         short_pile.resize(short_limit);
         if (fill_longs && candidate_slots > 0) {
@@ -11811,6 +12902,10 @@ static void tc_pfxt_expand_window_single_pass(
         cudaCheckErrors("tc pfxt single-work copy tails failed");
         thrust::host_vector<int> h_overflow(overflow);
         if (h_overflow[0] != 0) {
+          std::cerr << "tc_pfxt_single_work_overflow_detail"
+            << " base_short=" << base_short
+            << " short_limit=" << short_limit
+            << " observed_short_tail=" << h_tail_short << '\n';
           throw std::runtime_error("tc pfxt single-work candidate output overflow");
         }
 
@@ -12287,6 +13382,129 @@ static void tc_pfxt_expand_window_single_pass(
     gpucpg_nvtx_pop();
   }
 
+  if (replay_vss_descriptors) {
+    std::cout << "tc_pfxt_vss_descriptor_replay"
+      << " step=" << outer_step
+      << " substeps=" << vss_replay_substeps
+      << " pairs=" << vss_replay_pairs
+      << " pair_ms=" << vss_replay_pair_us / 1000.0
+      << " descriptor_ms=" << vss_replay_descriptor_us / 1000.0
+      << " speedup="
+      << (vss_replay_descriptor_us == 0.0
+            ? 0.0
+            : vss_replay_pair_us / vss_replay_descriptor_us)
+      << std::endl;
+  }
+  if (profile_vss_descriptors) {
+    const thrust::host_vector<unsigned long long> h_stats(vss_descriptor_stats);
+    if (h_stats[2] != vss_descriptor_expected_pairs) {
+      std::cerr << "tc_pfxt_vss_descriptor_mismatch"
+        << " step=" << outer_step
+        << " descriptor_pairs=" << h_stats[2]
+        << " discovery_pairs=" << vss_descriptor_expected_pairs
+        << std::endl;
+      throw std::runtime_error(
+        "TC-PFXT VSS descriptor pair-count mismatch");
+    }
+    const double pair_denominator = h_stats[2] == 0 ? 1.0 : h_stats[2];
+    const double descriptor_denominator = h_stats[1] == 0 ? 1.0 : h_stats[1];
+    const unsigned long long raw_pair_bytes = h_stats[2] * sizeof(int2);
+    const unsigned long long descriptor_bytes = h_stats[1] * 8ULL;
+    std::cout << "tc_pfxt_vss_descriptor_profile"
+      << " step=" << outer_step
+      << " active_vss=" << h_stats[0]
+      << " nonempty_vss=" << h_stats[1]
+      << " pairs=" << h_stats[2]
+      << " pairs_per_descriptor=" << h_stats[2] / descriptor_denominator
+      << " pair_fraction_ge4=" << h_stats[3] / pair_denominator
+      << " pair_fraction_ge8=" << h_stats[4] / pair_denominator
+      << " raw_pair_bytes=" << raw_pair_bytes
+      << " descriptor_bytes=" << descriptor_bytes
+      << " byte_reduction="
+      << (descriptor_bytes == 0
+            ? 0.0
+            : static_cast<double>(raw_pair_bytes) / descriptor_bytes)
+      << " vss_empty=" << h_stats[5]
+      << " vss_h1=" << h_stats[6]
+      << " vss_h2=" << h_stats[7]
+      << " vss_h3=" << h_stats[8]
+      << " vss_h4_7=" << h_stats[9]
+      << " vss_h8_15=" << h_stats[10]
+      << " vss_h16plus=" << h_stats[11]
+      << std::endl;
+  }
+  if (profile_cross_frontier_reuse) {
+    std::vector<int> interval_occurrences(bvss.n_intervals, 0);
+    std::vector<unsigned long long> interval_pair_totals(bvss.n_intervals, 0ULL);
+    unsigned long long total_pairs = 0;
+    unsigned long long total_interval_occurrences = 0;
+    for (const auto& depth : cross_frontier_depth_pairs) {
+      for (const auto& [interval, pairs_at_depth] : depth) {
+        ++interval_occurrences[interval];
+        interval_pair_totals[interval] += pairs_at_depth;
+        total_pairs += pairs_at_depth;
+        ++total_interval_occurrences;
+      }
+    }
+    const thrust::host_vector<int> h_real_ptrs(bvss.real_ptrs);
+    unsigned long long pairs_ge2 = 0;
+    unsigned long long pairs_ge4 = 0;
+    unsigned long long pairs_ge8 = 0;
+    unsigned long long vss_instances = 0;
+    unsigned long long vss_instances_ge4 = 0;
+    unsigned long long batch_histogram[9] {};
+    unsigned long long ideal_batches8 = 0;
+    int unique_intervals = 0;
+    int max_depth_reuse = 0;
+    for (int interval = 0; interval < bvss.n_intervals; ++interval) {
+      const int occurrences = interval_occurrences[interval];
+      if (occurrences == 0) continue;
+      ++unique_intervals;
+      max_depth_reuse = std::max(max_depth_reuse, occurrences);
+      if (occurrences >= 2) pairs_ge2 += interval_pair_totals[interval];
+      if (occurrences >= 4) pairs_ge4 += interval_pair_totals[interval];
+      if (occurrences >= 8) pairs_ge8 += interval_pair_totals[interval];
+      const unsigned long long vss_per_depth =
+        static_cast<unsigned long long>(
+          h_real_ptrs[interval + 1] - h_real_ptrs[interval]);
+      vss_instances += vss_per_depth * occurrences;
+      if (occurrences >= 4) {
+        vss_instances_ge4 += vss_per_depth * occurrences;
+      }
+      const int groups = (occurrences + 7) / 8;
+      ideal_batches8 += groups;
+      const int base_width = occurrences / groups;
+      const int wider_groups = occurrences % groups;
+      batch_histogram[base_width] += groups - wider_groups;
+      if (wider_groups != 0) batch_histogram[base_width + 1] += wider_groups;
+    }
+    const double pair_denominator = total_pairs == 0 ? 1.0 : total_pairs;
+    const double vss_denominator = vss_instances == 0 ? 1.0 : vss_instances;
+    const double effective_width = ideal_batches8 == 0
+      ? 0.0
+      : static_cast<double>(total_interval_occurrences) / ideal_batches8;
+    std::cout << "tc_pfxt_cross_frontier_profile"
+      << " step=" << outer_step
+      << " depths=" << cross_frontier_depth_pairs.size()
+      << " unique_intervals=" << unique_intervals
+      << " interval_occurrences=" << total_interval_occurrences
+      << " max_depth_reuse=" << max_depth_reuse
+      << " pairs=" << total_pairs
+      << " pairs_ge2=" << pairs_ge2
+      << " pairs_ge4=" << pairs_ge4
+      << " pairs_ge8=" << pairs_ge8
+      << " pair_fraction_ge2=" << pairs_ge2 / pair_denominator
+      << " pair_fraction_ge4=" << pairs_ge4 / pair_denominator
+      << " pair_fraction_ge8=" << pairs_ge8 / pair_denominator
+      << " vss_instances=" << vss_instances
+      << " vss_fraction_ge4=" << vss_instances_ge4 / vss_denominator
+      << " ideal_batches8=" << ideal_batches8
+      << " effective_width8=" << effective_width;
+    for (int width = 1; width <= 8; ++width) {
+      std::cout << " batches_w" << width << "=" << batch_histogram[width];
+    }
+    std::cout << std::endl;
+  }
   step_timing.max_chain_substeps = std::max(step_timing.max_chain_substeps, chain_substep);
   step_timing.sfx_chain_walk_steps += sfx_chain_walk_steps;
   light_profiler.add_to(step_timing);
@@ -14015,6 +15233,8 @@ void CpGen::report_paths(
     std::getenv("GPUCPG_TC_PFXT_TILE_RESIDENT_LPQ_CHEAP_SHADOW") != nullptr;
   const bool enable_tc_pfxt_compact_static_devs =
     std::getenv("GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS") != nullptr;
+  const bool enable_tc_pfxt_aligned_bvss =
+    std::getenv("GPUCPG_TC_PFXT_ALIGNED_BVSS") != nullptr;
   const bool enable_tc_pfxt_compact_source_groups =
     std::getenv("GPUCPG_TC_PFXT_COMPACT_SOURCE_GROUPS") != nullptr;
   const int tc_pfxt_single_pass_fallback_long_pile =
@@ -14043,6 +15263,10 @@ void CpGen::report_paths(
     short_pile.reserve(short_capacity);
     std::cout << "tc_pfxt_short_pile_reserved=" << short_capacity << '\n';
     std::cout << "tc_pfxt_max_pairs=" << tc_pfxt_max_pairs << '\n';
+    std::cout << "tc_pfxt_requested_execution_path="
+      << (enable_tc_pfxt_source_local_candidate
+        ? "source_local_cuda (BVSS discovery may be bypassed)"
+        : "bvss_tensor_core") << '\n';
     std::cout << "tc_pfxt_fusion=" << (enable_tc_pfxt_fusion ? 1 : 0)
       << ", active_check_interval=" << tc_pfxt_active_check_interval
       << ", discover_blocks=" << tc_pfxt_discover_blocks
@@ -14561,12 +15785,14 @@ void CpGen::report_paths(
 	    const std::string pfxt_cand_dump_dir =
 	        pfxt_cand_dump_dir_env ? pfxt_cand_dump_dir_env : "";
 		    TcPfxtDeviceBvss local_tc_pfxt_bvss;
+        TcPfxtDeviceBvss local_tc_pfxt_aligned_bvss;
         TcPfxtDeviceStaticDeviationCsr local_tc_pfxt_static_devs;
         TcPfxtDeviceCompactStaticDeviationCsr local_tc_pfxt_compact_static_devs;
         const bool tc_pfxt_need_compact_static_devs =
-          enable_tc_pfxt_compact_static_devs
+          (enable_tc_pfxt_compact_static_devs || enable_tc_pfxt_aligned_bvss)
           && (enable_tc_pfxt_source_local_profile
-            || enable_tc_pfxt_source_local_candidate);
+            || enable_tc_pfxt_source_local_candidate
+            || enable_tc_pfxt_aligned_bvss);
         const bool tc_pfxt_use_static_cache =
           tc_pfxt_static_cache_supported
           && _tc_pfxt_static_cache
@@ -14576,6 +15802,10 @@ void CpGen::report_paths(
           tc_pfxt_use_static_cache
             ? _tc_pfxt_static_cache->bvss
             : local_tc_pfxt_bvss;
+        auto& tc_pfxt_aligned_bvss =
+          tc_pfxt_use_static_cache
+            ? _tc_pfxt_static_cache->aligned_bvss
+            : local_tc_pfxt_aligned_bvss;
         auto& tc_pfxt_static_devs = local_tc_pfxt_static_devs;
         auto& tc_pfxt_compact_static_devs =
           tc_pfxt_use_static_cache
@@ -14583,9 +15813,10 @@ void CpGen::report_paths(
             : local_tc_pfxt_compact_static_devs;
 		    TcPfxtScratch tc_pfxt_scratch;
 		    if (enable_tc_pfxt) {
-		      std::cout << "TC PFXT enabled.\n";
           const bool tc_pfxt_static_hit =
             tc_pfxt_use_static_cache
+            && (!enable_tc_pfxt_aligned_bvss
+              || _tc_pfxt_static_cache->aligned_bvss_valid)
             && _tc_pfxt_static_cache->can_reuse_tc_static(
               N,
               M,
@@ -14623,9 +15854,10 @@ void CpGen::report_paths(
           if (tc_pfxt_use_static_cache) {
             _tc_pfxt_static_cache->bvss_valid = true;
           }
-          if (enable_tc_pfxt_compact_static_devs
+          if ((enable_tc_pfxt_compact_static_devs || enable_tc_pfxt_aligned_bvss)
               && (enable_tc_pfxt_source_local_profile
-                || enable_tc_pfxt_source_local_candidate)) {
+                || enable_tc_pfxt_source_local_candidate
+                || enable_tc_pfxt_aligned_bvss)) {
             const auto h_compact_devs = tc_pfxt::build_compact_static_deviation_csr(
               N,
               _h_fanout_adjp,
@@ -14636,6 +15868,25 @@ void CpGen::report_paths(
             tc_pfxt_compact_static_devs.offsets = h_compact_devs.offsets;
             tc_pfxt_compact_static_devs.dsts = h_compact_devs.dsts;
             tc_pfxt_compact_static_devs.deltas = h_compact_devs.deltas;
+            if (enable_tc_pfxt_aligned_bvss) {
+              const auto h_aligned_bvss =
+                tc_pfxt::build_adev_bvss_from_compact_deviation_offsets(
+                  N, h_compact_devs.offsets, 8);
+              tc_pfxt_aligned_bvss.real_ptrs = h_aligned_bvss.real_ptrs;
+              tc_pfxt_aligned_bvss.virtual_to_real = h_aligned_bvss.virtual_to_real;
+              tc_pfxt_aligned_bvss.slice_counts = h_aligned_bvss.slice_counts;
+              tc_pfxt_aligned_bvss.row_ids = h_aligned_bvss.row_ids;
+              tc_pfxt_aligned_bvss.masks = h_aligned_bvss.masks;
+              tc_pfxt_aligned_bvss.n_intervals = h_aligned_bvss.n_intervals;
+              tc_pfxt_aligned_bvss.n_vss = h_aligned_bvss.n_vss;
+              std::cout << "tc_pfxt_aligned_bvss_n_vss="
+                << h_aligned_bvss.n_vss
+                << ", comp_ratio=" << h_aligned_bvss.compression_ratio()
+                << '\n';
+              if (tc_pfxt_use_static_cache) {
+                _tc_pfxt_static_cache->aligned_bvss_valid = true;
+              }
+            }
             std::cout << "tc_pfxt_compact_static_deviation_edges="
               << h_compact_devs.dsts.size() << '\n';
             if (tc_pfxt_use_static_cache) {
@@ -14776,6 +16027,7 @@ void CpGen::report_paths(
 	    double pfxt_summary_dominant_step_ms{0.0};
 	    int pfxt_summary_dominant_step{0};
 	    int pfxt_summary_dominant_batch_size{0};
+        int pfxt_summary_bvss_mma_discovery_substeps{0};
         int pfxt_summary_sfx_chain_walk_steps{0};
         auto compressed_lpq_min_slack_device = [&]() -> float {
           if (tc_pfxt_scratch.compressed_lpq_families.empty()
@@ -15024,6 +16276,7 @@ void CpGen::report_paths(
 		            tc_pfxt_expand_window_single_pass(
 		              N,
 		              tc_pfxt_bvss,
+                  tc_pfxt_aligned_bvss,
                   tc_pfxt_static_devs,
                   tc_pfxt_compact_static_devs,
 		              d_fanout_adjp,
@@ -15561,6 +16814,8 @@ void CpGen::report_paths(
 	        pfxt_summary_source_local_max_products_per_source = std::max(
 	          pfxt_summary_source_local_max_products_per_source,
 	          curr_step_tc_timing.source_local_max_products_per_source);
+            pfxt_summary_bvss_mma_discovery_substeps +=
+              curr_step_tc_timing.bvss_mma_discovery_substeps;
             pfxt_summary_sfx_chain_walk_steps += curr_step_tc_timing.sfx_chain_walk_steps;
 	        if (curr_step_breakdown.total > pfxt_summary_dominant_step_ms) {
 	          pfxt_summary_dominant_step_ms = curr_step_breakdown.total;
@@ -15960,6 +17215,14 @@ void CpGen::report_paths(
         << " queue_ms=" << pfxt_summary_queue_ms
         << " advance_sync_ms=" << pfxt_summary_advance_sync_ms
         << " residual_ms=" << pfxt_summary_residual_ms
+        << " execution_path="
+        << (pfxt_summary_bvss_mma_discovery_substeps > 0
+          ? "bvss_tensor_core"
+          : "source_local_cuda")
+        << " bvss_mma_executed="
+        << (pfxt_summary_bvss_mma_discovery_substeps > 0 ? 1 : 0)
+        << " bvss_mma_discovery_substeps="
+        << pfxt_summary_bvss_mma_discovery_substeps
         << " sfx_chain_walk_steps=" << pfxt_summary_sfx_chain_walk_steps
         << '\n';
       const auto conceptual_breakdown =

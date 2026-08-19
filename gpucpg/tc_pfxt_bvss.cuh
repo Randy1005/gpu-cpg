@@ -175,6 +175,56 @@ inline HostBvss build_adev_bvss_from_fanout_csr(
   return out;
 }
 
+inline HostBvss build_adev_bvss_from_compact_deviation_offsets(
+  const int n_nodes,
+  const std::vector<int>& deviation_offsets,
+  const int sigma = 8) {
+  if (sigma != 8) {
+    throw std::invalid_argument(
+      "TC-PFXT aligned A_dev BVSS currently supports sigma=8 only");
+  }
+  if (n_nodes < 0
+      || deviation_offsets.size() != static_cast<std::size_t>(n_nodes + 1)
+      || (!deviation_offsets.empty() && deviation_offsets.front() != 0)) {
+    throw std::invalid_argument("invalid compact deviation offsets");
+  }
+  HostBvss out;
+  out.sigma = sigma;
+  out.slices_per_thread = 32 / sigma;
+  out.slice_capacity = 32 * out.slices_per_thread;
+  out.n_intervals = (n_nodes + sigma - 1) / sigma;
+  out.real_ptrs.assign(out.n_intervals + 1, 0);
+  std::vector<std::vector<std::pair<int, std::uint32_t>>> slices(
+    out.n_intervals);
+  for (int src = 0; src < n_nodes; ++src) {
+    if (deviation_offsets[src] > deviation_offsets[src + 1]) {
+      throw std::invalid_argument("compact deviation offsets must be nondecreasing");
+    }
+    const int interval = src / sigma;
+    const auto source_bit = std::uint32_t{1} << (src % sigma);
+    auto& interval_slices = slices[interval];
+    for (int dev = deviation_offsets[src]; dev < deviation_offsets[src + 1]; ++dev) {
+      interval_slices.emplace_back(dev, source_bit);
+      ++out.unpadded_slices;
+      ++out.total_set_bits;
+    }
+  }
+  for (int interval = 0; interval < out.n_intervals; ++interval) {
+    out.real_ptrs[interval] = out.n_vss;
+    const auto& interval_slices = slices[interval];
+    for (int begin = 0;
+         begin < static_cast<int>(interval_slices.size());
+         begin += out.slice_capacity) {
+      const int end = std::min(
+        begin + out.slice_capacity,
+        static_cast<int>(interval_slices.size()));
+      append_vss(out, interval, interval_slices, begin, end);
+    }
+  }
+  out.real_ptrs[out.n_intervals] = out.n_vss;
+  return out;
+}
+
 inline std::vector<int> decode_row_neighbors(const HostBvss& bvss, const int row) {
   std::vector<int> neighbors;
   constexpr int warp_size = 32;
@@ -186,15 +236,12 @@ inline std::vector<int> decode_row_neighbors(const HostBvss& bvss, const int row
       const auto packed = bvss.masks[mask_base + lane];
       for (int chunk = 0; chunk < bvss.slices_per_thread; ++chunk) {
         const auto row_slot = row_base + lane * bvss.slices_per_thread + chunk;
-        if (bvss.row_ids[row_slot] != row) {
-          continue;
-        }
+        if (bvss.row_ids[row_slot] != row) continue;
         const auto mask = (packed >> (bvss.sigma * chunk)) &
           ((std::uint32_t{1} << bvss.sigma) - 1);
         for (int bit = 0; bit < bvss.sigma; ++bit) {
-          if (mask & (std::uint32_t{1} << bit)) {
+          if (mask & (std::uint32_t{1} << bit))
             neighbors.push_back(interval * bvss.sigma + bit);
-          }
         }
       }
     }
@@ -214,18 +261,14 @@ inline bool verify_adev_bvss_matches_csr(
   for (int src = 0; src < n_nodes; ++src) {
     for (int edge = fanout_row_ptr[src]; edge < fanout_row_ptr[src + 1]; ++edge) {
       const auto dst = fanout_col_idx[edge];
-      if (dst != succs[src]) {
-        expected_by_dst[dst].push_back(src);
-      }
+      if (dst != succs[src]) expected_by_dst[dst].push_back(src);
     }
   }
   for (int row = 0; row < n_nodes; ++row) {
     auto& expected = expected_by_dst[row];
     std::sort(expected.begin(), expected.end());
     expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
-    if (decode_row_neighbors(bvss, row) != expected) {
-      return false;
-    }
+    if (decode_row_neighbors(bvss, row) != expected) return false;
   }
   return true;
 }
@@ -352,6 +395,137 @@ static __global__ void tc_transposed_adev_discover_pairs(
           } else {
             *overflow = 1;
           }
+        }
+        hits &= hits - 1;
+      }
+    }
+  }
+}
+
+// Use MMA popcounts as per-lane output counts, then reserve one contiguous
+// output range per VSS warp instead of issuing one atomic per discovered pair.
+static __global__ void tc_transposed_adev_discover_pairs_counted(
+  const int* virtual_to_real,
+  const unsigned char* slice_counts,
+  const int* row_ids,
+  const unsigned int* masks,
+  const unsigned int* frontier_words,
+  const int* active_vss,
+  const int* active_vss_size,
+  int2* pairs,
+  int* pair_count,
+  int* overflow,
+  const int max_pairs,
+  const int n_nodes,
+  const bool shape_dispatch) {
+  const int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+  const int no_warps = gridDim.x * blockDim.x / 32;
+  const int warp_id = thread_id / 32;
+  const int lane_id = thread_id & 31;
+  const int q_size = *active_vss_size;
+  constexpr unsigned int warp_mask = 0xffffffffu;
+
+  for (int q = warp_id; q < q_size; q += no_warps) {
+    const int vss = active_vss[q];
+    const int interval = virtual_to_real[vss];
+    const unsigned int frontier_byte =
+      (frontier_words[interval >> 2] >> ((interval & 3) * 8)) & 0xffu;
+
+    const unsigned int packed = masks[vss * 32 + lane_id];
+    unsigned int frag_b = 0;
+    const unsigned int res = lane_id % 9;
+    if (res == 0) frag_b = frontier_byte;
+    else if (res == 4) frag_b = frontier_byte << 8;
+
+    unsigned int frag_c[4] {0, 0, 0, 0};
+    unsigned int frag_a = packed & 0x0000ffffu;
+    m8n8k128_tc_pfxt(frag_c, frag_a, frag_b);
+    const bool use_upper_half = !shape_dispatch || slice_counts[vss] > 64;
+    if (use_upper_half) {
+      frag_a = (packed & 0xffff0000u) >> 16;
+      m8n8k128_tc_pfxt(&frag_c[2], frag_a, frag_b);
+    }
+
+    unsigned int lane_hits[4];
+    int lane_dsts[4];
+    int lane_count = 0;
+    #pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+      lane_dsts[chunk] = row_ids[vss * 128 + lane_id * 4 + chunk];
+      lane_hits[chunk] =
+        ((packed >> (chunk * 8)) & 0xffu) & frontier_byte;
+      if (frag_c[chunk] != 0
+          && lane_dsts[chunk] >= 0
+          && lane_dsts[chunk] < n_nodes) {
+        lane_count += static_cast<int>(frag_c[chunk]);
+      } else {
+        lane_hits[chunk] = 0;
+      }
+    }
+
+    int inclusive = lane_count;
+    #pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+      const int value = __shfl_up_sync(warp_mask, inclusive, offset);
+      if (lane_id >= offset) inclusive += value;
+    }
+    const int tile_count = __shfl_sync(warp_mask, inclusive, 31);
+    int tile_base = 0;
+    if (lane_id == 0 && tile_count > 0) {
+      tile_base = atomicAdd(pair_count, tile_count);
+      if (tile_base + tile_count > max_pairs) *overflow = 1;
+    }
+    tile_base = __shfl_sync(warp_mask, tile_base, 0);
+    int pos = tile_base + inclusive - lane_count;
+
+    #pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+      unsigned int hits = lane_hits[chunk];
+      while (hits != 0) {
+        const int bit = __ffs(hits) - 1;
+        const int src = interval * 8 + bit;
+        if (src < n_nodes) {
+          if (pos < max_pairs) pairs[pos] = make_int2(src, lane_dsts[chunk]);
+          ++pos;
+        }
+        hits &= hits - 1;
+      }
+    }
+  }
+}
+
+// Diagnostic scalar-core counterpart to binary-MMA discovery. The mapping,
+// packed inputs, exact pair emission, and atomics intentionally stay identical.
+static __global__ void scalar_transposed_adev_discover_pairs(
+  const int* virtual_to_real, const int* row_ids, const unsigned int* masks,
+  const unsigned int* frontier_words, const int* active_vss,
+  const int* active_vss_size, int2* pairs, int* pair_count, int* overflow,
+  const int max_pairs, const int n_nodes) {
+  const int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+  const int no_warps = gridDim.x * blockDim.x / 32;
+  const int warp_id = thread_id / 32;
+  const int lane_id = thread_id & 31;
+  const int q_size = *active_vss_size;
+  for (int q = warp_id; q < q_size; q += no_warps) {
+    const int vss = active_vss[q];
+    const int interval = virtual_to_real[vss];
+    const unsigned int frontier_byte =
+      (frontier_words[interval >> 2] >> ((interval & 3) * 8)) & 0xffu;
+    if (frontier_byte == 0) continue;
+    const unsigned int packed = masks[vss * 32 + lane_id];
+    for (int chunk = 0; chunk < 4; ++chunk) {
+      unsigned int hits =
+        ((packed >> (chunk * 8)) & 0xffu) & frontier_byte;
+      if (hits == 0) continue;
+      const int dst = row_ids[vss * 128 + lane_id * 4 + chunk];
+      if (dst < 0 || dst >= n_nodes) continue;
+      while (hits != 0) {
+        const int bit = __ffs(hits) - 1;
+        const int src = interval * 8 + bit;
+        if (src < n_nodes) {
+          const int pos = atomicAdd(pair_count, 1);
+          if (pos < max_pairs) pairs[pos] = make_int2(src, dst);
+          else *overflow = 1;
         }
         hits &= hits - 1;
       }
