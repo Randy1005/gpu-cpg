@@ -338,13 +338,49 @@ static __global__ void tc_transposed_adev_discover_pairs(
   int* overflow,
   const int max_pairs,
   const int n_nodes,
-  const bool shape_dispatch) {
+  const bool shape_dispatch,
+  const int tc_min_active_vss = 0) {
   const int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
   const int no_threads = gridDim.x * blockDim.x;
   const int no_warps = no_threads / 32;
   const int warp_id = thread_id / 32;
   const int lane_id = thread_id & 31;
   const int q_size = *active_vss_size;
+
+  if (tc_min_active_vss > 0 && q_size < tc_min_active_vss) {
+    for (int q = warp_id; q < q_size; q += no_warps) {
+      const int vss = active_vss[q];
+      const int interval = virtual_to_real[vss];
+      const unsigned int frontier_byte =
+        (frontier_words[interval >> 2] >> ((interval & 3) * 8)) & 0xffu;
+      if (frontier_byte == 0) {
+        continue;
+      }
+      const unsigned int packed = masks[vss * 32 + lane_id];
+      for (int chunk = 0; chunk < 4; ++chunk) {
+        unsigned int hits =
+          ((packed >> (chunk * 8)) & 0xffu) & frontier_byte;
+        if (hits == 0) {
+          continue;
+        }
+        const int dst = row_ids[vss * 128 + lane_id * 4 + chunk];
+        if (dst < 0 || dst >= n_nodes) {
+          continue;
+        }
+        while (hits != 0) {
+          const int bit = __ffs(hits) - 1;
+          const int src = interval * 8 + bit;
+          if (src < n_nodes) {
+            const int pos = atomicAdd(pair_count, 1);
+            if (pos < max_pairs) pairs[pos] = make_int2(src, dst);
+            else *overflow = 1;
+          }
+          hits &= hits - 1;
+        }
+      }
+    }
+    return;
+  }
 
   for (int q = warp_id; q < q_size; q += no_warps) {
     const int vss = active_vss[q];

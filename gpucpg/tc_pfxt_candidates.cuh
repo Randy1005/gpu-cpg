@@ -27,6 +27,76 @@ enum class CandidateTileClass : unsigned char {
   MIXED
 };
 
+struct alignas(16) BvssUniformTileDescriptor {
+  int parent_base = 0;
+  int family_base = 0;
+  unsigned int shape_and_class = 0;
+  int source_slot = -1;
+};
+
+static_assert(sizeof(BvssUniformTileDescriptor) == 16);
+
+__host__ __device__ inline bool is_uniform_candidate_tile_class(
+  const CandidateTileClass tile_class) {
+  return tile_class != CandidateTileClass::MIXED;
+}
+
+__host__ __device__ inline BvssUniformTileDescriptor
+make_bvss_uniform_tile_descriptor(
+  const int parent_base,
+  const int family_base,
+  const int parent_count,
+  const int family_count,
+  const CandidateTileClass tile_class,
+  const int source_slot) {
+  return BvssUniformTileDescriptor{
+    parent_base,
+    family_base,
+    static_cast<unsigned int>(parent_count & 0xff)
+      | (static_cast<unsigned int>(family_count & 0xff) << 8)
+      | (static_cast<unsigned int>(tile_class) << 16),
+    source_slot};
+}
+
+__host__ __device__ inline int bvss_descriptor_parent_count(
+  const BvssUniformTileDescriptor descriptor) {
+  return descriptor.shape_and_class & 0xff;
+}
+
+__host__ __device__ inline int bvss_descriptor_family_count(
+  const BvssUniformTileDescriptor descriptor) {
+  return (descriptor.shape_and_class >> 8) & 0xff;
+}
+
+__host__ __device__ inline CandidateTileClass bvss_descriptor_tile_class(
+  const BvssUniformTileDescriptor descriptor) {
+  return static_cast<CandidateTileClass>(
+    (descriptor.shape_and_class >> 16) & 0xff);
+}
+
+__host__ __device__ inline int bvss_descriptor_product_count(
+  const BvssUniformTileDescriptor descriptor) {
+  return bvss_descriptor_parent_count(descriptor)
+    * bvss_descriptor_family_count(descriptor);
+}
+
+__host__ __device__ inline bool bvss_descriptor_is_valid(
+  const BvssUniformTileDescriptor descriptor,
+  const int n_sources) {
+  const int parent_count = bvss_descriptor_parent_count(descriptor);
+  const int family_count = bvss_descriptor_family_count(descriptor);
+  return descriptor.parent_base >= 0
+    && descriptor.family_base >= 0
+    && descriptor.source_slot >= 0
+    && descriptor.source_slot < n_sources
+    && parent_count > 0
+    && parent_count <= 32
+    && family_count > 0
+    && family_count <= 16
+    && is_uniform_candidate_tile_class(
+      bvss_descriptor_tile_class(descriptor));
+}
+
 enum class ShortOnlyTileBoundClass : unsigned char {
   ALL_SKIP,
   ALL_SHORT,
@@ -64,6 +134,23 @@ struct DeferredLpqTile {
   unsigned short dev_count = 0;
   int parent_indices[DEFERRED_LPQ_MAX_PARENTS]{};
   unsigned int promoted[DEFERRED_LPQ_MASK_WORDS]{};
+};
+
+// Persistent representation for an exact ALL_LONG pair-family warp tile.
+// The pair-major consumer snapshots parent indices directly, so promotion does
+// not depend on the transient source grouping arrays.
+constexpr int BVSS_DEFERRED_FAMILY_MAX_PARENTS = 32;
+
+struct BvssDeferredFamilyTile {
+  int src = -1;
+  int dst = -1;
+  int src_dist = 0;
+  int dst_dist = 0;
+  float edge_weight = 0.0f;
+  unsigned short parent_count = 0;
+  unsigned short reserved = 0;
+  int parent_indices[BVSS_DEFERRED_FAMILY_MAX_PARENTS]{};
+  unsigned int promoted = 0;
 };
 
 struct TileResidentShadowCounts {
@@ -524,6 +611,27 @@ __host__ __device__ inline int source_major_tile_count(
   const int family_tile) {
   return ceil_div_int(parent_count, parent_tile)
     * ceil_div_int(family_count, family_tile);
+}
+
+__host__ __device__ inline int source_major_tile_linear_index(
+  const int source_tile_offset,
+  const int parent_local,
+  const int family_local,
+  const int family_count,
+  const int parent_tile,
+  const int family_tile) {
+  if (source_tile_offset < 0
+      || parent_local < 0
+      || family_local < 0
+      || family_local >= family_count
+      || parent_tile <= 0
+      || family_tile <= 0) {
+    return -1;
+  }
+  const int family_tiles = ceil_div_int(family_count, family_tile);
+  return source_tile_offset
+    + (parent_local / parent_tile) * family_tiles
+    + family_local / family_tile;
 }
 
 __host__ __device__ inline int candidate_chunk_size(

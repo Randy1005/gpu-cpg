@@ -149,6 +149,43 @@ TEST_CASE("tc pfxt classifies source-local candidate tiles") {
         == CandidateTileClass::MIXED);
 }
 
+TEST_CASE("tc pfxt BVSS uniform tile descriptors round trip") {
+  using gpucpg::tc_pfxt::BvssUniformTileDescriptor;
+  using gpucpg::tc_pfxt::CandidateTileClass;
+  using gpucpg::tc_pfxt::bvss_descriptor_family_count;
+  using gpucpg::tc_pfxt::bvss_descriptor_is_valid;
+  using gpucpg::tc_pfxt::bvss_descriptor_parent_count;
+  using gpucpg::tc_pfxt::bvss_descriptor_product_count;
+  using gpucpg::tc_pfxt::bvss_descriptor_tile_class;
+  using gpucpg::tc_pfxt::make_bvss_uniform_tile_descriptor;
+
+  CHECK(sizeof(BvssUniformTileDescriptor) == 16);
+  CHECK(alignof(BvssUniformTileDescriptor) == 16);
+
+  const auto descriptor = make_bvss_uniform_tile_descriptor(
+    123, 456, 31, 15, CandidateTileClass::ALL_SHORT, 7);
+  CHECK(descriptor.parent_base == 123);
+  CHECK(descriptor.family_base == 456);
+  CHECK(descriptor.source_slot == 7);
+  CHECK(bvss_descriptor_parent_count(descriptor) == 31);
+  CHECK(bvss_descriptor_family_count(descriptor) == 15);
+  CHECK(bvss_descriptor_product_count(descriptor) == 465);
+  CHECK(bvss_descriptor_tile_class(descriptor)
+        == CandidateTileClass::ALL_SHORT);
+  CHECK(bvss_descriptor_is_valid(descriptor, 8));
+
+  for (const auto tile_class : {
+         CandidateTileClass::ALL_SKIP,
+         CandidateTileClass::ALL_SHORT,
+         CandidateTileClass::ALL_LONG}) {
+    CHECK(bvss_descriptor_is_valid(
+      make_bvss_uniform_tile_descriptor(0, 0, 32, 16, tile_class, 0), 1));
+  }
+  CHECK_FALSE(bvss_descriptor_is_valid(
+    make_bvss_uniform_tile_descriptor(
+      0, 0, 32, 16, CandidateTileClass::MIXED, 0), 1));
+}
+
 TEST_CASE("tc pfxt short-only tile bounds are conservative") {
   using gpucpg::tc_pfxt::ShortOnlyTileBoundClass;
   using gpucpg::tc_pfxt::classify_short_only_tile_bounds;
@@ -708,6 +745,13 @@ TEST_CASE("source-major tiling keeps heavy sources parallel") {
   CHECK(source_major_tile_count(9, 8, 8, 8) == 2);
   CHECK(source_major_tile_count(9, 9, 8, 8) == 4);
   CHECK(source_major_tile_count(120, 173, 32, 16) == 44);
+
+  CHECK(source_major_tile_linear_index(100, 0, 0, 173, 32, 16) == 100);
+  CHECK(source_major_tile_linear_index(100, 31, 15, 173, 32, 16) == 100);
+  CHECK(source_major_tile_linear_index(100, 32, 0, 173, 32, 16) == 111);
+  CHECK(source_major_tile_linear_index(100, 119, 172, 173, 32, 16) == 143);
+  CHECK(source_major_tile_linear_index(100, 0, 173, 173, 32, 16) == -1);
+  CHECK(source_major_tile_linear_index(100, 0, 0, 173, 0, 16) == -1);
 }
 
 TEST_CASE("tile-native candidate path only handles short-only large tile work") {
