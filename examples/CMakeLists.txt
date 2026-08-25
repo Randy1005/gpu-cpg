@@ -30,6 +30,18 @@ add_executable(tc-pfxt-gate5 ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-gate5.cu)
 add_executable(tc-pfxt-inprocess-timing ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-inprocess-timing.cu)
 add_executable(tc-pfxt-inprocess-exactness ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-inprocess-exactness.cu)
 add_executable(sptc-incremental-replay ${GPUCPG_EXAMPLE_DIR}/sptc-incremental-replay.cu)
+
+set(CUSPARSELT_ROOT "" CACHE PATH "Local cuSPARSELt installation")
+if(CUSPARSELT_ROOT)
+  add_executable(sptc-hardware-gate ${GPUCPG_EXAMPLE_DIR}/sptc-hardware-gate.cu)
+  target_include_directories(sptc-hardware-gate PRIVATE ${CUSPARSELT_ROOT}/include)
+  target_link_libraries(sptc-hardware-gate PRIVATE ${CUSPARSELT_ROOT}/lib/libcusparseLt.so)
+  set_target_properties(sptc-hardware-gate PROPERTIES
+    BUILD_RPATH "${CUSPARSELT_ROOT}/lib")
+  add_test(NAME sptc_hardware_gate_smoke
+    COMMAND sptc-hardware-gate --batches 1 --iterations 2 --warmup 1)
+  set_tests_properties(sptc_hardware_gate_smoke PROPERTIES LABELS "gpu;hardware")
+endif()
 add_executable(tc-sfxt-bvss-check ${GPUCPG_EXAMPLE_DIR}/tc-sfxt-bvss-check.cu)
 
 

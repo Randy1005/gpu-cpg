@@ -119,8 +119,39 @@ against the existing CUDA/BVSS operation using identical useful work and data
 residency. Include conversion and metadata traffic. Require a robust speedup,
 not an instruction-throughput-only result.
 
-Current status: **pending**. cuSPARSELt is deliberately not installed until
-Gates 1--3 justify the dependency. CUDA 13.1 and SM120 are available.
+Current status: **fail for candidate classification in this formulation**.
+cuSPARSELt 0.9.1 for CUDA 13 was installed locally after Gates 1--3. The
+replay encodes exactly the existing operation: each parent row contains
+`[slack, 1]`, each deviation row contains `[1, delta]`, sparse MMA produces
+`slack + delta`, and a GPU kernel classifies every output. The CUDA baseline
+fuses addition and classification and writes the identical class byte.
+
+At a constant 4,194,304 useful candidate classifications on RTX 5090:
+
+| parent x deviation shape | sparse MMA + classify (ms) | fused CUDA (ms) | CUDA speed advantage |
+|---:|---:|---:|---:|
+| 16 x 16 | 0.186348 | 0.010311 | 18.07x |
+| 32 x 32 | 0.057371 | 0.010239 | 5.60x |
+| 64 x 64 | 0.024622 | 0.010266 | 2.40x |
+| 128 x 128 | 0.018468 | 0.012277 | 1.50x |
+| 256 x 256 | 0.018474 | 0.012306 | 1.50x |
+| 512 x 512 | 0.018478 | 0.012296 | 1.50x |
+| 1024 x 1024 | 0.018474 | 0.010253 | 1.80x |
+
+All shapes produced zero class mismatches. cuSPARSELt algorithm search was run
+before timing and improved the small shapes; its one-time 1.34--3.95 ms cost
+was excluded. Compression was also excluded from steady-state sparse times and
+still cost 0.70--0.86 ms. Nsight Compute proved
+the 4096-batch 16x16 case executed 8,589,934,592 FP16-to-FP32 sparse-HMMA math
+operations, zero dense-HMMA math operations, and 1,048,576 Tensor-pipe
+instructions. Thus this is not a library fallback. cuSPARSELt selected a
+128x128 sparse kernel for independent 16x16 work, creating extreme padding.
+
+Real K=10,000 d40 replays average only 48.926, 36.261, and 47.002 useful
+products per generated tile for leon2, leon3mp, and netcard respectively. Even
+the deliberately oversized 128x128 oracle loses, so cross-frontier shaping
+cannot make this particular `slack + delta` SpTC formulation beat the fused
+CUDA operation.
 
 ## Gate 5: fused useful work per MMA
 
@@ -130,7 +161,11 @@ or rejected products per MMA, intermediate bytes avoided, and residual CUDA
 kernel work. Reject a design that accelerates discovery but adds equivalent or
 larger conversion, launch, and materialization overhead.
 
-Current status: **pending Gate 4**.
+Current status: **stopped for this formulation because Gate 4 failed**. The
+hardware replay already includes the downstream classification kernel and
+still loses. Additional materialization would add work rather than reverse the
+measured gap. A materially different formulation would need to reduce
+algorithmic work, not merely move the same add/classify operation to SpTC.
 
 ## Gate 6: adaptive dispatch
 
@@ -139,7 +174,9 @@ dense, tiny, irregular, or update-expensive tiles to CUDA/BVSS. The decision
 must use device-resident cached statistics and must not introduce a per-step
 host round trip. Compare forced-CUDA, forced-SpTC, and adaptive modes.
 
-Current status: **design only**.
+Current status: **not productionized for the failed SpTC formulation**. The
+Gate 3 value-only update dispatcher remains useful independently: safe batches
+reuse cached state and tree-sensitive batches rebuild exactly.
 
 ## Gate 7: iterative end-to-end benefit
 
@@ -149,7 +186,9 @@ GPG and adaptive deferred candidates. Pass requires a geometric-mean win with
 no unexplained correctness failures and bounded regressions on unsuitable
 graphs handled by dispatch.
 
-Current status: **pending**.
+Current status: **not run for the failed SpTC formulation**. Gate 4 prevents
+an end-to-end production experiment; current adaptive CUDA/BVSS remains the
+reference path.
 
 ## Gate 8: correctness and precision
 
@@ -158,18 +197,32 @@ GPG cost list. Exercise edits that preserve and change shortest-tree successors,
 zero/negative legal perturbations where supported, no-op batches, boundary
 2:4 groups, and fallback paths. Performance from a failing case is discarded.
 
-Current status: **unit and measured replay pass**. All 15 updated-graph cases
-matched freshly recomputed GPG top-K costs. Maximum observed absolute cost
-difference was 1.90735e-5. Broader perturbation and fallback coverage remains
-required before a production claim.
+Current status: **unit, hardware-smoke, and measured replay pass**. All 15
+positive updated-graph cases matched independently recomputed GPG top-K costs.
+A real leon2_d40 local `-1%` perturbation also correctly forced rebuild and
+passed 10,000-cost validation with maximum difference 1.14441e-5. The maximum
+over the positive matrix was 1.90735e-5. Unit tests cover no-op batches,
+decrease/successor/unreachable policy rejection, duplicate and non-finite
+updates, and 2:4 group boundaries. The hardware shape sweep produced zero class
+mismatches.
 
 ## Reproduction controls
+
+The hardware gate used NVIDIA cuSPARSELt 0.9.1.1 for CUDA 13 from
+`https://developer.download.nvidia.com/compute/cusparselt/redist/libcusparse_lt/linux-x86_64/libcusparse_lt-linux-x86_64-0.9.1.1_cuda13-archive.tar.xz`,
+verified as SHA-256
+`e77c16595ce572fbd5d98c5a4959bb955055b5f8c339f5695430358e177360ff`.
+
 
 - `GPUCPG_SPTC_ELIGIBILITY_PROFILE=1`: source-local exact 2:4 oracle.
 - `GPUCPG_SPTC_BVSS_ELIGIBILITY_PROFILE=1`: aligned-BVSS structural/storage
   oracle.
 - `GPUCPG_SPTC_INCREMENTAL_PROFILE=1`: capture and compare real before/after
   shortest and compact-deviation state.
+- `examples/sptc-hardware-gate`: optional cuSPARSELt hardware replay. Configure
+  with `-DCUSPARSELT_ROOT=/path/to/cusparselt`; it validates identical class
+  outputs and reports compression, sparse-plus-classification, and fused-CUDA
+  times.
 - `examples/sptc-incremental-replay`: deterministic real-graph perturbation,
   recomputation, amplification report, and updated GPG correctness validation.
   Add `--gate3-fast-path` to exercise cache-preserving device updates; the tool
