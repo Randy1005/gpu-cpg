@@ -23,6 +23,18 @@ TEST_CASE("tc pfxt inprocess rejects empty or nonpositive K values") {
     std::runtime_error);
 }
 
+TEST_CASE("tc pfxt inprocess parses and configures adaptive mode") {
+  using namespace gpucpg::tc_pfxt_inprocess;
+  CHECK(parse_run_mode("adaptive") == RunMode::ADAPTIVE);
+  CHECK(std::string(run_mode_name(RunMode::ADAPTIVE)) == "adaptive");
+  configure_run_mode(RunMode::ADAPTIVE);
+  REQUIRE(std::getenv("GPUCPG_TC_PFXT_ADAPTIVE_DEFER") != nullptr);
+  REQUIRE(std::getenv("GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ") != nullptr);
+  configure_run_mode(RunMode::GPG);
+  CHECK(std::getenv("GPUCPG_TC_PFXT_ADAPTIVE_DEFER") == nullptr);
+  CHECK(std::getenv("GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ") == nullptr);
+}
+
 TEST_CASE("tc pfxt inprocess compares TC costs against golden prefix") {
   const std::vector<float> golden {1.0f, 2.0f, 3.0f, 4.0f};
   const std::vector<float> tc {1.0f, 2.000001f, 3.0f};
@@ -75,8 +87,10 @@ TEST_CASE("tc pfxt inprocess caches static setup across repeated TC runs") {
   setenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE", "1", 1);
   setenv("GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS", "1", 1);
 
-  const auto first = gpucpg::tc_pfxt_inprocess::run_paths(cpgen, 2, true);
-  const auto second = gpucpg::tc_pfxt_inprocess::run_paths(cpgen, 2, true);
+  const auto first = gpucpg::tc_pfxt_inprocess::run_paths(
+    cpgen, 2, gpucpg::tc_pfxt_inprocess::RunMode::TILE_DEFERRED);
+  const auto second = gpucpg::tc_pfxt_inprocess::run_paths(
+    cpgen, 2, gpucpg::tc_pfxt_inprocess::RunMode::TILE_DEFERRED);
 
   CHECK(first.costs == second.costs);
   CHECK(cpgen.tc_pfxt_static_cache_misses() == 1);

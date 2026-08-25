@@ -12,7 +12,7 @@ namespace {
 
 struct Args {
   std::string benchmark;
-  std::string mode = "tc";
+  std::string mode = "tile-deferred";
   int k = 0;
   int warmup = 1;
   int trials = 3;
@@ -54,8 +54,8 @@ Args parse_args(int argc, char* argv[]) {
   if (args.benchmark.empty() || args.k <= 0) {
     throw std::runtime_error("missing --benchmark or positive --k");
   }
-  if (args.mode != "tc" && args.mode != "gpg" && args.mode != "both") {
-    throw std::runtime_error("--mode must be tc, gpg, or both");
+  if (args.mode != "all") {
+    gpucpg::tc_pfxt_inprocess::parse_run_mode(args.mode);
   }
   if (args.warmup < 0 || args.trials <= 0) {
     throw std::runtime_error("--warmup must be nonnegative and --trials positive");
@@ -66,7 +66,8 @@ Args parse_args(int argc, char* argv[]) {
 void print_usage(const char* argv0, const std::exception& e) {
   std::cerr
     << "usage: " << argv0
-    << " --benchmark FILE --k K [--mode tc|gpg|both] "
+    << " --benchmark FILE --k K "
+    << "[--mode gpg|gpg-deferred|tile-deferred|adaptive|all] "
     << "[--warmup N] [--trials N] [--reset-device]\n"
     << "error: " << e.what() << '\n';
 }
@@ -77,7 +78,7 @@ void run_mode(
     gpucpg::CpGen& cpgen,
     const Args& args,
     const std::string& mode) {
-  const bool enable_tc = mode == "tc";
+  const auto run_mode = gpucpg::tc_pfxt_inprocess::parse_run_mode(mode);
   std::cout << "tc_pfxt_inprocess_timing"
     << " benchmark=" << args.benchmark
     << " K=" << args.k
@@ -89,7 +90,7 @@ void run_mode(
     << '\n';
 
   for (int i = 0; i < args.warmup; ++i) {
-    const auto run = gpucpg::tc_pfxt_inprocess::run_paths(cpgen, args.k, enable_tc);
+    const auto run = gpucpg::tc_pfxt_inprocess::run_paths(cpgen, args.k, run_mode);
     std::cout << "trial_summary mode=" << mode << " kind=warmup"
       << " trial=" << i + 1 << " count=" << run.costs.size()
       << " total_pfxt_ms=" << run.pfxt_ms << '\n';
@@ -103,7 +104,7 @@ void run_mode(
   std::vector<double> measured;
   measured.reserve(args.trials);
   for (int i = 0; i < args.trials; ++i) {
-    const auto run = gpucpg::tc_pfxt_inprocess::run_paths(cpgen, args.k, enable_tc);
+    const auto run = gpucpg::tc_pfxt_inprocess::run_paths(cpgen, args.k, run_mode);
     measured.push_back(run.pfxt_ms);
     std::cout << "trial_summary mode=" << mode << " kind=measured"
       << " trial=" << i + 1 << " count=" << run.costs.size()
@@ -142,9 +143,11 @@ int main(int argc, char* argv[]) {
       << args.benchmark << '\n';
     cpgen.enable_tc_pfxt_static_cache(true);
     std::cerr << "tc_pfxt_inprocess_setup static_cache_enabled=1\n";
-    if (args.mode == "both") {
+    if (args.mode == "all") {
       run_mode(cpgen, args, "gpg");
-      run_mode(cpgen, args, "tc");
+      run_mode(cpgen, args, "gpg-deferred");
+      run_mode(cpgen, args, "tile-deferred");
+      run_mode(cpgen, args, "adaptive");
     }
     else {
       run_mode(cpgen, args, args.mode);

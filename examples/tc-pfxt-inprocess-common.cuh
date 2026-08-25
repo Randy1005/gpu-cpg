@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -16,6 +17,32 @@
 #include <cuda_runtime_api.h>
 
 namespace gpucpg::tc_pfxt_inprocess {
+
+enum class RunMode {
+  GPG,
+  GPG_DEFERRED,
+  TILE_DEFERRED,
+  ADAPTIVE
+};
+
+inline const char* run_mode_name(const RunMode mode) {
+  switch (mode) {
+    case RunMode::GPG: return "gpg";
+    case RunMode::GPG_DEFERRED: return "gpg-deferred";
+    case RunMode::TILE_DEFERRED: return "tile-deferred";
+    case RunMode::ADAPTIVE: return "adaptive";
+  }
+  return "unknown";
+}
+
+inline RunMode parse_run_mode(const std::string& mode) {
+  if (mode == "gpg") return RunMode::GPG;
+  if (mode == "gpg-deferred") return RunMode::GPG_DEFERRED;
+  if (mode == "tile-deferred" || mode == "tc") return RunMode::TILE_DEFERRED;
+  if (mode == "adaptive") return RunMode::ADAPTIVE;
+  throw std::runtime_error(
+    "mode must be gpg, gpg-deferred, tile-deferred, adaptive, or legacy alias tc");
+}
 
 struct RunResult {
   std::vector<float> costs;
@@ -70,6 +97,17 @@ inline std::vector<float> read_costs(const std::string& filename) {
   return costs;
 }
 
+inline void write_costs(
+    const std::string& filename,
+    const std::vector<float>& costs) {
+  std::ofstream os(filename);
+  if (!os) {
+    throw std::runtime_error("failed to create cost file: " + filename);
+  }
+  os << std::setprecision(std::numeric_limits<float>::max_digits10);
+  for (const float cost : costs) os << cost << '\n';
+}
+
 inline CompareResult compare_prefix(
   const std::vector<float>& baseline,
   const std::vector<float>& tc,
@@ -109,13 +147,45 @@ inline double short_long_pfxt_ms(const CpGen& cpgen) {
   return total_ms;
 }
 
-inline RunResult run_paths(CpGen& cpgen, const int k, const bool enable_tc) {
-  if (enable_tc) {
-    setenv("GPUCPG_ENABLE_TC_PFXT", "1", 1);
+inline void configure_run_mode(const RunMode mode) {
+  constexpr const char* controlled_flags[] = {
+    "GPUCPG_ENABLE_TC_PFXT",
+    "GPUCPG_TC_PFXT_SINGLE_PASS",
+    "GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE",
+    "GPUCPG_TC_PFXT_DISABLE_PHASE_PROFILE",
+    "GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE",
+    "GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS",
+    "GPUCPG_TC_PFXT_TILE_NATIVE_CANDIDATE",
+    "GPUCPG_TC_PFXT_COMPACT_SOURCE_GROUPS",
+    "GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ",
+    "GPUCPG_TC_PFXT_ADAPTIVE_DEFER",
+    "GPUCPG_TC_PFXT_DEFER_ORACLE",
+    "GPUCPG_TC_PFXT_SHORT_TILE_BOUNDS",
+    "GPUCPG_TC_PFXT_SOURCE_LOCAL_MAX_SLOTS"
+  };
+  for (const char* flag : controlled_flags) unsetenv(flag);
+  if (mode == RunMode::GPG) return;
+
+  setenv("GPUCPG_ENABLE_TC_PFXT", "1", 1);
+  setenv("GPUCPG_TC_PFXT_SINGLE_PASS", "1", 1);
+  setenv("GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE", "1", 1);
+  setenv("GPUCPG_TC_PFXT_DISABLE_PHASE_PROFILE", "1", 1);
+  setenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE", "1", 1);
+  setenv("GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS", "1", 1);
+  setenv("GPUCPG_TC_PFXT_TILE_NATIVE_CANDIDATE", "1", 1);
+  setenv("GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ", "1", 1);
+  setenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_MAX_SLOTS", "300000000", 1);
+  if (mode == RunMode::TILE_DEFERRED || mode == RunMode::ADAPTIVE) {
+    setenv("GPUCPG_TC_PFXT_COMPACT_SOURCE_GROUPS", "1", 1);
+    setenv("GPUCPG_TC_PFXT_SHORT_TILE_BOUNDS", "1", 1);
   }
-  else {
-    unsetenv("GPUCPG_ENABLE_TC_PFXT");
+  if (mode == RunMode::ADAPTIVE) {
+    setenv("GPUCPG_TC_PFXT_ADAPTIVE_DEFER", "1", 1);
   }
+}
+
+inline RunResult run_paths(CpGen& cpgen, const int k, const RunMode mode) {
+  configure_run_mode(mode);
 
   cpgen.reset();
   cpgen.report_paths(
@@ -138,7 +208,7 @@ inline RunResult run_paths(CpGen& cpgen, const int k, const bool enable_tc) {
   RunResult result;
   result.pfxt_ms = short_long_pfxt_ms(cpgen);
   result.costs = cpgen.get_slacks(k);
-  unsetenv("GPUCPG_ENABLE_TC_PFXT");
+  configure_run_mode(RunMode::GPG);
   return result;
 }
 
