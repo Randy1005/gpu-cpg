@@ -72,23 +72,13 @@ for case_name in "${cases[@]}"; do
     valid_mode_log "$out_dir/validation/${case_name}.${mode}.log" "$mode" \
       || missing_modes+=("$mode")
   done
-  if (( ${#missing_modes[@]} == ${#modes[@]} )); then
-    log="$out_dir/validation/${case_name}.inprocess-all.log"
-    if ! valid_log "$log"; then
-      wait_for_idle_gpu
-      "$exact_bin" --benchmark "$benchmark" --baseline-file "$golden" \
-        --ks 1000000 --mode all >"$log" 2>&1
-      valid_log "$log"
-    fi
-  else
-    for mode in "${missing_modes[@]}"; do
-      log="$out_dir/validation/${case_name}.${mode}.log"
-      wait_for_idle_gpu
-      "$exact_bin" --benchmark "$benchmark" --baseline-file "$golden" \
-        --ks 1000000 --mode "$mode" >"$log" 2>&1
-      valid_log "$log"
-    done
-  fi
+  for mode in "${missing_modes[@]}"; do
+    log="$out_dir/validation/${case_name}.${mode}.log"
+    wait_for_idle_gpu
+    "$exact_bin" --benchmark "$benchmark" --baseline-file "$golden" \
+      --ks 1000000 --mode "$mode" >"$log" 2>&1
+    valid_mode_log "$log" "$mode"
+  done
 done
 
 printf 'case,mode,pass,max_diff,pfxt_ms\n' >"$out_dir/validation.csv"
