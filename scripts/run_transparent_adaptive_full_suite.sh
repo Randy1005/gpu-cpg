@@ -228,4 +228,47 @@ awk -F, '
 ' "$out_dir/timing.csv" "$out_dir/adaptive_steps.csv" \
   >"$out_dir/comparison.csv"
 
+printf 'case,gpg_pfxt_ms,adaptive_production_pfxt_ms,cold_setup_ms,cold_pfxt_ms,cold_end_to_end_ms,reused_setup_ms,decision_ms,core_pfxt_ms,profiled_total_pfxt_ms,profiler_overhead_ms,reused_speedup_vs_gpg,cold_speedup_vs_gpg\n' >"$out_dir/transparent_costs.csv"
+for case_name in "${cases[@]}"; do
+  gpg_ms=$(awk -F, -v c="$case_name" '$1==c && $2=="gpg" {print $3}' "$out_dir/timing.csv")
+  adaptive_ms=$(awk -F, -v c="$case_name" '$1==c && $2=="adaptive" {print $3}' "$out_dir/timing.csv")
+  awk -v c="$case_name" -v g="$gpg_ms" -v production="$adaptive_ms" '
+    /^runtime_summary_tc_breakdown/ {
+      ++n;
+      setup=decision=core=total=0;
+      for (i=1; i<=NF; ++i) {
+        split($i,a,"=");
+        if (a[1]=="oracle_setup_ms") setup=a[2]+0;
+        if (a[1]=="oracle_decision_ms") decision=a[2]+0;
+        if (a[1]=="core_pfxt_ms") core=a[2]+0;
+        if (a[1]=="total_pfxt_ms") total=a[2]+0;
+      }
+      if (n==1) {
+        cold_setup=setup;
+        cold_total=total;
+      } else {
+        reused_setup+=setup;
+        decisions+=decision;
+        cores+=core;
+        totals+=total;
+        ++measured;
+      }
+    }
+    END {
+      if (measured != 3) {
+        print "expected 3 measured adaptive breakdowns for " c > "/dev/stderr";
+        exit 2;
+      }
+      reused_setup/=measured;
+      decisions/=measured;
+      cores/=measured;
+      totals/=measured;
+      cold_e2e=cold_setup+cold_total;
+      printf "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f\n",
+        c,g,production,cold_setup,cold_total,cold_e2e,reused_setup,
+        decisions,cores,totals,totals-production,g/production,g/cold_e2e;
+    }
+  ' "$out_dir/timing-profile/${case_name}.adaptive.log" >>"$out_dir/transparent_costs.csv"
+done
+
 date --iso-8601=seconds >"$out_dir/COMPLETE"
