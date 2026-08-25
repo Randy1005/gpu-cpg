@@ -50,6 +50,28 @@ TEST_CASE("tc pfxt inprocess compares TC costs against golden prefix") {
   CHECK(result.first_mismatch_rank == 0);
 }
 
+TEST_CASE("tc pfxt inprocess accepts bounded relative FP32 drift at large cost") {
+  const std::vector<float> golden {2000.0f, 4750.0f};
+  const std::vector<float> tc {2000.0015f, 4750.0035f};
+
+  const auto result =
+    gpucpg::tc_pfxt_inprocess::compare_prefix(golden, tc, 2);
+
+  CHECK(result.pass);
+  CHECK(result.first_mismatch_rank == 0);
+}
+
+TEST_CASE("tc pfxt inprocess rejects drift beyond relative tolerance") {
+  const std::vector<float> golden {2000.0f};
+  const std::vector<float> tc {2000.01f};
+
+  const auto result =
+    gpucpg::tc_pfxt_inprocess::compare_prefix(golden, tc, 1);
+
+  CHECK_FALSE(result.pass);
+  CHECK(result.first_mismatch_rank == 1);
+}
+
 TEST_CASE("tc pfxt inprocess reports first mismatch rank") {
   const std::vector<float> golden {1.0f, 2.0f, 3.0f};
   const std::vector<float> tc {1.0f, 2.2f, 3.0f};

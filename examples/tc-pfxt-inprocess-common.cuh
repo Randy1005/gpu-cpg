@@ -112,7 +112,8 @@ inline CompareResult compare_prefix(
   const std::vector<float>& baseline,
   const std::vector<float>& tc,
   const int k,
-  const float tolerance = 1.0e-3f) {
+  const float absolute_tolerance = 1.0e-3f,
+  const float relative_tolerance = 1.0e-6f) {
   CompareResult result;
   result.baseline_count = baseline.size();
   result.tc_count = tc.size();
@@ -126,7 +127,9 @@ inline CompareResult compare_prefix(
       result.max_diff = diff;
       result.max_diff_rank = static_cast<int>(i) + 1;
     }
-    if (result.first_mismatch_rank == 0 && diff >= tolerance) {
+    const float scale = std::max(std::fabs(baseline[i]), std::fabs(tc[i]));
+    const float tolerance = absolute_tolerance + relative_tolerance * scale;
+    if (result.first_mismatch_rank == 0 && diff > tolerance) {
       result.first_mismatch_rank = static_cast<int>(i) + 1;
     }
   }

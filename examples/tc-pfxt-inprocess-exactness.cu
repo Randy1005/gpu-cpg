@@ -10,6 +10,7 @@ struct Args {
   std::string benchmark;
   std::string baseline_file;
   std::string baseline_output;
+  std::string result_output;
   std::string mode = "tile-deferred";
   std::vector<int> ks;
   bool current_gpg_baseline = false;
@@ -34,6 +35,9 @@ Args parse_args(int argc, char* argv[]) {
     }
     else if (arg == "--baseline-output") {
       args.baseline_output = value("--baseline-output");
+    }
+    else if (arg == "--result-output") {
+      args.result_output = value("--result-output");
     }
     else if (arg == "--ks") {
       args.ks = gpucpg::tc_pfxt_inprocess::parse_k_list(value("--ks"));
@@ -73,7 +77,7 @@ void print_usage(const char* argv0, const std::exception& e) {
     << "usage: " << argv0
     << " --benchmark FILE [--baseline-file COSTS | --current-gpg-baseline "
     << "--baseline-output COSTS] --ks K1,K2,... "
-    << "[--mode gpg|gpg-deferred|tile-deferred|adaptive|all] [--reset-device]\n"
+    << "[--mode gpg|gpg-deferred|tile-deferred|adaptive|all] [--result-output COSTS] [--reset-device]\n"
     << "error: " << e.what() << '\n';
 }
 
@@ -126,6 +130,10 @@ int main(int argc, char* argv[]) {
       }
       const auto cmp =
         gpucpg::tc_pfxt_inprocess::compare_prefix(baseline, run.costs, k);
+      if (!args.result_output.empty()
+          && run_mode == gpucpg::tc_pfxt_inprocess::RunMode::ADAPTIVE) {
+        gpucpg::tc_pfxt_inprocess::write_costs(args.result_output, run.costs);
+      }
       std::cout << "exactness_summary"
         << " K=" << k
         << " mode=" << gpucpg::tc_pfxt_inprocess::run_mode_name(run_mode)
