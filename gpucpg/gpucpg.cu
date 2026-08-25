@@ -10992,22 +10992,18 @@ static void tc_pfxt_expand_window_single_pass(
           n_active,
           adaptive_safe_ordinary_min_paths,
           chain_product_upper_bounds != nullptr);
+      int* ordinary_safe_ptr = nullptr;
       if (probe_safe_ordinary) {
-        set_kernel<<<1, 1>>>(
-          thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()), 1);
+        ordinary_safe_ptr = thrust::raw_pointer_cast(
+          adaptive_ordinary_safe_state.data());
+        set_kernel<<<1, 1>>>(ordinary_safe_ptr, 1);
         mark_tc_pfxt_unsafe_ordinary_chains
           <<<tc_pfxt::adaptive_oracle_grid_blocks(n_active, 256), 256>>>(
             thrust::raw_pointer_cast(current_v.data()),
             n_active,
             chain_product_upper_bounds,
             static_cast<unsigned long long>(defer_oracle_low),
-            thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()));
-      }
-      else {
-        cudaMemsetAsync(
-          thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()),
-          0,
-          sizeof(int));
+            ordinary_safe_ptr);
       }
       collect_tc_pfxt_adaptive_path_stats
         <<<tc_pfxt::adaptive_oracle_grid_blocks(
@@ -11027,7 +11023,7 @@ static void tc_pfxt_expand_window_single_pass(
           sample_seed,
           thrust::raw_pointer_cast(source_local_stats.data()),
           thrust::raw_pointer_cast(defer_oracle_sample_stats.data()),
-          thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()));
+          ordinary_safe_ptr);
       update_tc_pfxt_defer_oracle_state<<<1, 1>>>(
         thrust::raw_pointer_cast(source_local_stats.data()),
         thrust::raw_pointer_cast(defer_oracle_sample_stats.data()),
@@ -11040,7 +11036,7 @@ static void tc_pfxt_expand_window_single_pass(
         static_cast<unsigned int>(defer_oracle_telemetry.size()),
         static_cast<unsigned int>(outer_step),
         static_cast<unsigned int>(substep_number),
-        thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()),
+        ordinary_safe_ptr,
         n_active);
       cudaCheckErrors("tc pfxt adaptive pre-group oracle failed");
       light_profiler.end_oracle_decision(oracle_decision_start);
