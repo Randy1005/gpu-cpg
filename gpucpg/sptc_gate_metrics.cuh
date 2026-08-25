@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cmath>
 #include <stdexcept>
+#include <limits>
 #include <vector>
 
 namespace gpucpg::sptc {
@@ -152,6 +153,38 @@ class EdgeToPackedSlots {
  private:
   std::vector<std::vector<std::size_t>> slots_;
 };
+
+enum class ValueOnlyUpdateRejection {
+  NONE = 0,
+  WEIGHT_DECREASE,
+  UNREACHABLE_SOURCE,
+  UNREACHABLE_DESTINATION,
+  SUCCESSOR_EDGE
+};
+
+template <typename Successors, typename Distances>
+inline ValueOnlyUpdateRejection classify_value_only_update(
+  const float old_weight,
+  const float new_weight,
+  const int src,
+  const int dst,
+  const Successors& successors,
+  const Distances& distances) {
+  if (src < 0 || src >= static_cast<int>(successors.size())
+      || src >= static_cast<int>(distances.size()))
+    throw std::out_of_range("incremental update source outside derived state");
+  if (dst < 0 || dst >= static_cast<int>(distances.size()))
+    throw std::out_of_range("incremental update destination outside derived state");
+  if (new_weight < old_weight)
+    return ValueOnlyUpdateRejection::WEIGHT_DECREASE;
+  if (distances[src] == std::numeric_limits<int>::max())
+    return ValueOnlyUpdateRejection::UNREACHABLE_SOURCE;
+  if (distances[dst] == std::numeric_limits<int>::max())
+    return ValueOnlyUpdateRejection::UNREACHABLE_DESTINATION;
+  if (successors[src] == dst)
+    return ValueOnlyUpdateRejection::SUCCESSOR_EDGE;
+  return ValueOnlyUpdateRejection::NONE;
+}
 
 struct DerivedUpdateStats {
   std::uint64_t vertices = 0;

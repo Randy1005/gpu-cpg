@@ -17,6 +17,7 @@ struct Args {
   float delta_percent = 1.0f;
   std::string pattern = "local";
   unsigned int seed = 1;
+  bool gate3_fast_path = false;
 };
 
 Args parse_args(int argc, char* argv[]) {
@@ -34,6 +35,7 @@ Args parse_args(int argc, char* argv[]) {
       args.delta_percent = std::stof(value("--delta-percent"));
     else if (arg == "--pattern") args.pattern = value("--pattern");
     else if (arg == "--seed") args.seed = std::stoul(value("--seed"));
+    else if (arg == "--gate3-fast-path") args.gate3_fast_path = true;
     else throw std::runtime_error("unknown argument: " + arg);
   }
   if (args.benchmark.empty() || args.k <= 0 || args.edits == 0
@@ -73,7 +75,8 @@ int main(int argc, char* argv[]) {
     gpucpg::CpGen graph;
     graph.read_input(args.benchmark);
     graph.enable_tc_pfxt_static_cache(true);
-    setenv("GPUCPG_SPTC_INCREMENTAL_PROFILE", "1", 1);
+    if (args.gate3_fast_path) unsetenv("GPUCPG_SPTC_INCREMENTAL_PROFILE");
+    else setenv("GPUCPG_SPTC_INCREMENTAL_PROFILE", "1", 1);
 
     std::cout << "sptc_incremental_replay"
       << " benchmark=" << args.benchmark
@@ -83,7 +86,8 @@ int main(int argc, char* argv[]) {
       << " edits=" << args.edits
       << " delta_percent=" << args.delta_percent
       << " pattern=" << args.pattern
-      << " seed=" << args.seed << '\n';
+      << " seed=" << args.seed
+      << " gate3_fast_path=" << (args.gate3_fast_path ? 1 : 0) << '\n';
 
     // Establish the exact derived state and production compact-deviation shape.
     const auto before = gpucpg::tc_pfxt_inprocess::run_paths(
@@ -101,13 +105,17 @@ int main(int argc, char* argv[]) {
       << " requested=" << update_result.requested
       << " changed=" << update_result.changed
       << " invalidated=" << (update_result.derived_state_invalidated ? 1 : 0)
+      << " device_cache_updated=" << (update_result.device_cache_updated ? 1 : 0)
+      << " device_cache_fallback=" << (update_result.device_cache_fallback ? 1 : 0)
+      << " device_update_ms=" << update_result.device_update_ms
       << '\n';
 
     // Adaptive rebuild consumes the oracle before-image and emits amplification.
     const auto after = gpucpg::tc_pfxt_inprocess::run_paths(
       graph, args.k, gpucpg::tc_pfxt_inprocess::RunMode::ADAPTIVE);
-    // Current GPG on the updated graph is the correctness oracle; old golden
-    // costs are invalid after a weight edit.
+    // Force an independent recomputation: the adaptive run may have populated
+    // a valid static cache, which must not become the correctness oracle.
+    graph.clear_tc_pfxt_static_cache();
     const auto gpg = gpucpg::tc_pfxt_inprocess::run_paths(
       graph, args.k, gpucpg::tc_pfxt_inprocess::RunMode::GPG);
     const auto cmp = gpucpg::tc_pfxt_inprocess::compare_prefix(

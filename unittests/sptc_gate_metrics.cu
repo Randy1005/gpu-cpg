@@ -97,6 +97,28 @@ TEST_CASE("invalid reverse mappings fail instead of corrupting data") {
   CHECK_THROWS_AS(reverse.scatter({0}, edge_values, packed_values), std::out_of_range);
 }
 
+TEST_CASE("value-only update policy accepts only provably stable edits") {
+  using gpucpg::sptc::ValueOnlyUpdateRejection;
+  const std::vector<int> successors{1,2,-1,2};
+  const std::vector<int> distances{20,10,0,std::numeric_limits<int>::max()};
+  CHECK(gpucpg::sptc::classify_value_only_update(
+    1.0f,1.1f,0,2,successors,distances) == ValueOnlyUpdateRejection::NONE);
+  CHECK(gpucpg::sptc::classify_value_only_update(
+    1.0f,0.9f,0,2,successors,distances)
+    == ValueOnlyUpdateRejection::WEIGHT_DECREASE);
+  CHECK(gpucpg::sptc::classify_value_only_update(
+    1.0f,1.1f,0,1,successors,distances)
+    == ValueOnlyUpdateRejection::SUCCESSOR_EDGE);
+  CHECK(gpucpg::sptc::classify_value_only_update(
+    1.0f,1.1f,3,2,successors,distances)
+    == ValueOnlyUpdateRejection::UNREACHABLE_SOURCE);
+  CHECK(gpucpg::sptc::classify_value_only_update(
+    1.0f,1.1f,0,3,successors,distances)
+    == ValueOnlyUpdateRejection::UNREACHABLE_DESTINATION);
+  CHECK_THROWS_AS(gpucpg::sptc::classify_value_only_update(
+    1.0f,1.1f,4,2,successors,distances), std::out_of_range);
+}
+
 TEST_CASE("derived update separates tree, membership, and value changes") {
   const auto stats = gpucpg::sptc::compare_derived_update(
     {10,20,30,40}, {1,2,3,-1},

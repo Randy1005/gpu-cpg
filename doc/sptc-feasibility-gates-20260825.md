@@ -90,10 +90,27 @@ packed values, and structured metadata. Compare with cached full rebuild time.
 Pass only if update plus repair is a small fraction of one PFXT query and is
 amortized within the expected number of repeated queries.
 
-Current status: **unblocked by Gate 1; implementation pending**. Host-side API
-correctness exists; persistent device CSR weights, localized shortest-state
-repair, and edge-to-packed-slot/metadata repair remain to be implemented and
-timed. Profiling-only host snapshots must never enter production timing.
+Current status: **partial pass with a strong value-only signal**. A conservative
+production fast path now accepts only non-decreasing updates to reachable,
+non-successor edges. Those edits provably preserve shortest distances,
+successors, BVSS membership, and compact-deviation membership. One GPU kernel
+updates cached fanin/fanout weights and finds each compact slot within its
+source row to update the delta; there is no device-to-host decision round trip.
+Every other batch invalidates the cache and takes the existing exact rebuild.
+
+The same 15-case real matrix used by Gate 1 produced 15/15 independently
+validated top-K passes. Seven batches (46.7%) took the device path, exactly the
+seven for which the full oracle observed zero changed distances. All eight
+tree-sensitive batches fell back. Device-path time ranged from 0.046665 to
+0.060892 ms, with median 0.055158 ms, versus 20--42 ms PFXT times: roughly
+0.11--0.30% of one query. The signal for cached value-only maintenance is
+therefore strong.
+
+This is not a complete Gate 3 pass. Structural shortest-tree/membership repair
+is still a rebuild, and `report_paths` still creates its ordinary per-query CSR
+vectors from the updated host graph even though persistent cached weights are
+updated. Production iterative end-to-end timing must include removal of that
+full CSR upload. Profiling-only host snapshots remain outside production timing.
 
 ## Gate 4: isolated hardware replay
 
@@ -155,3 +172,5 @@ required before a production claim.
   shortest and compact-deviation state.
 - `examples/sptc-incremental-replay`: deterministic real-graph perturbation,
   recomputation, amplification report, and updated GPG correctness validation.
+  Add `--gate3-fast-path` to exercise cache-preserving device updates; the tool
+  explicitly clears the cache before its independent GPG oracle run.

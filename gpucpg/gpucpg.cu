@@ -660,6 +660,13 @@ GraphWeightUpdateResult CpGen::update_edge_weights(
   }
 
   GraphWeightUpdateResult result{updates.size(), changed_edges.size(), false};
+  const bool incremental_cache_candidate = !changed_edges.empty()
+    && _has_incremental_cache_candidate();
+  const bool incremental_cache_updated = incremental_cache_candidate
+    && _try_incremental_cache_update(updates, result.device_update_ms);
+  result.device_cache_updated = incremental_cache_updated;
+  result.device_cache_fallback = incremental_cache_candidate
+    && !incremental_cache_updated;
   for (const auto update : updates) {
     if (_h_fanout_wgts[update.edge_id] == update.weight) continue;
     const auto [src, dst] = edge_endpoints(update.edge_id);
@@ -676,7 +683,7 @@ GraphWeightUpdateResult CpGen::update_edge_weights(
       if (neighbor == src) weight = update.weight;
     }
   }
-  if (result.changed != 0) {
+  if (result.changed != 0 && !incremental_cache_updated) {
     clear_tc_pfxt_static_cache();
     result.derived_state_invalidated = true;
   }
@@ -7541,6 +7548,10 @@ struct CpGen::TcPfxtStaticCache {
   thrust::device_vector<int> queue;
   thrust::device_vector<int> successors;
   thrust::device_vector<int> tc_pfxt_next_dev_vertex;
+  thrust::device_vector<float> fanin_wgts;
+  thrust::device_vector<float> fanout_wgts;
+  thrust::device_vector<int> fanout_to_fanin;
+  bool graph_weights_valid = false;
 
   TcPfxtDeviceBvss bvss;
   TcPfxtDeviceBvss aligned_bvss;
@@ -7580,6 +7591,10 @@ struct CpGen::TcPfxtStaticCache {
     thrust::device_vector<int>().swap(queue);
     thrust::device_vector<int>().swap(successors);
     thrust::device_vector<int>().swap(tc_pfxt_next_dev_vertex);
+    thrust::device_vector<float>().swap(fanin_wgts);
+    thrust::device_vector<float>().swap(fanout_wgts);
+    thrust::device_vector<int>().swap(fanout_to_fanin);
+    graph_weights_valid = false;
     thrust::device_vector<int>().swap(bvss.real_ptrs);
     thrust::device_vector<int>().swap(bvss.virtual_to_real);
     thrust::device_vector<unsigned char>().swap(bvss.slice_counts);
@@ -7597,6 +7612,89 @@ struct CpGen::TcPfxtStaticCache {
     compact_devs.release();
   }
 };
+
+bool CpGen::_has_incremental_cache_candidate() const {
+  const auto* cache = _tc_pfxt_static_cache.get();
+  return std::getenv("GPUCPG_SPTC_INCREMENTAL_PROFILE") == nullptr
+    && cache != nullptr
+    && cache->can_reuse_tc_static(
+      static_cast<int>(num_verts()), static_cast<int>(num_edges()), true)
+    && cache->graph_weights_valid;
+}
+
+struct TcPfxtIncrementalDeviceUpdate {
+  int src;
+  int dst;
+  int fanout_edge;
+  int fanin_edge;
+  float new_weight;
+  float weight_delta;
+};
+
+__global__ void apply_tc_pfxt_incremental_value_updates(
+  const TcPfxtIncrementalDeviceUpdate* updates,
+  const int count,
+  const int* compact_offsets,
+  const int* compact_dsts,
+  float* compact_deltas,
+  float* fanout_wgts,
+  float* fanin_wgts) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= count) return;
+  const auto update = updates[tid];
+  fanout_wgts[update.fanout_edge] = update.new_weight;
+  fanin_wgts[update.fanin_edge] = update.new_weight;
+  for (int slot = compact_offsets[update.src];
+       slot < compact_offsets[update.src + 1]; ++slot) {
+    if (compact_dsts[slot] == update.dst) {
+      compact_deltas[slot] += update.weight_delta;
+      return;
+    }
+  }
+}
+
+bool CpGen::_try_incremental_cache_update(
+  const std::vector<EdgeWeightUpdate>& updates,
+  float& device_update_ms) {
+  device_update_ms = 0.0f;
+  auto* cache = _tc_pfxt_static_cache.get();
+  if (!_has_incremental_cache_candidate()) return false;
+
+  std::vector<TcPfxtIncrementalDeviceUpdate> dirty;
+  dirty.reserve(updates.size());
+  for (const auto& update : updates) {
+    const float old_weight = _h_fanout_wgts[update.edge_id];
+    if (old_weight == update.weight) continue;
+    const int src = _h_fanout_sources[update.edge_id];
+    const int dst = _h_fanout_adjncy[update.edge_id];
+    if (sptc::classify_value_only_update(
+          old_weight, update.weight, src, dst,
+          cache->h_succs, cache->h_dists)
+        != sptc::ValueOnlyUpdateRejection::NONE) return false;
+    dirty.push_back(TcPfxtIncrementalDeviceUpdate{
+      src, dst, static_cast<int>(update.edge_id),
+      _h_fanout_to_fanin[update.edge_id], update.weight,
+      update.weight - old_weight});
+  }
+  if (dirty.empty()) return true;
+
+  const auto begin = std::chrono::steady_clock::now();
+  thrust::device_vector<TcPfxtIncrementalDeviceUpdate> d_dirty(dirty);
+  apply_tc_pfxt_incremental_value_updates<<<
+    ROUNDUPBLOCKS(static_cast<int>(dirty.size()), 128), 128>>>(
+      thrust::raw_pointer_cast(d_dirty.data()),
+      static_cast<int>(dirty.size()),
+      thrust::raw_pointer_cast(cache->compact_devs.offsets.data()),
+      thrust::raw_pointer_cast(cache->compact_devs.dsts.data()),
+      thrust::raw_pointer_cast(cache->compact_devs.deltas.data()),
+      thrust::raw_pointer_cast(cache->fanout_wgts.data()),
+      thrust::raw_pointer_cast(cache->fanin_wgts.data()));
+  checkError_t(cudaGetLastError(), "incremental cache update launch failed");
+  checkError_t(cudaDeviceSynchronize(), "incremental cache update failed");
+  device_update_ms = std::chrono::duration<float, std::milli>(
+    std::chrono::steady_clock::now() - begin).count();
+  return true;
+}
 
 CpGen::CpGen()
   : _tc_pfxt_static_cache(std::make_unique<TcPfxtStaticCache>()) {
@@ -16385,6 +16483,10 @@ void CpGen::report_paths(
     _tc_pfxt_static_cache->dists_cache = dists_cache;
     _tc_pfxt_static_cache->queue = queue;
     _tc_pfxt_static_cache->successors = successors;
+    _tc_pfxt_static_cache->fanin_wgts = fanin_wgts;
+    _tc_pfxt_static_cache->fanout_wgts = fanout_wgts;
+    _tc_pfxt_static_cache->fanout_to_fanin = _h_fanout_to_fanin;
+    _tc_pfxt_static_cache->graph_weights_valid = true;
     _tc_pfxt_static_cache->sfxt_valid = true;
   }
   }

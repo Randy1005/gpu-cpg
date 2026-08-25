@@ -53,6 +53,9 @@ struct GraphWeightUpdateResult {
   std::size_t requested = 0;
   std::size_t changed = 0;
   bool derived_state_invalidated = false;
+  bool device_cache_updated = false;
+  bool device_cache_fallback = false;
+  float device_update_ms = 0.0f;
 };
 
 enum class PropDistMethod {
@@ -381,6 +384,12 @@ public:
 
 private:
   struct TcPfxtStaticCache;
+
+  bool _has_incremental_cache_candidate() const;
+
+  bool _try_incremental_cache_update(
+    const std::vector<EdgeWeightUpdate>& updates,
+    float& device_update_ms);
 
   void _free();
 
