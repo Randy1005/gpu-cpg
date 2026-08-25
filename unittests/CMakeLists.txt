@@ -2,6 +2,8 @@ enable_testing()
 include(${GPUCPG_3RDPARTY_DIR}/doctest/doctest.cmake)
 list(APPEND CU_UNITTESTS
   ballot
+  sptc_gate_metrics
+  tc_graph_updates
   tc_pfxt_adaptive
   tc_pfxt_candidates
   tc_pfxt_inprocess

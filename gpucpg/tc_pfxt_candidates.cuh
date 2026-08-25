@@ -325,6 +325,8 @@ struct StaticDeviationCsr {
 
 struct CompactStaticDeviationCsr {
   std::vector<int> offsets;
+  // Stable fanout-CSR identity retained for incremental replay.
+  std::vector<int> edge_ids;
   std::vector<int> dsts;
   std::vector<float> deltas;
 };
@@ -608,7 +610,8 @@ inline CompactStaticDeviationCsr build_compact_static_deviation_csr(
   const std::vector<int>& col_idx,
   const std::vector<float>& weights,
   const std::vector<int>& succs,
-  const std::vector<int>& dists) {
+  const std::vector<int>& dists,
+  const bool retain_edge_ids = false) {
   CompactStaticDeviationCsr csr;
   csr.offsets.resize(static_cast<std::size_t>(n_nodes) + 1, 0);
   if (n_nodes <= 0) {
@@ -633,6 +636,7 @@ inline CompactStaticDeviationCsr build_compact_static_deviation_csr(
         src_dist,
         dst_dist,
         edge_id < static_cast<int>(weights.size()) ? weights[edge_id] : 0.0f);
+      if (retain_edge_ids) csr.edge_ids.push_back(edge_id);
       csr.dsts.push_back(dst);
       csr.deltas.push_back(delta);
     }

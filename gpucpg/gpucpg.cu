@@ -1,4 +1,5 @@
 #include "gpucpg.cuh"
+#include "sptc_gate_metrics.cuh"
 #include "tc_pfxt_bvss.cuh"
 #include "tc_pfxt_adaptive.cuh"
 #include "tc_pfxt_candidates.cuh"
@@ -447,6 +448,24 @@ void CpGen::read_input(const std::string& filename, bool ignore_wgts) {
   }
 
   benchmark_path = filename;
+  _h_fanin_edges.clear();
+  _h_fanout_edges.clear();
+  _h_fanin_adjncy.clear();
+  _h_fanin_wgts.clear();
+  _h_fanout_adjncy.clear();
+  _h_fanout_wgts.clear();
+  _h_inv_fanout_adjncy.clear();
+  _h_inv_fanin_adjncy.clear();
+  _h_fanout_sources.clear();
+  _h_fanout_to_fanin.clear();
+  _srcs.clear();
+  _sinks.clear();
+  _sptc_incremental_profile_pending = false;
+  _sptc_incremental_dirty_edges.clear();
+  _sptc_incremental_old_dists.clear();
+  _sptc_incremental_old_succs.clear();
+  _sptc_incremental_old_edge_ids.clear();
+  _sptc_incremental_old_deltas.clear();
   std::string line;
   int vertex_count;
 
@@ -534,6 +553,149 @@ void CpGen::read_input(const std::string& filename, bool ignore_wgts) {
       _h_inv_fanin_adjncy.push_back(i);
     }
   }
+
+  const auto edge_key = [](const int src, const int dst) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned int>(src)) << 32)
+      | static_cast<unsigned int>(dst);
+  };
+  std::unordered_map<std::uint64_t, int> fanin_by_endpoint;
+  fanin_by_endpoint.reserve(_h_fanin_adjncy.size());
+  for (int dst = 0; dst < vertex_count; ++dst) {
+    for (int edge = _h_fanin_adjp[dst]; edge < _h_fanin_adjp[dst + 1]; ++edge) {
+      const auto [_, inserted] = fanin_by_endpoint.emplace(
+        edge_key(_h_fanin_adjncy[edge], dst), edge);
+      if (!inserted) {
+        throw std::runtime_error(
+          "parallel edges must be collapsed before incremental updates");
+      }
+    }
+  }
+  _h_fanout_sources.resize(_h_fanout_adjncy.size(), -1);
+  _h_fanout_to_fanin.resize(_h_fanout_adjncy.size(), -1);
+  for (int src = 0; src < vertex_count; ++src) {
+    for (int edge = _h_fanout_adjp[src]; edge < _h_fanout_adjp[src + 1]; ++edge) {
+      const auto it = fanin_by_endpoint.find(edge_key(src, _h_fanout_adjncy[edge]));
+      if (it == fanin_by_endpoint.end()) {
+        throw std::runtime_error("fanin/fanout CSR mismatch");
+      }
+      _h_fanout_sources[edge] = src;
+      _h_fanout_to_fanin[edge] = it->second;
+    }
+  }
+}
+
+float CpGen::edge_weight(const std::size_t edge_id) const {
+  if (edge_id >= _h_fanout_wgts.size()) {
+    throw std::out_of_range("edge id outside graph");
+  }
+  return _h_fanout_wgts[edge_id];
+}
+
+std::pair<int, int> CpGen::edge_endpoints(const std::size_t edge_id) const {
+  if (edge_id >= _h_fanout_adjncy.size()
+      || edge_id >= _h_fanout_sources.size()) {
+    throw std::out_of_range("edge id outside graph");
+  }
+  return {_h_fanout_sources[edge_id], _h_fanout_adjncy[edge_id]};
+}
+
+std::optional<std::size_t> CpGen::find_edge_id(const int src, const int dst) const {
+  if (src < 0 || dst < 0
+      || src >= static_cast<int>(num_verts())
+      || dst >= static_cast<int>(num_verts())) return std::nullopt;
+  for (int edge = _h_fanout_adjp[src]; edge < _h_fanout_adjp[src + 1]; ++edge) {
+    if (_h_fanout_adjncy[edge] == dst)
+      return static_cast<std::size_t>(edge);
+  }
+  return std::nullopt;
+}
+
+GraphWeightUpdateResult CpGen::update_edge_weights(
+  const std::vector<EdgeWeightUpdate>& updates) {
+  std::unordered_set<std::size_t> seen;
+  seen.reserve(updates.size());
+  for (const auto update : updates) {
+    if (update.edge_id >= _h_fanout_wgts.size()) {
+      throw std::out_of_range("edge weight update id outside graph");
+    }
+    if (!std::isfinite(update.weight)) {
+      throw std::invalid_argument("edge weight update must be finite");
+    }
+    if (!seen.insert(update.edge_id).second) {
+      throw std::invalid_argument("duplicate edge id in weight update batch");
+    }
+  }
+
+  std::vector<std::size_t> changed_edges;
+  changed_edges.reserve(updates.size());
+  for (const auto update : updates) {
+    if (_h_fanout_wgts[update.edge_id] != update.weight)
+      changed_edges.push_back(update.edge_id);
+  }
+  if (!changed_edges.empty()
+      && std::getenv("GPUCPG_SPTC_INCREMENTAL_PROFILE") != nullptr) {
+    if (_h_dists.size() == num_verts() && _h_succs.size() == num_verts()) {
+      auto old_compact = tc_pfxt::build_compact_static_deviation_csr(
+        static_cast<int>(num_verts()),
+        _h_fanout_adjp,
+        _h_fanout_adjncy,
+        _h_fanout_wgts,
+        std::vector<int>(_h_succs.begin(), _h_succs.end()),
+        std::vector<int>(_h_dists.begin(), _h_dists.end()),
+        true);
+      _sptc_incremental_profile_pending = true;
+      _sptc_incremental_dirty_edges = changed_edges;
+      _sptc_incremental_old_dists.assign(_h_dists.begin(), _h_dists.end());
+      _sptc_incremental_old_succs.assign(_h_succs.begin(), _h_succs.end());
+      _sptc_incremental_old_edge_ids = std::move(old_compact.edge_ids);
+      _sptc_incremental_old_deltas = std::move(old_compact.deltas);
+      std::cout << "sptc_incremental_before_image"
+        << " edited_edges=" << changed_edges.size()
+        << " compact_slots=" << _sptc_incremental_old_edge_ids.size()
+        << '\n';
+    } else {
+      std::cout << "sptc_incremental_before_image unavailable=1"
+        << " reason=no_completed_derived_state\n";
+    }
+  }
+
+  GraphWeightUpdateResult result{updates.size(), changed_edges.size(), false};
+  for (const auto update : updates) {
+    if (_h_fanout_wgts[update.edge_id] == update.weight) continue;
+    const auto [src, dst] = edge_endpoints(update.edge_id);
+    const int fanin_edge = _h_fanout_to_fanin[update.edge_id];
+    if (fanin_edge < 0 || fanin_edge >= static_cast<int>(_h_fanin_wgts.size())) {
+      throw std::runtime_error("edge weight update has invalid fanin mapping");
+    }
+    _h_fanout_wgts[update.edge_id] = update.weight;
+    _h_fanin_wgts[fanin_edge] = update.weight;
+    for (auto& [neighbor, weight] : _h_fanout_edges[src]) {
+      if (neighbor == dst) weight = update.weight;
+    }
+    for (auto& [neighbor, weight] : _h_fanin_edges[dst]) {
+      if (neighbor == src) weight = update.weight;
+    }
+  }
+  if (result.changed != 0) {
+    clear_tc_pfxt_static_cache();
+    result.derived_state_invalidated = true;
+  }
+  return result;
+}
+
+GraphWeightUpdateResult CpGen::update_edge_weights_by_endpoint(
+  const std::vector<EndpointWeightUpdate>& updates) {
+  std::vector<EdgeWeightUpdate> resolved;
+  resolved.reserve(updates.size());
+  for (const auto update : updates) {
+    const auto edge = find_edge_id(update.src, update.dst);
+    if (!edge) {
+      throw std::out_of_range(
+        "endpoint weight update does not identify a graph edge");
+    }
+    resolved.push_back({*edge, update.weight});
+  }
+  return update_edge_weights(resolved);
 }
 
 void CpGen::convert_dimacs(
@@ -5397,6 +5559,49 @@ __global__ void fill_tc_pfxt_source_local_tiles(
         (parent_count_this << 16) | (dev_count_this & 0xffff));
     }
   }
+}
+
+// Gate-only counter over the exact source-local product tiles consumed by the
+// production candidate path. Groups are formed along each parent's deviation
+// row, matching the K dimension an SpMMA score formulation would use.
+__global__ void profile_sptc_exact_2_to_4_eligibility(
+  const int n_tiles,
+  const int4* tiles,
+  const int* active_sources,
+  const int* dev_offsets,
+  const unsigned char* dev_reachable,
+  unsigned long long* stats) {
+  const int tile_idx = blockIdx.x;
+  if (tile_idx >= n_tiles) return;
+  const auto tile = tiles[tile_idx];
+  const int src = active_sources[tile.x];
+  const int dev_base = dev_offsets[src] + tile.z;
+  const int parent_count = tile.w >> 16;
+  const int dev_count = tile.w & 0xffff;
+  const int groups_per_parent = (dev_count + 3) / 4;
+  __shared__ unsigned long long block_stats[9];
+  if (threadIdx.x < 9) block_stats[threadIdx.x] = 0ULL;
+  __syncthreads();
+  for (int dev_group = threadIdx.x;
+       dev_group < groups_per_parent;
+       dev_group += blockDim.x) {
+    const int local_begin = dev_group * 4;
+    unsigned int nonzeros = 0;
+    for (int lane = 0; lane < 4 && local_begin + lane < dev_count; ++lane) {
+      nonzeros += dev_reachable == nullptr
+        || dev_reachable[dev_base + local_begin + lane] != 0 ? 1U : 0U;
+    }
+    const auto parent_weight = static_cast<unsigned long long>(parent_count);
+    const auto product_weight = parent_weight * nonzeros;
+    atomicAdd(block_stats + nonzeros, parent_weight);
+    atomicAdd(block_stats + 5, product_weight);
+    atomicAdd(block_stats + (nonzeros <= 2 ? 6 : 7),
+      product_weight);
+    atomicAdd(block_stats + 8,
+      parent_weight * (nonzeros <= 2 ? 2ULL : 4ULL));
+  }
+  __syncthreads();
+  if (threadIdx.x < 9) atomicAdd(stats + threadIdx.x, block_stats[threadIdx.x]);
 }
 
 __global__ void profile_tc_pfxt_scalar_tile_classification(
@@ -10418,6 +10623,12 @@ static void tc_pfxt_expand_window_single_pass(
     std::getenv("GPUCPG_TC_PFXT_VSS_DESCRIPTOR_PROFILE") != nullptr;
   const bool replay_vss_descriptors =
     std::getenv("GPUCPG_TC_PFXT_VSS_DESCRIPTOR_REPLAY") != nullptr;
+  const bool profile_sptc_eligibility =
+    std::getenv("GPUCPG_SPTC_ELIGIBILITY_PROFILE") != nullptr;
+  thrust::device_vector<unsigned long long> sptc_eligibility_stats;
+  if (profile_sptc_eligibility) {
+    sptc_eligibility_stats.resize(9, 0ULL);
+  }
   const char* work_equivalence_csv =
     std::getenv("GPUCPG_TC_PFXT_WORK_EQUIV_CSV");
   const char* source_selectivity_csv =
@@ -12473,6 +12684,16 @@ static void tc_pfxt_expand_window_single_pass(
               use_compact_source_groups,
 	              thrust::raw_pointer_cast(source_local_tiles.data()));
 	          cudaCheckErrors("tc pfxt source-local fill tile descriptors failed");
+          if (profile_sptc_eligibility) {
+            profile_sptc_exact_2_to_4_eligibility<<<h_n_tiles, 256>>>(
+              h_n_tiles,
+              thrust::raw_pointer_cast(source_local_tiles.data()),
+              thrust::raw_pointer_cast(source_local_active_sources.data()),
+              source_local_dev_offsets,
+              source_local_dev_reachable,
+              thrust::raw_pointer_cast(sptc_eligibility_stats.data()));
+            cudaCheckErrors("SpTC exact 2:4 eligibility profile failed");
+          }
           if (profile_tf32_mma_classification) {
             thrust::device_vector<unsigned long long> scalar_class_stats(4, 0ULL);
             const auto scalar_class_start = std::chrono::steady_clock::now();
@@ -14558,6 +14779,28 @@ static void tc_pfxt_expand_window_single_pass(
         << " skip_min_pct=" << defer_oracle_skip_min_pct
         << '\n';
     }
+  }
+  if (profile_sptc_eligibility) {
+    const thrust::host_vector<unsigned long long> stats(sptc_eligibility_stats);
+    const auto useful = stats[5];
+    const auto one_pass = stats[6];
+    const auto multi_pass = stats[7];
+    const auto groups = stats[0] + stats[1] + stats[2] + stats[3] + stats[4];
+    std::cout << "sptc_eligibility"
+      << " step=" << outer_step
+      << " groups=" << groups
+      << " groups_nnz0=" << stats[0]
+      << " groups_nnz1=" << stats[1]
+      << " groups_nnz2=" << stats[2]
+      << " groups_nnz3=" << stats[3]
+      << " groups_nnz4=" << stats[4]
+      << " useful_products=" << useful
+      << " one_pass_products=" << one_pass
+      << " multi_pass_products=" << multi_pass
+      << " one_pass_fraction="
+      << (useful == 0 ? 0.0 : static_cast<double>(one_pass) / useful)
+      << " sparse_value_slots=" << stats[8]
+      << '\n';
   }
   step_timing.max_chain_substeps = std::max(step_timing.max_chain_substeps, chain_substep);
   step_timing.sfx_chain_walk_steps += sfx_chain_walk_steps;
@@ -16918,7 +17161,41 @@ void CpGen::report_paths(
               _h_fanout_adjncy,
               _h_fanout_wgts,
               std::vector<int>(_h_succs.begin(), _h_succs.end()),
-              h_dists);
+              h_dists,
+              _sptc_incremental_profile_pending);
+            if (_sptc_incremental_profile_pending) {
+              const auto stats = sptc::compare_derived_update(
+                _sptc_incremental_old_dists,
+                _sptc_incremental_old_succs,
+                _sptc_incremental_old_edge_ids,
+                _sptc_incremental_old_deltas,
+                h_dists,
+                std::vector<int>(_h_succs.begin(), _h_succs.end()),
+                h_compact_devs.edge_ids,
+                h_compact_devs.deltas);
+              std::cout << "sptc_incremental_oracle"
+                << " edited_edges=" << _sptc_incremental_dirty_edges.size()
+                << " vertices=" << stats.vertices
+                << " changed_distances=" << stats.changed_distances
+                << " distance_change_fraction=" << stats.vertex_change_fraction()
+                << " changed_successors=" << stats.changed_successors
+                << " old_compact_slots=" << stats.old_compact_slots
+                << " new_compact_slots=" << stats.new_compact_slots
+                << " added_slots=" << stats.added_slots
+                << " removed_slots=" << stats.removed_slots
+                << " changed_value_slots=" << stats.changed_value_slots
+                << " affected_slots=" << stats.affected_slots()
+                << " slot_change_fraction=" << stats.slot_change_fraction()
+                << " slot_amplification="
+                << stats.slot_amplification(_sptc_incremental_dirty_edges.size())
+                << '\n';
+              _sptc_incremental_profile_pending = false;
+              _sptc_incremental_dirty_edges.clear();
+              _sptc_incremental_old_dists.clear();
+              _sptc_incremental_old_succs.clear();
+              _sptc_incremental_old_edge_ids.clear();
+              _sptc_incremental_old_deltas.clear();
+            }
             tc_pfxt_compact_static_devs.offsets = h_compact_devs.offsets;
             tc_pfxt_compact_static_devs.dsts = h_compact_devs.dsts;
             tc_pfxt_compact_static_devs.deltas = h_compact_devs.deltas;
@@ -16937,6 +17214,30 @@ void CpGen::report_paths(
                 << h_aligned_bvss.n_vss
                 << ", comp_ratio=" << h_aligned_bvss.compression_ratio()
                 << '\n';
+              if (std::getenv("GPUCPG_SPTC_BVSS_ELIGIBILITY_PROFILE") != nullptr) {
+                const auto eligibility =
+                  sptc::analyze_bvss_masks_exact_2_to_4(h_aligned_bvss);
+                const auto bvss_bytes = sptc::bvss_allocated_bytes(h_aligned_bvss);
+                const auto fp16_value_bytes = eligibility.sparse_value_slots * 2ULL;
+                std::cout << "sptc_bvss_eligibility"
+                  << " groups=" << eligibility.groups()
+                  << " groups_nnz0=" << eligibility.groups_by_nnz[0]
+                  << " groups_nnz1=" << eligibility.groups_by_nnz[1]
+                  << " groups_nnz2=" << eligibility.groups_by_nnz[2]
+                  << " groups_nnz3=" << eligibility.groups_by_nnz[3]
+                  << " groups_nnz4=" << eligibility.groups_by_nnz[4]
+                  << " useful_nonzeros=" << eligibility.useful_nonzeros
+                  << " one_pass_nonzeros=" << eligibility.one_pass_nonzeros
+                  << " multi_pass_nonzeros=" << eligibility.multi_pass_nonzeros
+                  << " one_pass_fraction="
+                  << eligibility.one_pass_product_fraction()
+                  << " bvss_allocated_bytes=" << bvss_bytes
+                  << " fp16_value_bytes_lower_bound=" << fp16_value_bytes
+                  << " fp16_value_to_bvss_ratio_lower_bound="
+                  << (bvss_bytes == 0 ? 0.0
+                    : static_cast<double>(fp16_value_bytes) / bvss_bytes)
+                  << '\n';
+              }
               if (tc_pfxt_use_static_cache) {
                 _tc_pfxt_static_cache->aligned_bvss_valid = true;
               }

@@ -9,12 +9,12 @@
 #include <queue>
 #include <numeric>
 #include <random>
-#include <queue>
 #include <functional>
 #include <unordered_map>
 #include <optional>
 #include <iomanip>
 #include <memory>
+#include <utility>
 #include <thrust/host_vector.h>
 #include "timer.hpp"
 #include "graph.h"
@@ -37,6 +37,23 @@
 namespace gpucpg {
 struct PfxtNode;
 class CpGen;
+
+struct EdgeWeightUpdate {
+  std::size_t edge_id = 0;
+  float weight = 0.0f;
+};
+
+struct EndpointWeightUpdate {
+  int src = -1;
+  int dst = -1;
+  float weight = 0.0f;
+};
+
+struct GraphWeightUpdateResult {
+  std::size_t requested = 0;
+  std::size_t changed = 0;
+  bool derived_state_invalidated = false;
+};
 
 enum class PropDistMethod {
   BASIC = 0,
@@ -207,6 +224,13 @@ public:
 
   size_t num_verts() const;
   size_t num_edges() const;
+  float edge_weight(std::size_t edge_id) const;
+  std::pair<int, int> edge_endpoints(std::size_t edge_id) const;
+  std::optional<std::size_t> find_edge_id(int src, int dst) const;
+  GraphWeightUpdateResult update_edge_weights(
+    const std::vector<EdgeWeightUpdate>& updates);
+  GraphWeightUpdateResult update_edge_weights_by_endpoint(
+    const std::vector<EndpointWeightUpdate>& updates);
 
   void reset() {
     _h_verts_lvlp.clear();
@@ -380,6 +404,18 @@ private:
   std::vector<int> _h_fanout_adjp;
   std::vector<int> _h_fanout_adjncy;
   std::vector<float> _h_fanout_wgts;
+  std::vector<int> _h_fanout_sources;
+  std::vector<int> _h_fanout_to_fanin;
+
+  // Profiling-only before-image for the incremental SpTC feasibility gate.
+  // It is populated only when GPUCPG_SPTC_INCREMENTAL_PROFILE is set and is
+  // consumed after the next exact recomputation.
+  bool _sptc_incremental_profile_pending = false;
+  std::vector<std::size_t> _sptc_incremental_dirty_edges;
+  std::vector<int> _sptc_incremental_old_dists;
+  std::vector<int> _sptc_incremental_old_succs;
+  std::vector<int> _sptc_incremental_old_edge_ids;
+  std::vector<float> _sptc_incremental_old_deltas;
 
   // inversed CSR storage
   std::vector<int> _h_inv_fanout_adjncy;

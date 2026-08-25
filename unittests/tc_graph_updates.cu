@@ -1,0 +1,77 @@
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+#include <gpucpg/gpucpg.cuh>
+
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+
+namespace {
+
+std::filesystem::path write_graph() {
+  const auto path = std::filesystem::temp_directory_path()
+    / "gpucpg_incremental_weight_update_test.txt";
+  std::ofstream out(path);
+  out << "3\n0\n1\n2\n"
+      << "\"0\" -> \"1\", 1.5;\n"
+      << "\"0\" -> \"2\", 2.5;\n"
+      << "\"1\" -> \"2\", 3.5;\n";
+  return path;
+}
+
+}  // namespace
+
+TEST_CASE("batched weight updates preserve endpoint identity and use edge ids") {
+  gpucpg::CpGen graph;
+  graph.read_input(write_graph().string());
+  REQUIRE(graph.num_edges() == 3);
+  CHECK(graph.edge_endpoints(0) == std::pair{0, 1});
+  CHECK(graph.edge_endpoints(1) == std::pair{0, 2});
+  CHECK(graph.edge_endpoints(2) == std::pair{1, 2});
+  const auto result = graph.update_edge_weights({{0, 1.75f}, {2, 3.25f}});
+  CHECK(result.requested == 2);
+  CHECK(result.changed == 2);
+  CHECK(result.derived_state_invalidated);
+  CHECK(graph.edge_weight(0) == doctest::Approx(1.75f));
+  CHECK(graph.edge_weight(1) == doctest::Approx(2.5f));
+  CHECK(graph.edge_weight(2) == doctest::Approx(3.25f));
+}
+
+TEST_CASE("endpoint updates resolve stable edge ids atomically") {
+  gpucpg::CpGen graph;
+  graph.read_input(write_graph().string());
+  CHECK(graph.find_edge_id(0,1) == 0);
+  CHECK(graph.find_edge_id(0,2) == 1);
+  CHECK(graph.find_edge_id(1,2) == 2);
+  CHECK_FALSE(graph.find_edge_id(2,0));
+  CHECK_FALSE(graph.find_edge_id(-1,0));
+  const auto result = graph.update_edge_weights_by_endpoint(
+    std::vector<gpucpg::EndpointWeightUpdate>{{0,1,4.0f},{1,2,5.0f}});
+  CHECK(result.changed == 2);
+  CHECK(graph.edge_weight(0) == doctest::Approx(4.0f));
+  CHECK(graph.edge_weight(2) == doctest::Approx(5.0f));
+  CHECK_THROWS_AS(graph.update_edge_weights_by_endpoint(
+    std::vector<gpucpg::EndpointWeightUpdate>{{0,1,6.0f},{2,0,7.0f}}),
+    std::out_of_range);
+  CHECK(graph.edge_weight(0) == doctest::Approx(4.0f));
+}
+
+TEST_CASE("no-op batch does not invalidate derived state") {
+  gpucpg::CpGen graph;
+  graph.read_input(write_graph().string());
+  const auto result = graph.update_edge_weights({{1, 2.5f}});
+  CHECK(result.requested == 1);
+  CHECK(result.changed == 0);
+  CHECK_FALSE(result.derived_state_invalidated);
+}
+
+TEST_CASE("invalid batches are rejected atomically") {
+  gpucpg::CpGen graph;
+  graph.read_input(write_graph().string());
+  CHECK_THROWS_AS(graph.update_edge_weights({{3, 1.0f}}), std::out_of_range);
+  CHECK_THROWS_AS(
+    graph.update_edge_weights({{0, std::nanf("")}}), std::invalid_argument);
+  CHECK_THROWS_AS(
+    graph.update_edge_weights({{0, 2.0f}, {0, 3.0f}}), std::invalid_argument);
+  CHECK(graph.edge_weight(0) == doctest::Approx(1.5f));
+}

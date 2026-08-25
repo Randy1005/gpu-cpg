@@ -364,10 +364,24 @@ TEST_CASE("tc pfxt builds compact static deviation CSR with reachable deviations
     dists);
 
   REQUIRE(csr.offsets == std::vector<int> {0, 1, 2, 2, 2});
+  CHECK(csr.edge_ids.empty());
   REQUIRE(csr.dsts == std::vector<int> {3, 0});
   REQUIRE(csr.deltas.size() == 2);
   CHECK(csr.deltas[0] == doctest::Approx(0.6f));
   CHECK(csr.deltas[1] == doctest::Approx(0.5f));
+
+  const auto profiled = build_compact_static_deviation_csr(
+    4,
+    row_ptr,
+    col_idx,
+    weights,
+    succs,
+    dists,
+    true);
+  CHECK(profiled.offsets == csr.offsets);
+  CHECK(profiled.dsts == csr.dsts);
+  CHECK(profiled.deltas == csr.deltas);
+  CHECK(profiled.edge_ids == std::vector<int>{3,5});
 }
 
 TEST_CASE("tc pfxt pair lower-bound pruning respects active output threshold") {

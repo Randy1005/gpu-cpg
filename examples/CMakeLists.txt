@@ -29,6 +29,7 @@ add_executable(tc-pfxt-gate4-step1 ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-gate4-step1.cu)
 add_executable(tc-pfxt-gate5 ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-gate5.cu)
 add_executable(tc-pfxt-inprocess-timing ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-inprocess-timing.cu)
 add_executable(tc-pfxt-inprocess-exactness ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-inprocess-exactness.cu)
+add_executable(sptc-incremental-replay ${GPUCPG_EXAMPLE_DIR}/sptc-incremental-replay.cu)
 add_executable(tc-sfxt-bvss-check ${GPUCPG_EXAMPLE_DIR}/tc-sfxt-bvss-check.cu)
 
 
@@ -63,6 +64,7 @@ list(APPEND GPUCPG_EXAMPLES
   tc-pfxt-gate5
   tc-pfxt-inprocess-timing
   tc-pfxt-inprocess-exactness
+  sptc-incremental-replay
   tc-sfxt-bvss-check)
 
 foreach(example IN LISTS GPUCPG_EXAMPLES)
