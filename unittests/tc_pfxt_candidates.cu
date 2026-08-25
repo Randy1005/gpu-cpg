@@ -497,6 +497,21 @@ TEST_CASE("tc pfxt block candidate offsets are stable across tiles") {
   CHECK(d_totals[1] == long_total);
 }
 
+TEST_CASE("tc pfxt maps every linear tile across empty source ranges") {
+  using gpucpg::tc_pfxt::source_slot_for_linear_tile;
+  const int offsets[] {0, 2, 2, 7, 8};
+
+  CHECK(source_slot_for_linear_tile(-1, 4, offsets) == -1);
+  CHECK(source_slot_for_linear_tile(0, 4, offsets) == 0);
+  CHECK(source_slot_for_linear_tile(1, 4, offsets) == 0);
+  CHECK(source_slot_for_linear_tile(2, 4, offsets) == 2);
+  CHECK(source_slot_for_linear_tile(6, 4, offsets) == 2);
+  CHECK(source_slot_for_linear_tile(7, 4, offsets) == 3);
+  CHECK(source_slot_for_linear_tile(8, 4, offsets) == -1);
+  CHECK(source_slot_for_linear_tile(0, 0, offsets) == -1);
+  CHECK(source_slot_for_linear_tile(0, 4, nullptr) == -1);
+}
+
 TEST_CASE("tc pfxt validates pair metadata before candidate generation") {
   using gpucpg::tc_pfxt::PairMeta;
   using gpucpg::tc_pfxt::pair_meta_is_valid;

@@ -5536,12 +5536,18 @@ __global__ void fill_tc_pfxt_source_local_tiles(
   const int* group_offsets,
   const int* dev_offsets,
   const int* tile_offsets,
+  const int n_tiles,
   const int parent_tile,
   const int dev_tile,
   const bool compact_group_offsets,
   int4* tiles) {
-  const int source_slot = threadIdx.x + blockIdx.x * blockDim.x;
-  if (source_slot >= n_sources) {
+  const int tile_idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tile_idx >= n_tiles) {
+    return;
+  }
+  const int source_slot = tc_pfxt::source_slot_for_linear_tile(
+    tile_idx, n_sources, tile_offsets);
+  if (source_slot < 0) {
     return;
   }
   const int src = active_sources[source_slot];
@@ -5549,23 +5555,17 @@ __global__ void fill_tc_pfxt_source_local_tiles(
     tc_pfxt_source_group_end(group_offsets, src, source_slot, compact_group_offsets)
     - tc_pfxt_source_group_begin(group_offsets, src, source_slot, compact_group_offsets);
   const int dev_count = dev_offsets[src + 1] - dev_offsets[src];
-  const int parent_tiles = tc_pfxt::ceil_div_int(parent_count, parent_tile);
   const int dev_tiles = tc_pfxt::ceil_div_int(dev_count, dev_tile);
-  int write = tile_offsets[source_slot];
-  for (int pt = 0; pt < parent_tiles; ++pt) {
-    const int parent_begin = pt * parent_tile;
-    const int parent_count_this =
-      min(parent_tile, parent_count - parent_begin);
-    for (int dt = 0; dt < dev_tiles; ++dt) {
-      const int dev_begin = dt * dev_tile;
-      const int dev_count_this = min(dev_tile, dev_count - dev_begin);
-      tiles[write++] = make_int4(
-        source_slot,
-        parent_begin,
-        dev_begin,
-        (parent_count_this << 16) | (dev_count_this & 0xffff));
-    }
-  }
+  const int local_tile = tile_idx - tile_offsets[source_slot];
+  const int parent_begin = (local_tile / dev_tiles) * parent_tile;
+  const int dev_begin = (local_tile % dev_tiles) * dev_tile;
+  const int parent_count_this = min(parent_tile, parent_count - parent_begin);
+  const int dev_count_this = min(dev_tile, dev_count - dev_begin);
+  tiles[tile_idx] = make_int4(
+    source_slot,
+    parent_begin,
+    dev_begin,
+    (parent_count_this << 16) | (dev_count_this & 0xffff));
 }
 
 // Gate-only counter over the exact source-local product tiles consumed by the
@@ -5935,6 +5935,22 @@ __global__ void sample_tc_pfxt_defer_candidate_classes(
 // Runs before source grouping so adaptive mode is available early enough to
 // guard the complete deferred pipeline. One sampled deviation per active path,
 // weighted by deviation degree, supplies transition-region class evidence.
+__global__ void mark_tc_pfxt_unsafe_ordinary_chains(
+  const int* current_v,
+  const int n_active,
+  const unsigned long long* chain_product_upper_bounds,
+  const unsigned long long low,
+  int* all_safe) {
+  const int active_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (active_idx >= n_active || atomicAdd(all_safe, 0) == 0) {
+    return;
+  }
+  const int src = current_v[active_idx];
+  if (src >= 0 && chain_product_upper_bounds[src] >= low) {
+    atomicExch(all_safe, 0);
+  }
+}
+
 __global__ void collect_tc_pfxt_adaptive_path_stats(
   const int* current_v,
   const int n_active,
@@ -5949,65 +5965,85 @@ __global__ void collect_tc_pfxt_adaptive_path_stats(
   const bool skip_long_paths,
   const unsigned int seed,
   TcPfxtSourceLocalStats* source_stats,
-  unsigned long long* sample_stats) {
-  const int active_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (active_idx >= n_active) {
+  unsigned long long* sample_stats,
+  const int* ordinary_safe) {
+  if (ordinary_safe != nullptr && ordinary_safe[0] != 0) {
     return;
   }
-  const int src = current_v[active_idx];
-  if (src < 0) {
-    return;
-  }
-  const int dev_begin = dev_offsets[src];
-  const int dev_count = dev_offsets[src + 1] - dev_begin;
-  if (dev_count <= 0) {
-    return;
+  tc_pfxt::AdaptiveOracleContribution local;
+  const int stride = blockDim.x * gridDim.x;
+  for (int active_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       active_idx < n_active;
+       active_idx += stride) {
+    const int src = current_v[active_idx];
+    if (src < 0) {
+      continue;
+    }
+    const int dev_begin = dev_offsets[src];
+    const int dev_count = dev_offsets[src + 1] - dev_begin;
+    if (dev_count <= 0) {
+      continue;
+    }
+
+    const auto weight = static_cast<unsigned long long>(dev_count);
+    local.active_paths += 1ULL;
+    local.parent_dev_products += weight;
+    local.max_dev_count = local.max_dev_count > weight
+      ? local.max_dev_count : weight;
+
+    unsigned int hash = static_cast<unsigned int>(active_idx) ^ seed;
+    hash ^= hash >> 16;
+    hash *= 0x7feb352du;
+    hash ^= hash >> 15;
+    hash *= 0x846ca68bu;
+    hash ^= hash >> 16;
+    const int dev_idx = dev_begin + static_cast<int>(
+      hash % static_cast<unsigned int>(dev_count));
+    auto candidate_class = tc_pfxt::CandidateClass::SKIP;
+    if (dev_reachable == nullptr || dev_reachable[dev_idx] != 0) {
+      const float new_slack =
+        short_pile[window_start + active_idx].slack + dev_deltas[dev_idx];
+      candidate_class = tc_pfxt::classify_candidate(
+        new_slack, split, final_split, use_final_split, skip_long_paths);
+    }
+    local.sample_count += 1ULL;
+    local.sample_weight += weight;
+    local.sample_short_weight +=
+      candidate_class == tc_pfxt::CandidateClass::SHORT ? weight : 0ULL;
+    local.sample_long_weight +=
+      candidate_class == tc_pfxt::CandidateClass::LONG ? weight : 0ULL;
+    local.sample_skip_weight +=
+      candidate_class == tc_pfxt::CandidateClass::SKIP ? weight : 0ULL;
+    local.sample_weight_squared += weight * weight;
   }
 
-  atomicAdd(
-    reinterpret_cast<unsigned long long*>(&source_stats->active_paths),
-    1ULL);
-  atomicAdd(
-    reinterpret_cast<unsigned long long*>(&source_stats->deviation_families),
-    static_cast<unsigned long long>(dev_count));
-  atomicAdd(
-    reinterpret_cast<unsigned long long*>(&source_stats->parent_dev_products),
-    static_cast<unsigned long long>(dev_count));
-  atomicMax(&source_stats->max_parent_count, 1);
-  atomicMax(&source_stats->max_dev_count, dev_count);
-  atomicMax(
-    reinterpret_cast<unsigned long long*>(&source_stats->max_products_per_source),
-    static_cast<unsigned long long>(dev_count));
-
-  unsigned int hash = static_cast<unsigned int>(active_idx) ^ seed;
-  hash ^= hash >> 16;
-  hash *= 0x7feb352du;
-  hash ^= hash >> 15;
-  hash *= 0x846ca68bu;
-  hash ^= hash >> 16;
-  const int local_dev = static_cast<int>(
-    hash % static_cast<unsigned int>(dev_count));
-  const int dev_idx = dev_begin + local_dev;
-  auto candidate_class = tc_pfxt::CandidateClass::SKIP;
-  if (dev_reachable == nullptr || dev_reachable[dev_idx] != 0) {
-    const float new_slack =
-      short_pile[window_start + active_idx].slack + dev_deltas[dev_idx];
-    candidate_class = tc_pfxt::classify_candidate(
-      new_slack, split, final_split, use_final_split, skip_long_paths);
+  using BlockReduce = cub::BlockReduce<
+    tc_pfxt::AdaptiveOracleContribution, TC_PFXT_PAIR_BLOCK_THREADS>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage;
+  const auto block = BlockReduce(reduce_storage).Reduce(
+    local, tc_pfxt::AddAdaptiveOracleContribution{});
+  if (threadIdx.x == 0) {
+    atomicAdd(
+      reinterpret_cast<unsigned long long*>(&source_stats->active_paths),
+      block.active_paths);
+    atomicAdd(
+      reinterpret_cast<unsigned long long*>(&source_stats->deviation_families),
+      block.parent_dev_products);
+    atomicAdd(
+      reinterpret_cast<unsigned long long*>(&source_stats->parent_dev_products),
+      block.parent_dev_products);
+    atomicMax(&source_stats->max_parent_count, block.active_paths > 0 ? 1 : 0);
+    atomicMax(&source_stats->max_dev_count, static_cast<int>(block.max_dev_count));
+    atomicMax(
+      reinterpret_cast<unsigned long long*>(&source_stats->max_products_per_source),
+      block.max_dev_count);
+    atomicAdd(sample_stats + 0, block.sample_count);
+    atomicAdd(sample_stats + 1, block.sample_weight);
+    atomicAdd(sample_stats + 2, block.sample_short_weight);
+    atomicAdd(sample_stats + 3, block.sample_long_weight);
+    atomicAdd(sample_stats + 4, block.sample_skip_weight);
+    atomicAdd(sample_stats + 5, block.sample_weight_squared);
   }
-  const auto weight = static_cast<unsigned long long>(dev_count);
-  atomicAdd(sample_stats + 0, 1ULL);
-  atomicAdd(sample_stats + 1, weight);
-  atomicAdd(
-    sample_stats + 2,
-    candidate_class == tc_pfxt::CandidateClass::SHORT ? weight : 0ULL);
-  atomicAdd(
-    sample_stats + 3,
-    candidate_class == tc_pfxt::CandidateClass::LONG ? weight : 0ULL);
-  atomicAdd(
-    sample_stats + 4,
-    candidate_class == tc_pfxt::CandidateClass::SKIP ? weight : 0ULL);
-  atomicAdd(sample_stats + 5, weight * weight);
 }
 
 // The ordinary branch deliberately mirrors GPG's one-thread-per-parent,
@@ -6167,11 +6203,19 @@ __global__ void update_tc_pfxt_defer_oracle_state(
   unsigned int* telemetry_size,
   const unsigned int telemetry_capacity,
   const unsigned int outer_step,
-  const unsigned int chain_substep) {
+  const unsigned int chain_substep,
+  const int* ordinary_safe,
+  const int n_active) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
-  const auto stats = source_stats[0];
+  auto stats = source_stats[0];
+  const bool safe_ordinary = ordinary_safe != nullptr
+    && ordinary_safe[0] != 0;
+  if (safe_ordinary) {
+    stats.active_paths = static_cast<std::uint64_t>(n_active);
+    stats.parent_dev_products = 0;
+  }
   if (stats.active_paths == 0) {
     return;
   }
@@ -6187,6 +6231,7 @@ __global__ void update_tc_pfxt_defer_oracle_state(
   const auto selected = tc_pfxt::resolve_adaptive_mode(recommendation, previous);
 
   atomicAdd(state + 0, 1ULL);
+  atomicAdd(state + (safe_ordinary ? 12 : 13), 1ULL);
   atomicAdd(state + 1 + static_cast<unsigned long long>(selected), 1ULL);
   atomicAdd(state + 4, stats.active_paths);
   atomicAdd(state + 5, stats.parent_dev_products);
@@ -7536,6 +7581,8 @@ struct CpGen::TcPfxtStaticCache {
   bool bvss_valid = false;
   bool aligned_bvss_valid = false;
   bool compact_devs_valid = false;
+  bool ordinary_chain_bound_valid = false;
+  unsigned long long max_chain_products = 0;
 
   thrust::host_vector<int> h_dists;
   thrust::host_vector<int> h_queue;
@@ -7556,6 +7603,7 @@ struct CpGen::TcPfxtStaticCache {
   TcPfxtDeviceBvss bvss;
   TcPfxtDeviceBvss aligned_bvss;
   TcPfxtDeviceCompactStaticDeviationCsr compact_devs;
+  thrust::device_vector<unsigned long long> chain_product_upper_bounds;
 
   bool matches_graph(const int candidate_n, const int candidate_m) const {
     return n == candidate_n && m == candidate_m;
@@ -7578,6 +7626,8 @@ struct CpGen::TcPfxtStaticCache {
     bvss_valid = false;
     aligned_bvss_valid = false;
     compact_devs_valid = false;
+    ordinary_chain_bound_valid = false;
+    max_chain_products = 0;
     n = 0;
     m = 0;
     graph_diameter = 0;
@@ -7610,6 +7660,8 @@ struct CpGen::TcPfxtStaticCache {
     aligned_bvss.n_intervals = 0;
     aligned_bvss.n_vss = 0;
     compact_devs.release();
+    thrust::device_vector<unsigned long long>().swap(
+      chain_product_upper_bounds);
   }
 };
 
@@ -7620,6 +7672,20 @@ bool CpGen::_has_incremental_cache_candidate() const {
     && cache->can_reuse_tc_static(
       static_cast<int>(num_verts()), static_cast<int>(num_edges()), true)
     && cache->graph_weights_valid;
+}
+
+__global__ void compute_tc_pfxt_chain_product_upper_bounds(
+  const int n,
+  const int* dev_offsets,
+  const int* succs,
+  const int* next_dev_vertex,
+  unsigned long long* bounds) {
+  const int start = blockIdx.x * blockDim.x + threadIdx.x;
+  if (start >= n) {
+    return;
+  }
+  bounds[start] = tc_pfxt::chain_product_upper_bound(
+    start, dev_offsets, succs, next_dev_vertex);
 }
 
 struct TcPfxtIncrementalDeviceUpdate {
@@ -7726,6 +7792,7 @@ int CpGen::tc_pfxt_static_cache_misses() const {
 }
 
 struct TcPfxtStepTiming {
+  std::chrono::duration<double, std::micro> oracle_decision{0};
   std::chrono::duration<double, std::micro> tc{0};
   std::chrono::duration<double, std::micro> sort{0};
   std::chrono::duration<double, std::micro> cost{0};
@@ -7880,6 +7947,7 @@ public:
     return event;
   }
 
+  void end_oracle_decision(cudaEvent_t start) { end(_oracle_decision, start); }
   void end_queue(cudaEvent_t start) { end(_queue, start); }
   void end_discovery(cudaEvent_t start) { end(_discovery, start); }
   void end_candidate(cudaEvent_t start) { end(_candidate, start); }
@@ -7910,6 +7978,7 @@ public:
     if (!_enabled) {
       return;
     }
+    timing.oracle_decision += collect(_oracle_decision);
     timing.sort += collect(_queue);
     timing.tc += collect(_discovery);
     timing.cost += collect(_candidate);
@@ -7950,6 +8019,7 @@ private:
   }
 
   bool _enabled = false;
+  std::vector<TcPfxtCudaEventPair> _oracle_decision;
   std::vector<TcPfxtCudaEventPair> _queue;
   std::vector<TcPfxtCudaEventPair> _discovery;
   std::vector<TcPfxtCudaEventPair> _candidate;
@@ -8006,9 +8076,11 @@ struct AddTcPfxtInDiscoveryStats {
 
 struct TcPfxtScratch {
   int source_local_epoch_counter = 0;
-  int adaptive_stable_deferred_windows = 0;
+  int adaptive_stable_mode_windows = 0;
   int adaptive_fast_lane_windows_since_audit = 0;
   bool adaptive_fast_lane_qualified = false;
+  tc_pfxt::AdaptiveMode adaptive_fast_lane_mode =
+    tc_pfxt::AdaptiveMode::UNINITIALIZED;
   thrust::device_vector<int> current_v;
   thrust::device_vector<int> active_count;
   thrust::device_vector<int> short_count;
@@ -8068,6 +8140,7 @@ struct TcPfxtScratch {
   thrust::device_vector<unsigned long long> defer_oracle_sample_stats;
   thrust::device_vector<unsigned long long> defer_oracle_state;
   thrust::device_vector<int> adaptive_scalar_state;
+  thrust::device_vector<int> adaptive_ordinary_safe_state;
   thrust::device_vector<tc_pfxt::AdaptiveTelemetryEntry> defer_oracle_telemetry;
   thrust::device_vector<unsigned int> defer_oracle_telemetry_size;
   thrust::device_vector<unsigned long long> source_local_filter_stats;
@@ -10332,6 +10405,8 @@ static void tc_pfxt_expand_window_single_pass(
   int fixed_discover_blocks,
   bool profile_tc_phases,
   bool light_stage_profile,
+  bool ordinary_topology_safe,
+  const unsigned long long* chain_product_upper_bounds,
   int fallback_long_pile_threshold,
   int outer_step,
   TcPfxtScratch& scratch,
@@ -10621,6 +10696,8 @@ static void tc_pfxt_expand_window_single_pass(
   auto& defer_oracle_sample_stats = scratch.defer_oracle_sample_stats;
   auto& defer_oracle_state = scratch.defer_oracle_state;
   auto& adaptive_scalar_state = scratch.adaptive_scalar_state;
+  auto& adaptive_ordinary_safe_state =
+    scratch.adaptive_ordinary_safe_state;
   auto& defer_oracle_telemetry = scratch.defer_oracle_telemetry;
   auto& defer_oracle_telemetry_size = scratch.defer_oracle_telemetry_size;
   auto& source_local_filter_stats = scratch.source_local_filter_stats;
@@ -10795,8 +10872,8 @@ static void tc_pfxt_expand_window_single_pass(
       defer_oracle_sample_stats.begin(),
       defer_oracle_sample_stats.end(),
       0ULL);
-    if (outer_step == 1 || defer_oracle_state.size() != 12) {
-      defer_oracle_state.resize(12);
+    if (outer_step == 1 || defer_oracle_state.size() != 14) {
+      defer_oracle_state.resize(14);
       thrust::fill(defer_oracle_state.begin(), defer_oracle_state.end(), 0ULL);
       defer_oracle_state[10] = static_cast<unsigned long long>(
         tc_pfxt::AdaptiveMode::UNINITIALIZED);
@@ -10808,14 +10885,16 @@ static void tc_pfxt_expand_window_single_pass(
         defer_oracle_telemetry_size.begin(),
         defer_oracle_telemetry_size.end(),
         0U);
-      scratch.adaptive_stable_deferred_windows = 0;
+      scratch.adaptive_stable_mode_windows = 0;
       scratch.adaptive_fast_lane_windows_since_audit = 0;
       scratch.adaptive_fast_lane_qualified = false;
+      scratch.adaptive_fast_lane_mode = tc_pfxt::AdaptiveMode::UNINITIALIZED;
     }
   }
   if (adaptive_defer_requested) {
     source_local_stats.resize(1);
     adaptive_scalar_state.resize(3);
+    adaptive_ordinary_safe_state.resize(1);
   }
   bool reached_k_after_window = short_pile_size >= k;
   int sfx_chain_walk_steps = 0;
@@ -10867,6 +10946,8 @@ static void tc_pfxt_expand_window_single_pass(
   const bool family_capture_window =
     std::getenv("GPUCPG_TC_PFXT_FAMILY_CAPTURE_WINDOW") != nullptr;
 
+  const int adaptive_safe_ordinary_min_paths = get_env_int_or_default(
+    "GPUCPG_TC_PFXT_ADAPTIVE_SAFE_MIN_PATHS", 65536);
   const int adaptive_fast_lane_stable_windows = get_env_int_or_default(
     "GPUCPG_TC_PFXT_ADAPTIVE_FAST_STABLE_WINDOWS", 2);
   const int adaptive_fast_lane_min_substeps = get_env_int_or_default(
@@ -10880,7 +10961,9 @@ static void tc_pfxt_expand_window_single_pass(
   const bool adaptive_fast_lane_this_window = adaptive_defer_requested
     && scratch.adaptive_fast_lane_qualified
     && !adaptive_fast_lane_audit;
-  auto adaptive_window_mode = tc_pfxt::AdaptiveMode::UNINITIALIZED;
+  auto adaptive_window_mode = adaptive_fast_lane_this_window
+    ? scratch.adaptive_fast_lane_mode
+    : tc_pfxt::AdaptiveMode::UNINITIALIZED;
   bool adaptive_window_saw_ordinary = false;
   bool adaptive_window_saw_deferred = false;
   while (h_active > 0 && chain_substep < max_chain_substeps) {
@@ -10889,8 +10972,9 @@ static void tc_pfxt_expand_window_single_pass(
     bool adaptive_ordinary_this_substep = false;
     const bool evaluate_adaptive_oracle = adaptive_defer_requested
       && tc_pfxt::should_evaluate_adaptive_oracle(
-        chain_substep, adaptive_fast_lane_this_window);
+        adaptive_fast_lane_this_window);
     if (evaluate_adaptive_oracle) {
+      auto oracle_decision_start = light_profiler.begin();
       cudaMemsetAsync(
         thrust::raw_pointer_cast(source_local_stats.data()),
         0,
@@ -10903,8 +10987,32 @@ static void tc_pfxt_expand_window_single_pass(
         static_cast<unsigned int>(outer_step) * 0x9e3779b9u
         ^ static_cast<unsigned int>(substep_number) * 0x85ebca6bu
         ^ static_cast<unsigned int>(window_start);
+      const bool probe_safe_ordinary =
+        tc_pfxt::should_probe_safe_ordinary(
+          n_active,
+          adaptive_safe_ordinary_min_paths,
+          chain_product_upper_bounds != nullptr);
+      if (probe_safe_ordinary) {
+        set_kernel<<<1, 1>>>(
+          thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()), 1);
+        mark_tc_pfxt_unsafe_ordinary_chains
+          <<<tc_pfxt::adaptive_oracle_grid_blocks(n_active, 256), 256>>>(
+            thrust::raw_pointer_cast(current_v.data()),
+            n_active,
+            chain_product_upper_bounds,
+            static_cast<unsigned long long>(defer_oracle_low),
+            thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()));
+      }
+      else {
+        cudaMemsetAsync(
+          thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()),
+          0,
+          sizeof(int));
+      }
       collect_tc_pfxt_adaptive_path_stats
-        <<<std::max(1, ROUNDUPBLOCKS(n_active, 256)), 256>>>(
+        <<<tc_pfxt::adaptive_oracle_grid_blocks(
+             n_active, TC_PFXT_PAIR_BLOCK_THREADS),
+           TC_PFXT_PAIR_BLOCK_THREADS>>>(
           thrust::raw_pointer_cast(current_v.data()),
           n_active,
           source_local_dev_offsets,
@@ -10918,7 +11026,8 @@ static void tc_pfxt_expand_window_single_pass(
           skip_long_this_substep,
           sample_seed,
           thrust::raw_pointer_cast(source_local_stats.data()),
-          thrust::raw_pointer_cast(defer_oracle_sample_stats.data()));
+          thrust::raw_pointer_cast(defer_oracle_sample_stats.data()),
+          thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()));
       update_tc_pfxt_defer_oracle_state<<<1, 1>>>(
         thrust::raw_pointer_cast(source_local_stats.data()),
         thrust::raw_pointer_cast(defer_oracle_sample_stats.data()),
@@ -10930,9 +11039,15 @@ static void tc_pfxt_expand_window_single_pass(
         thrust::raw_pointer_cast(defer_oracle_telemetry_size.data()),
         static_cast<unsigned int>(defer_oracle_telemetry.size()),
         static_cast<unsigned int>(outer_step),
-        static_cast<unsigned int>(substep_number));
+        static_cast<unsigned int>(substep_number),
+        thrust::raw_pointer_cast(adaptive_ordinary_safe_state.data()),
+        n_active);
       cudaCheckErrors("tc pfxt adaptive pre-group oracle failed");
-
+      light_profiler.end_oracle_decision(oracle_decision_start);
+    }
+    if (adaptive_defer_requested
+        && (evaluate_adaptive_oracle
+            || adaptive_window_mode == tc_pfxt::AdaptiveMode::ORDINARY)) {
       thrust::fill(
         adaptive_scalar_state.begin(),
         adaptive_scalar_state.end(),
@@ -11136,15 +11251,27 @@ static void tc_pfxt_expand_window_single_pass(
         if (substep_reaches_k) {
           reached_k_after_window = true;
         }
+        if (!evaluate_adaptive_oracle) {
+          record_tc_pfxt_cached_adaptive_step<<<1, 1>>>(
+            thrust::raw_pointer_cast(defer_oracle_state.data()),
+            thrust::raw_pointer_cast(defer_oracle_telemetry.data()),
+            thrust::raw_pointer_cast(defer_oracle_telemetry_size.data()),
+            static_cast<unsigned int>(defer_oracle_telemetry.size()),
+            static_cast<unsigned int>(outer_step),
+            static_cast<unsigned int>(substep_number),
+            static_cast<unsigned long long>(h_active));
+          cudaCheckErrors("tc pfxt cached ordinary step failed");
+        }
         ++chain_substep;
         h_active = 0;
         break;
       }
     }
-    else if (adaptive_defer_requested) {
-      if (adaptive_window_mode != tc_pfxt::AdaptiveMode::DEFERRED) {
+    if (adaptive_defer_requested && !evaluate_adaptive_oracle) {
+      if (adaptive_window_mode != tc_pfxt::AdaptiveMode::ORDINARY
+          && adaptive_window_mode != tc_pfxt::AdaptiveMode::DEFERRED) {
         throw std::runtime_error(
-          "adaptive window reuse requires an established deferred mode");
+          "adaptive window reuse requires an established mode");
       }
       record_tc_pfxt_cached_adaptive_step<<<1, 1>>>(
         thrust::raw_pointer_cast(defer_oracle_state.data()),
@@ -11694,7 +11821,9 @@ static void tc_pfxt_expand_window_single_pass(
           thrust::raw_pointer_cast(defer_oracle_telemetry_size.data()),
           static_cast<unsigned int>(defer_oracle_telemetry.size()),
           static_cast<unsigned int>(outer_step),
-          static_cast<unsigned int>(substep_number));
+          static_cast<unsigned int>(substep_number),
+          nullptr,
+          n_active);
         cudaCheckErrors("tc pfxt defer oracle state update failed");
         if (defer_oracle_trace) {
           std::cout << "tc_pfxt_defer_oracle"
@@ -12771,12 +12900,13 @@ static void tc_pfxt_expand_window_single_pass(
             source_local_tile_classes.resize(h_n_tiles);
           }
 	          fill_tc_pfxt_source_local_tiles
-	            <<<std::max(1, ROUNDUPBLOCKS(h_source_local_sources, 256)), 256>>>(
+            <<<std::max(1, ROUNDUPBLOCKS(h_n_tiles, 256)), 256>>>(
               thrust::raw_pointer_cast(source_local_active_sources.data()),
               h_source_local_sources,
               active_group_offsets,
               source_local_dev_offsets,
               thrust::raw_pointer_cast(source_local_tile_offsets.data()),
+              h_n_tiles,
               source_local_parent_tile,
               source_local_dev_tile,
               use_compact_source_groups,
@@ -14662,27 +14792,34 @@ static void tc_pfxt_expand_window_single_pass(
     gpucpg_nvtx_pop();
   }
 
-  if (adaptive_defer_requested && adaptive_window_saw_deferred) {
+  if (adaptive_defer_requested
+      && (adaptive_window_saw_ordinary || adaptive_window_saw_deferred)) {
     if (adaptive_fast_lane_this_window) {
       ++scratch.adaptive_fast_lane_windows_since_audit;
     }
     else {
-      const bool stable_window = tc_pfxt::is_stable_deferred_window(
+      const auto stable_mode = tc_pfxt::stable_adaptive_window_mode(
         adaptive_window_saw_deferred,
         adaptive_window_saw_ordinary,
         chain_substep,
-        adaptive_fast_lane_min_substeps);
+        adaptive_fast_lane_min_substeps,
+        ordinary_topology_safe);
       scratch.adaptive_fast_lane_windows_since_audit = 0;
-      if (stable_window) {
-        ++scratch.adaptive_stable_deferred_windows;
-        if (scratch.adaptive_stable_deferred_windows
-            >= adaptive_fast_lane_stable_windows) {
-          scratch.adaptive_fast_lane_qualified = true;
-        }
+      if (stable_mode == tc_pfxt::AdaptiveMode::UNRESOLVED) {
+        scratch.adaptive_stable_mode_windows = 0;
+        scratch.adaptive_fast_lane_qualified = false;
+        scratch.adaptive_fast_lane_mode =
+          tc_pfxt::AdaptiveMode::UNINITIALIZED;
       }
       else {
-        scratch.adaptive_stable_deferred_windows = 0;
-        scratch.adaptive_fast_lane_qualified = false;
+        scratch.adaptive_stable_mode_windows =
+          stable_mode == scratch.adaptive_fast_lane_mode
+            ? scratch.adaptive_stable_mode_windows + 1
+            : 1;
+        scratch.adaptive_fast_lane_mode = stable_mode;
+        scratch.adaptive_fast_lane_qualified =
+          scratch.adaptive_stable_mode_windows
+            >= adaptive_fast_lane_stable_windows;
       }
     }
   }
@@ -17187,6 +17324,8 @@ void CpGen::report_paths(
         TcPfxtDeviceBvss local_tc_pfxt_aligned_bvss;
         TcPfxtDeviceStaticDeviationCsr local_tc_pfxt_static_devs;
         TcPfxtDeviceCompactStaticDeviationCsr local_tc_pfxt_compact_static_devs;
+        thrust::device_vector<unsigned long long>
+          local_tc_pfxt_chain_product_upper_bounds;
         const bool tc_pfxt_need_compact_static_devs =
           (enable_tc_pfxt_compact_static_devs || enable_tc_pfxt_aligned_bvss)
           && (enable_tc_pfxt_source_local_profile
@@ -17210,9 +17349,16 @@ void CpGen::report_paths(
           tc_pfxt_use_static_cache
             ? _tc_pfxt_static_cache->compact_devs
             : local_tc_pfxt_compact_static_devs;
+        auto& tc_pfxt_chain_product_upper_bounds =
+          tc_pfxt_use_static_cache
+            ? _tc_pfxt_static_cache->chain_product_upper_bounds
+            : local_tc_pfxt_chain_product_upper_bounds;
 		    TcPfxtScratch tc_pfxt_scratch;
+        bool tc_pfxt_static_hit = false;
+        const auto tc_pfxt_static_setup_begin =
+          std::chrono::steady_clock::now();
 		    if (enable_tc_pfxt) {
-          const bool tc_pfxt_static_hit =
+          tc_pfxt_static_hit =
             tc_pfxt_use_static_cache
             && (!enable_tc_pfxt_aligned_bvss
               || _tc_pfxt_static_cache->aligned_bvss_valid)
@@ -17370,12 +17516,72 @@ void CpGen::report_paths(
           }
 		      std::cout << "tc_pfxt_max_chain_substeps=" << std::max(1, graph_diameter) << '\n';
 		    }
+        unsigned long long tc_pfxt_max_chain_products = tc_pfxt_use_static_cache
+          && _tc_pfxt_static_cache->ordinary_chain_bound_valid
+          ? _tc_pfxt_static_cache->max_chain_products
+          : 0;
+        if (enable_tc_pfxt
+            && !tc_pfxt_compact_static_devs.empty()
+            && !(tc_pfxt_use_static_cache
+              && _tc_pfxt_static_cache->ordinary_chain_bound_valid)) {
+          tc_pfxt_chain_product_upper_bounds.resize(N);
+          compute_tc_pfxt_chain_product_upper_bounds
+            <<<std::max(1, ROUNDUPBLOCKS(N, 256)), 256>>>(
+              N,
+              thrust::raw_pointer_cast(tc_pfxt_compact_static_devs.offsets.data()),
+              d_succs,
+              d_tc_pfxt_next_dev_vertex,
+              thrust::raw_pointer_cast(
+                tc_pfxt_chain_product_upper_bounds.data()));
+          cudaCheckErrors("tc pfxt chain-product bound failed");
+          const auto max_it = thrust::max_element(
+            tc_pfxt_chain_product_upper_bounds.begin(),
+            tc_pfxt_chain_product_upper_bounds.end());
+          tc_pfxt_max_chain_products = max_it
+            == tc_pfxt_chain_product_upper_bounds.end() ? 0 : *max_it;
+          if (tc_pfxt_use_static_cache) {
+            _tc_pfxt_static_cache->max_chain_products =
+              tc_pfxt_max_chain_products;
+            _tc_pfxt_static_cache->ordinary_chain_bound_valid = true;
+          }
+        }
+        const int tc_pfxt_ordinary_low = get_env_int_or_default(
+          "GPUCPG_TC_PFXT_DEFER_ORACLE_LOW", 60);
+        const bool tc_pfxt_ordinary_topology_safe =
+          tc_pfxt_max_chain_products > 0
+          && tc_pfxt_max_chain_products
+            < static_cast<unsigned long long>(tc_pfxt_ordinary_low);
+        if (enable_tc_pfxt) {
+          std::cout << "tc_pfxt_ordinary_topology_bound"
+            << " max_chain_products=" << tc_pfxt_max_chain_products
+            << " low=" << tc_pfxt_ordinary_low
+            << " safe=" << (tc_pfxt_ordinary_topology_safe ? 1 : 0)
+            << " cached="
+            << (tc_pfxt_use_static_cache
+              && _tc_pfxt_static_cache->ordinary_chain_bound_valid ? 1 : 0)
+            << '\n';
+        }
+        if (enable_tc_pfxt && !tc_pfxt_static_hit) {
+          cudaDeviceSynchronize();
+        }
+        const double tc_pfxt_static_setup_ms = enable_tc_pfxt
+          && !tc_pfxt_static_hit
+          ? std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - tc_pfxt_static_setup_begin).count()
+          : 0.0;
+        if (enable_tc_pfxt) {
+          std::cout << "tc_pfxt_static_setup"
+            << " cache_hit=" << (tc_pfxt_static_hit ? 1 : 0)
+            << " setup_ms=" << tc_pfxt_static_setup_ms
+            << '\n';
+        }
 	    std::uint64_t total_tc_pfxt_pairs{0};
 	    std::chrono::duration<double, std::micro> curr_step_cuda_time{0};
 	    TcPfxtStepTiming curr_step_tc_timing;
 	    std::uint64_t curr_step_hops{0};
 	    bool curr_step_dump_appended{false};
 	    double pfxt_summary_total_ms{0.0};
+	    double pfxt_summary_oracle_decision_ms{0.0};
 	    double pfxt_summary_discovery_ms{0.0};
 	    double pfxt_summary_candidate_ms{0.0};
 	    double pfxt_summary_queue_ms{0.0};
@@ -17763,6 +17969,9 @@ void CpGen::report_paths(
 		              tc_pfxt_discover_blocks,
 		              profile_tc_pfxt_phases,
 		              light_tc_pfxt_stage_profile,
+                  tc_pfxt_ordinary_topology_safe,
+                  thrust::raw_pointer_cast(
+                    tc_pfxt_chain_product_upper_bounds.data()),
 	              tc_pfxt_single_pass_fallback_long_pile,
 	              curr_step,
 	              tc_pfxt_scratch,
@@ -18070,6 +18279,8 @@ void CpGen::report_paths(
 	        const auto curr_step_breakdown =
 	          make_tc_pfxt_stage_breakdown_ms(curr_step_cuda_time, curr_step_tc_timing);
 	        pfxt_summary_total_ms += curr_step_breakdown.total;
+	        pfxt_summary_oracle_decision_ms +=
+	          curr_step_tc_timing.oracle_decision / 1ms;
 	        pfxt_summary_discovery_ms += curr_step_breakdown.discovery;
 	        pfxt_summary_candidate_ms += curr_step_breakdown.candidate;
 	        pfxt_summary_queue_ms += curr_step_breakdown.queue;
@@ -18666,6 +18877,19 @@ void CpGen::report_paths(
       << " dominant_batch_size=" << pfxt_summary_dominant_batch_size
       << '\n';
     if (enable_tc_pfxt) {
+      const auto transparent_runtime =
+        tc_pfxt::make_transparent_runtime_breakdown(
+          tc_pfxt_static_setup_ms,
+          pfxt_summary_oracle_decision_ms,
+          pfxt_summary_total_ms);
+      std::cout << "runtime_summary_tc_breakdown"
+        << " oracle_setup_ms=" << transparent_runtime.oracle_setup_ms
+        << " oracle_setup_reused=" << (tc_pfxt_static_hit ? 1 : 0)
+        << " oracle_decision_ms=" << transparent_runtime.oracle_decision_ms
+        << " core_pfxt_ms="
+        << transparent_runtime.core_pfxt_ms
+        << " total_pfxt_ms=" << transparent_runtime.total_pfxt_ms
+        << '\n';
       std::cout << "runtime_summary_tc_stages"
         << " discovery_ms=" << pfxt_summary_discovery_ms
         << " candidate_ms=" << pfxt_summary_candidate_ms
@@ -18978,12 +19202,16 @@ void CpGen::report_paths(
           << '\n';
         previous = entry.mode;
       }
+      const thrust::host_vector<unsigned long long> adaptive_state(
+        tc_pfxt_scratch.defer_oracle_state);
       std::cout << "adaptive_mode_summary"
         << " recorded_steps=" << recorded
         << " attempted_steps=" << telemetry_size
         << " normal_steps=" << ordinary_steps
         << " deferred_steps=" << deferred_steps
         << " switches=" << switches
+        << " safe_fast_decisions=" << adaptive_state[12]
+        << " exact_oracle_decisions=" << adaptive_state[13]
         << '\n';
     }
 

@@ -99,7 +99,7 @@ TEST_CASE("all-long tile gate distinguishes fixed adaptive and normal modes") {
 }
 
 TEST_CASE("adaptive telemetry counts selected modes and real switches") {
-  unsigned long long state[12]{};
+  unsigned long long state[14]{};
   state[10] = static_cast<unsigned long long>(AdaptiveMode::UNINITIALIZED);
   gpucpg::tc_pfxt::update_adaptive_telemetry(
     state, {10, 500, 20, 5}, AdaptiveMode::ORDINARY);
@@ -248,12 +248,20 @@ TEST_CASE("mode switches preserve deferred backlog exactly") {
 }
 
 TEST_CASE("adaptive fast lane uses probation and periodic audits") {
-  CHECK(gpucpg::tc_pfxt::should_evaluate_adaptive_oracle(0, true));
-  CHECK_FALSE(gpucpg::tc_pfxt::should_evaluate_adaptive_oracle(1, true));
-  CHECK(gpucpg::tc_pfxt::should_evaluate_adaptive_oracle(1, false));
-  CHECK(gpucpg::tc_pfxt::is_stable_deferred_window(true, false, 4, 4));
-  CHECK_FALSE(gpucpg::tc_pfxt::is_stable_deferred_window(true, true, 8, 4));
-  CHECK_FALSE(gpucpg::tc_pfxt::is_stable_deferred_window(true, false, 3, 4));
+  CHECK_FALSE(gpucpg::tc_pfxt::should_evaluate_adaptive_oracle(true));
+  CHECK(gpucpg::tc_pfxt::should_evaluate_adaptive_oracle(false));
+  using gpucpg::tc_pfxt::AdaptiveMode;
+  using gpucpg::tc_pfxt::stable_adaptive_window_mode;
+  CHECK(stable_adaptive_window_mode(true, false, 4, 4, false)
+        == AdaptiveMode::DEFERRED);
+  CHECK(stable_adaptive_window_mode(false, true, 1, 4, true)
+        == AdaptiveMode::ORDINARY);
+  CHECK(stable_adaptive_window_mode(false, true, 1, 4, false)
+        == AdaptiveMode::UNRESOLVED);
+  CHECK(stable_adaptive_window_mode(true, true, 8, 4, true)
+        == AdaptiveMode::UNRESOLVED);
+  CHECK(stable_adaptive_window_mode(true, false, 3, 4, false)
+        == AdaptiveMode::UNRESOLVED);
   CHECK(gpucpg::tc_pfxt::should_audit_adaptive_fast_lane(16, 16));
   CHECK_FALSE(gpucpg::tc_pfxt::should_audit_adaptive_fast_lane(15, 16));
 }
@@ -287,4 +295,58 @@ TEST_CASE("GPU telemetry records step substep and mode without host control") {
   }
   CHECK(saw_ordinary);
   CHECK(saw_deferred);
+}
+
+TEST_CASE("adaptive oracle block aggregation preserves exact policy inputs") {
+  using gpucpg::tc_pfxt::AdaptiveOracleContribution;
+  using gpucpg::tc_pfxt::AddAdaptiveOracleContribution;
+  const AdaptiveOracleContribution first{2, 11, 2, 11, 3, 5, 3, 61, 7};
+  const AdaptiveOracleContribution second{3, 19, 3, 19, 7, 4, 8, 129, 9};
+  const auto total = AddAdaptiveOracleContribution{}(first, second);
+  CHECK(total.active_paths == 5);
+  CHECK(total.parent_dev_products == 30);
+  CHECK(total.sample_count == 5);
+  CHECK(total.sample_weight == 30);
+  CHECK(total.sample_short_weight == 10);
+  CHECK(total.sample_long_weight == 9);
+  CHECK(total.sample_skip_weight == 11);
+  CHECK(total.sample_weight_squared == 190);
+  CHECK(total.max_dev_count == 9);
+}
+
+TEST_CASE("adaptive oracle launch is bounded without dropping work") {
+  using gpucpg::tc_pfxt::adaptive_oracle_grid_blocks;
+  CHECK(adaptive_oracle_grid_blocks(0, 128) == 1);
+  CHECK(adaptive_oracle_grid_blocks(1, 128) == 1);
+  CHECK(adaptive_oracle_grid_blocks(129, 128) == 2);
+  CHECK(adaptive_oracle_grid_blocks(1000000, 128, 1024) == 1024);
+}
+
+TEST_CASE("transparent runtime breakdown is non-overlapping") {
+  const auto breakdown = gpucpg::tc_pfxt::make_transparent_runtime_breakdown(
+    12.5, 7.25, 100.0);
+  CHECK(breakdown.oracle_setup_ms == doctest::Approx(12.5));
+  CHECK(breakdown.oracle_decision_ms == doctest::Approx(7.25));
+  CHECK(breakdown.core_pfxt_ms == doctest::Approx(92.75));
+  CHECK(breakdown.total_pfxt_ms == doctest::Approx(100.0));
+  CHECK(breakdown.core_pfxt_ms + breakdown.oracle_decision_ms
+        == doctest::Approx(breakdown.total_pfxt_ms));
+}
+
+TEST_CASE("topology bound sums the complete successor deviation chain") {
+  const int offsets[] {0, 2, 5, 6, 10};
+  const int succs[] {1, 2, 3, -1};
+  const int next_dev[] {0, 1, 2, 3};
+  using gpucpg::tc_pfxt::chain_product_upper_bound;
+  CHECK(chain_product_upper_bound(0, offsets, succs, next_dev) == 10);
+  CHECK(chain_product_upper_bound(1, offsets, succs, next_dev) == 8);
+  CHECK(chain_product_upper_bound(2, offsets, succs, next_dev) == 5);
+  CHECK(chain_product_upper_bound(3, offsets, succs, next_dev) == 4);
+}
+
+TEST_CASE("safe ordinary probe avoids overhead on small frontiers") {
+  using gpucpg::tc_pfxt::should_probe_safe_ordinary;
+  CHECK_FALSE(should_probe_safe_ordinary(65535, 65536, true));
+  CHECK(should_probe_safe_ordinary(65536, 65536, true));
+  CHECK_FALSE(should_probe_safe_ordinary(100000, 65536, false));
 }

@@ -528,6 +528,28 @@ __host__ __device__ inline int source_major_tile_count(
     * ceil_div_int(family_count, family_tile);
 }
 
+__host__ __device__ inline int source_slot_for_linear_tile(
+  const int tile_idx,
+  const int n_sources,
+  const int* tile_offsets) {
+  if (tile_idx < 0 || n_sources <= 0 || tile_offsets == nullptr
+      || tile_idx >= tile_offsets[n_sources]) {
+    return -1;
+  }
+  int lo = 0;
+  int hi = n_sources;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (tile_idx < tile_offsets[mid + 1]) {
+      hi = mid;
+    }
+    else {
+      lo = mid + 1;
+    }
+  }
+  return lo;
+}
+
 __host__ __device__ inline int candidate_chunk_size(
   const int remaining_pairs,
   const int requested_chunk_pairs) {

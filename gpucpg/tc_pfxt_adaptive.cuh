@@ -18,11 +18,99 @@ struct AdaptivePolicyInput {
   std::uint64_t sample_skip_weight = 0;
 };
 
+struct TransparentRuntimeBreakdownMs {
+  double oracle_setup_ms = 0.0;
+  double oracle_decision_ms = 0.0;
+  double core_pfxt_ms = 0.0;
+  double total_pfxt_ms = 0.0;
+};
+
+__host__ __device__ inline TransparentRuntimeBreakdownMs
+make_transparent_runtime_breakdown(
+  const double oracle_setup_ms,
+  const double oracle_decision_ms,
+  const double total_pfxt_ms) {
+  const double bounded_decision = oracle_decision_ms < 0.0
+    ? 0.0 : oracle_decision_ms;
+  return TransparentRuntimeBreakdownMs{
+    oracle_setup_ms < 0.0 ? 0.0 : oracle_setup_ms,
+    bounded_decision,
+    total_pfxt_ms > bounded_decision
+      ? total_pfxt_ms - bounded_decision : 0.0,
+    total_pfxt_ms < 0.0 ? 0.0 : total_pfxt_ms};
+}
+
 struct AdaptivePolicy {
   int low_products_per_path = 60;
   int high_products_per_path = 70;
   int min_skip_percent = 50;
 };
+
+struct AdaptiveOracleContribution {
+  std::uint64_t active_paths = 0;
+  std::uint64_t parent_dev_products = 0;
+  std::uint64_t sample_count = 0;
+  std::uint64_t sample_weight = 0;
+  std::uint64_t sample_short_weight = 0;
+  std::uint64_t sample_long_weight = 0;
+  std::uint64_t sample_skip_weight = 0;
+  std::uint64_t sample_weight_squared = 0;
+  std::uint64_t max_dev_count = 0;
+};
+
+struct AddAdaptiveOracleContribution {
+  __host__ __device__ AdaptiveOracleContribution operator()(
+    const AdaptiveOracleContribution& lhs,
+    const AdaptiveOracleContribution& rhs) const {
+    return AdaptiveOracleContribution{
+      lhs.active_paths + rhs.active_paths,
+      lhs.parent_dev_products + rhs.parent_dev_products,
+      lhs.sample_count + rhs.sample_count,
+      lhs.sample_weight + rhs.sample_weight,
+      lhs.sample_short_weight + rhs.sample_short_weight,
+      lhs.sample_long_weight + rhs.sample_long_weight,
+      lhs.sample_skip_weight + rhs.sample_skip_weight,
+      lhs.sample_weight_squared + rhs.sample_weight_squared,
+      lhs.max_dev_count > rhs.max_dev_count
+        ? lhs.max_dev_count : rhs.max_dev_count};
+  }
+};
+
+__host__ __device__ inline bool should_probe_safe_ordinary(
+  const int active_paths,
+  const int min_active_paths,
+  const bool bounds_available) {
+  return bounds_available
+    && active_paths >= min_active_paths
+    && min_active_paths > 0;
+}
+
+__host__ __device__ inline unsigned long long chain_product_upper_bound(
+  const int start,
+  const int* dev_offsets,
+  const int* succs,
+  const int* next_dev_vertex) {
+  unsigned long long products = 0;
+  int v = start;
+  while (v != -1) {
+    products += static_cast<unsigned long long>(
+      dev_offsets[v + 1] - dev_offsets[v]);
+    const int succ = succs[v];
+    v = succ == -1 ? -1 : next_dev_vertex[succ];
+  }
+  return products;
+}
+
+__host__ __device__ inline int adaptive_oracle_grid_blocks(
+  const int item_count,
+  const int block_threads,
+  const int max_blocks = 1024) {
+  if (item_count <= 0 || block_threads <= 0 || max_blocks <= 0) {
+    return 1;
+  }
+  const int required = (item_count + block_threads - 1) / block_threads;
+  return required < max_blocks ? required : max_blocks;
+}
 
 struct CandidateArenaState {
   unsigned long long short_tail = 0;
@@ -150,18 +238,24 @@ __host__ __device__ inline bool should_run_deferred_branch(
 }
 
 __host__ __device__ inline bool should_evaluate_adaptive_oracle(
-  const int chain_substep,
   const bool fast_lane_active) {
-  return !fast_lane_active || chain_substep == 0;
+  return !fast_lane_active;
 }
 
-__host__ __device__ inline bool is_stable_deferred_window(
+__host__ __device__ inline AdaptiveMode stable_adaptive_window_mode(
   const bool saw_deferred,
   const bool saw_ordinary,
   const int chain_substeps,
-  const int min_chain_substeps) {
-  return saw_deferred && !saw_ordinary
-    && chain_substeps >= min_chain_substeps;
+  const int min_deferred_chain_substeps,
+  const bool ordinary_topology_safe) {
+  if (saw_deferred && !saw_ordinary
+      && chain_substeps >= min_deferred_chain_substeps) {
+    return AdaptiveMode::DEFERRED;
+  }
+  if (ordinary_topology_safe && saw_ordinary && !saw_deferred) {
+    return AdaptiveMode::ORDINARY;
+  }
+  return AdaptiveMode::UNRESOLVED;
 }
 
 __host__ __device__ inline bool should_audit_adaptive_fast_lane(
@@ -227,7 +321,7 @@ __host__ __device__ inline std::uint64_t exact_short_output_limit(
   return base_short + short_output_capacity(counted_short_outputs);
 }
 
-// Layout remains compatible with the existing 12-word device telemetry array.
+// Layout remains compatible with the 14-word device telemetry array.
 __host__ __device__ inline void update_adaptive_telemetry(
   unsigned long long* state,
   const AdaptivePolicyInput input,
