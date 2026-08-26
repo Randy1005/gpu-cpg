@@ -50,6 +50,29 @@ namespace cg = cooperative_groups;
 
 namespace {
 
+constexpr char GPUCPG_CSR_MAGIC[8] {'G', 'P', 'U', 'C', 'P', 'G', '2', '\0'};
+constexpr std::uint32_t GPUCPG_CSR_VERSION = 2;
+
+template <typename T>
+void read_binary_vector(
+  std::istream& input, std::vector<T>& values,
+  const std::size_t count, const char* label) {
+  values.resize(count);
+  if (count != 0) {
+    input.read(reinterpret_cast<char*>(values.data()),
+      static_cast<std::streamsize>(count * sizeof(T)));
+  }
+  if (!input) throw std::runtime_error(std::string("truncated binary CSR: ") + label);
+}
+
+template <typename T>
+void write_binary_vector(std::ostream& output, const std::vector<T>& values) {
+  if (!values.empty()) {
+    output.write(reinterpret_cast<const char*>(values.data()),
+      static_cast<std::streamsize>(values.size() * sizeof(T)));
+  }
+}
+
 int get_env_int_or_default(const char* name, const int fallback) {
   const char* raw = std::getenv(name);
   if (raw == nullptr || *raw == '\0') {
@@ -439,17 +462,39 @@ static std::vector<int> build_tc_pfxt_next_dev_vertex(
   return next_dev;
 }
 
+void CpGen::write_to_csr_bin(std::string& filename) const {
+  std::ofstream output(filename, std::ios::binary | std::ios::trunc);
+  if (!output) throw std::runtime_error("Unable to create binary CSR: " + filename);
+  const std::uint32_t version = GPUCPG_CSR_VERSION;
+  const std::uint64_t n = num_verts();
+  const std::uint64_t m = num_edges();
+  output.write(GPUCPG_CSR_MAGIC, sizeof(GPUCPG_CSR_MAGIC));
+  output.write(reinterpret_cast<const char*>(&version), sizeof(version));
+  output.write(reinterpret_cast<const char*>(&n), sizeof(n));
+  output.write(reinterpret_cast<const char*>(&m), sizeof(m));
+  write_binary_vector(output, _h_fanout_adjp);
+  write_binary_vector(output, _h_fanout_adjncy);
+  write_binary_vector(output, _h_fanout_wgts);
+  if (!output) throw std::runtime_error("Failed to write binary CSR: " + filename);
+}
+
 
 void CpGen::read_input(const std::string& filename, bool ignore_wgts) {
   clear_tc_pfxt_static_cache();
-  std::ifstream infile(filename);
-  if (!infile) {
+  std::ifstream binary_probe(filename, std::ios::binary);
+  if (!binary_probe) {
     throw std::runtime_error("Unable to open file: " + filename);
   }
+  char magic[sizeof(GPUCPG_CSR_MAGIC)] {};
+  binary_probe.read(magic, sizeof(magic));
+  const bool binary_csr = binary_probe.gcount() == sizeof(magic)
+    && std::equal(std::begin(magic), std::end(magic), std::begin(GPUCPG_CSR_MAGIC));
 
   benchmark_path = filename;
-  _h_fanin_edges.clear();
-  _h_fanout_edges.clear();
+  // These maps are text-parser scratch space and can dominate resident memory on
+  // dense graphs. Release their buckets when replacing a graph.
+  decltype(_h_fanin_edges){}.swap(_h_fanin_edges);
+  decltype(_h_fanout_edges){}.swap(_h_fanout_edges);
   _h_fanin_adjncy.clear();
   _h_fanin_wgts.clear();
   _h_fanout_adjncy.clear();
@@ -460,12 +505,91 @@ void CpGen::read_input(const std::string& filename, bool ignore_wgts) {
   _h_fanout_to_fanin.clear();
   _srcs.clear();
   _sinks.clear();
+  _h_max_odeg = 0;
   _sptc_incremental_profile_pending = false;
   _sptc_incremental_dirty_edges.clear();
   _sptc_incremental_old_dists.clear();
   _sptc_incremental_old_succs.clear();
   _sptc_incremental_old_edge_ids.clear();
   _sptc_incremental_old_deltas.clear();
+
+  if (binary_csr) {
+    std::uint32_t version = 0;
+    std::uint64_t n64 = 0;
+    std::uint64_t m64 = 0;
+    binary_probe.read(reinterpret_cast<char*>(&version), sizeof(version));
+    binary_probe.read(reinterpret_cast<char*>(&n64), sizeof(n64));
+    binary_probe.read(reinterpret_cast<char*>(&m64), sizeof(m64));
+    if (!binary_probe || version != GPUCPG_CSR_VERSION
+        || n64 > static_cast<std::uint64_t>(std::numeric_limits<int>::max())
+        || m64 > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+      throw std::runtime_error("invalid or unsupported GPUCPG binary CSR: " + filename);
+    }
+    const int vertex_count = static_cast<int>(n64);
+    const int edge_count = static_cast<int>(m64);
+    read_binary_vector(binary_probe, _h_fanout_adjp,
+      static_cast<std::size_t>(vertex_count) + 1, "fanout offsets");
+    read_binary_vector(binary_probe, _h_fanout_adjncy, edge_count, "fanout destinations");
+    read_binary_vector(binary_probe, _h_fanout_wgts, edge_count, "fanout weights");
+    if (_h_fanout_adjp.empty() || _h_fanout_adjp.front() != 0
+        || _h_fanout_adjp.back() != edge_count) {
+      throw std::runtime_error("invalid fanout offsets in binary CSR: " + filename);
+    }
+    if (ignore_wgts) std::fill(_h_fanout_wgts.begin(), _h_fanout_wgts.end(), 1.0f);
+
+    _h_fanin_adjp.assign(static_cast<std::size_t>(vertex_count) + 1, 0);
+    _h_out_degrees.resize(vertex_count);
+    _h_in_degrees.assign(vertex_count, 0);
+    _h_max_odeg = 0;
+    for (int src = 0; src < vertex_count; ++src) {
+      const int begin = _h_fanout_adjp[src];
+      const int end = _h_fanout_adjp[src + 1];
+      if (begin > end || begin < 0 || end > edge_count) {
+        throw std::runtime_error("nonmonotonic fanout offsets in binary CSR");
+      }
+      _h_out_degrees[src] = end - begin;
+      _h_max_odeg = std::max(_h_max_odeg, end - begin);
+      if (begin == end) _sinks.push_back(src);
+      for (int edge = begin; edge < end; ++edge) {
+        const int dst = _h_fanout_adjncy[edge];
+        if (dst < 0 || dst >= vertex_count) {
+          throw std::runtime_error("destination outside binary CSR vertex range");
+        }
+        ++_h_fanin_adjp[dst + 1];
+      }
+    }
+    std::partial_sum(_h_fanin_adjp.begin(), _h_fanin_adjp.end(),
+      _h_fanin_adjp.begin());
+    _h_in_degrees.resize(vertex_count);
+    for (int dst = 0; dst < vertex_count; ++dst) {
+      _h_in_degrees[dst] = _h_fanin_adjp[dst + 1] - _h_fanin_adjp[dst];
+      if (_h_in_degrees[dst] == 0) _srcs.push_back(dst);
+    }
+    _h_fanin_adjncy.resize(edge_count);
+    _h_fanin_wgts.resize(edge_count);
+    _h_inv_fanout_adjncy.resize(edge_count);
+    _h_inv_fanin_adjncy.resize(edge_count);
+    _h_fanout_sources.resize(edge_count);
+    _h_fanout_to_fanin.resize(edge_count);
+    std::vector<int> cursor(_h_fanin_adjp.begin(), _h_fanin_adjp.end() - 1);
+    for (int src = 0; src < vertex_count; ++src) {
+      for (int edge = _h_fanout_adjp[src]; edge < _h_fanout_adjp[src + 1]; ++edge) {
+        const int dst = _h_fanout_adjncy[edge];
+        const int fanin_edge = cursor[dst]++;
+        _h_fanin_adjncy[fanin_edge] = src;
+        _h_fanin_wgts[fanin_edge] = _h_fanout_wgts[edge];
+        _h_inv_fanout_adjncy[edge] = src;
+        _h_inv_fanin_adjncy[fanin_edge] = dst;
+        _h_fanout_sources[edge] = src;
+        _h_fanout_to_fanin[edge] = fanin_edge;
+      }
+    }
+    return;
+  }
+
+  binary_probe.close();
+  std::ifstream infile(filename);
+  if (!infile) throw std::runtime_error("Unable to open file: " + filename);
   std::string line;
   int vertex_count;
 
@@ -676,11 +800,15 @@ GraphWeightUpdateResult CpGen::update_edge_weights(
     }
     _h_fanout_wgts[update.edge_id] = update.weight;
     _h_fanin_wgts[fanin_edge] = update.weight;
-    for (auto& [neighbor, weight] : _h_fanout_edges[src]) {
-      if (neighbor == dst) weight = update.weight;
+    if (const auto it = _h_fanout_edges.find(src); it != _h_fanout_edges.end()) {
+      for (auto& [neighbor, weight] : it->second) {
+        if (neighbor == dst) weight = update.weight;
+      }
     }
-    for (auto& [neighbor, weight] : _h_fanin_edges[dst]) {
-      if (neighbor == src) weight = update.weight;
+    if (const auto it = _h_fanin_edges.find(dst); it != _h_fanin_edges.end()) {
+      for (auto& [neighbor, weight] : it->second) {
+        if (neighbor == src) weight = update.weight;
+      }
     }
   }
   if (result.changed != 0 && !incremental_cache_updated) {

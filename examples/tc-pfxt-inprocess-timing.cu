@@ -1,6 +1,7 @@
 #include "tc-pfxt-inprocess-common.cuh"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -138,9 +139,14 @@ int main(int argc, char* argv[]) {
     gpucpg::CpGen cpgen;
     std::cerr << "tc_pfxt_inprocess_setup begin_read_input benchmark="
       << args.benchmark << '\n';
+    const auto load_begin = std::chrono::steady_clock::now();
     cpgen.read_input(args.benchmark);
+    const double load_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - load_begin).count();
     std::cerr << "tc_pfxt_inprocess_setup end_read_input benchmark="
-      << args.benchmark << '\n';
+      << args.benchmark << " load_ms=" << load_ms
+      << " vertices=" << cpgen.num_verts()
+      << " edges=" << cpgen.num_edges() << '\n';
     cpgen.enable_tc_pfxt_static_cache(true);
     std::cerr << "tc_pfxt_inprocess_setup static_cache_enabled=1\n";
     if (args.mode == "all") {

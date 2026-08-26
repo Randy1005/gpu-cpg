@@ -75,3 +75,59 @@ TEST_CASE("invalid batches are rejected atomically") {
     graph.update_edge_weights({{0, 2.0f}, {0, 3.0f}}), std::invalid_argument);
   CHECK(graph.edge_weight(0) == doctest::Approx(1.5f));
 }
+
+TEST_CASE("binary CSR round trip preserves edge ids endpoints and weights") {
+  gpucpg::CpGen text_graph;
+  text_graph.read_input(write_graph().string());
+  auto path = (std::filesystem::temp_directory_path()
+    / "gpucpg_incremental_weight_update_test.csrbin").string();
+  text_graph.write_to_csr_bin(path);
+
+  gpucpg::CpGen binary_graph;
+  binary_graph.read_input(path);
+  REQUIRE(binary_graph.num_verts() == text_graph.num_verts());
+  REQUIRE(binary_graph.num_edges() == text_graph.num_edges());
+  for (std::size_t edge = 0; edge < text_graph.num_edges(); ++edge) {
+    CHECK(binary_graph.edge_endpoints(edge) == text_graph.edge_endpoints(edge));
+    CHECK(binary_graph.edge_weight(edge)
+      == doctest::Approx(text_graph.edge_weight(edge)));
+  }
+  CHECK(binary_graph.find_edge_id(0, 2) == 1);
+  const auto update = binary_graph.update_edge_weights({{1, 9.25f}});
+  CHECK(update.changed == 1);
+  CHECK(binary_graph.edge_weight(1) == doctest::Approx(9.25f));
+}
+
+TEST_CASE("binary CSR supports unit-weight loading") {
+  gpucpg::CpGen text_graph;
+  text_graph.read_input(write_graph().string());
+  auto path = (std::filesystem::temp_directory_path()
+    / "gpucpg_incremental_weight_update_test.csrbin").string();
+  text_graph.write_to_csr_bin(path);
+
+  gpucpg::CpGen binary_graph;
+  binary_graph.read_input(path, true);
+  REQUIRE(binary_graph.num_edges() == 3);
+  for (std::size_t edge = 0; edge < binary_graph.num_edges(); ++edge)
+    CHECK(binary_graph.edge_weight(edge) == doctest::Approx(1.0f));
+}
+
+TEST_CASE("truncated binary CSR is rejected") {
+  gpucpg::CpGen text_graph;
+  text_graph.read_input(write_graph().string());
+  auto path = (std::filesystem::temp_directory_path()
+    / "gpucpg_incremental_weight_update_test.csrbin").string();
+  text_graph.write_to_csr_bin(path);
+  const auto truncated_path = std::filesystem::temp_directory_path()
+    / "gpucpg_incremental_weight_update_truncated.csrbin";
+  {
+    std::ifstream input(path, std::ios::binary);
+    std::ofstream output(truncated_path, std::ios::binary | std::ios::trunc);
+    char bytes[20] {};
+    input.read(bytes, sizeof(bytes));
+    output.write(bytes, input.gcount());
+  }
+  gpucpg::CpGen binary_graph;
+  CHECK_THROWS_AS(
+    binary_graph.read_input(truncated_path.string()), std::runtime_error);
+}

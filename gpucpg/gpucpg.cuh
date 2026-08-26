@@ -338,17 +338,7 @@ public:
     }
   }
 
-  void write_to_csr_bin(std::string& filename) {
-    auto graph = Graph(
-      num_verts(),
-      num_edges(),
-      _h_fanout_adjncy,
-      _h_fanout_adjncy,
-      _h_fanout_wgts,
-      true);
-
-    graph.write_to_bin(filename);
-  }
+  void write_to_csr_bin(std::string& filename) const;
 
 
   std::chrono::duration<double, std::micro> prop_time;
