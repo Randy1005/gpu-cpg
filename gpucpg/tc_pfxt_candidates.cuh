@@ -66,6 +66,151 @@ struct DeferredLpqTile {
   unsigned int promoted[DEFERRED_LPQ_MASK_WORDS]{};
 };
 
+struct MixedSubtileOracleCounts {
+  std::uint64_t mixed_long_products = 0;
+  std::uint64_t covered_16x8_products = 0;
+  std::uint64_t descriptors_16x8 = 0;
+  std::uint64_t covered_8x4_products = 0;
+  std::uint64_t descriptors_8x4 = 0;
+  std::uint64_t residual_long_products = 0;
+  std::uint64_t subregions_considered = 0;
+  std::uint64_t descriptor_bytes = 0;
+};
+
+__host__ __device__ inline std::uint64_t estimated_deferred_subtile_bytes(
+  const int parent_count,
+  const int dev_count) {
+  if (parent_count <= 0 || dev_count <= 0) return 0;
+  const int products = parent_count * dev_count;
+  const int mask_words = (products + 31) / 32;
+  // src, dev_begin, parent/dev counts; parent ids; exact promotion bitmap.
+  return 12ULL
+    + static_cast<std::uint64_t>(parent_count) * sizeof(int)
+    + static_cast<std::uint64_t>(mask_words) * sizeof(unsigned int);
+}
+
+struct CandidateClassRegionCounts {
+  int short_count = 0;
+  int long_count = 0;
+  int skip_count = 0;
+
+  __host__ __device__ int products() const {
+    return short_count + long_count + skip_count;
+  }
+};
+
+__host__ __device__ inline CandidateClassRegionCounts
+count_candidate_class_region(
+  const unsigned char* classes,
+  const int dev_stride,
+  const int parent_begin,
+  const int parent_count,
+  const int dev_begin,
+  const int dev_count) {
+  CandidateClassRegionCounts result;
+  for (int parent = 0; parent < parent_count; ++parent) {
+    for (int dev = 0; dev < dev_count; ++dev) {
+      const auto candidate_class = static_cast<CandidateClass>(
+        classes[(parent_begin + parent) * dev_stride + dev_begin + dev]);
+      if (candidate_class == CandidateClass::SHORT) ++result.short_count;
+      else if (candidate_class == CandidateClass::LONG) ++result.long_count;
+      else ++result.skip_count;
+    }
+  }
+  return result;
+}
+
+// Exact, sorting-free oracle for 32x16 mixed tiles. Uniform 16x8 regions are
+// retained first; only regions still mixed are split into 8x4 leaves.
+__host__ __device__ inline MixedSubtileOracleCounts
+evaluate_mixed_subtiles(
+  const unsigned char* classes,
+  const int parent_count,
+  const int dev_count) {
+  MixedSubtileOracleCounts result;
+  if (classes == nullptr || parent_count <= 0 || dev_count <= 0) return result;
+  const auto root = count_candidate_class_region(
+    classes, dev_count, 0, parent_count, 0, dev_count);
+  result.mixed_long_products = root.long_count;
+  for (int parent_begin = 0; parent_begin < parent_count; parent_begin += 16) {
+    const int parents = parent_count - parent_begin < 16
+      ? parent_count - parent_begin : 16;
+    for (int dev_begin = 0; dev_begin < dev_count; dev_begin += 8) {
+      const int devs = dev_count - dev_begin < 8
+        ? dev_count - dev_begin : 8;
+      const auto level1 = count_candidate_class_region(
+        classes, dev_count, parent_begin, parents, dev_begin, devs);
+      ++result.subregions_considered;
+      if (level1.long_count == level1.products()) {
+        result.covered_16x8_products += level1.long_count;
+        ++result.descriptors_16x8;
+        result.descriptor_bytes +=
+          estimated_deferred_subtile_bytes(parents, devs);
+        continue;
+      }
+      if (level1.long_count == 0) continue;
+      for (int parent_sub = 0; parent_sub < parents; parent_sub += 8) {
+        const int sub_parents = parents - parent_sub < 8
+          ? parents - parent_sub : 8;
+        for (int dev_sub = 0; dev_sub < devs; dev_sub += 4) {
+          const int sub_devs = devs - dev_sub < 4
+            ? devs - dev_sub : 4;
+          const auto level2 = count_candidate_class_region(
+            classes,
+            dev_count,
+            parent_begin + parent_sub,
+            sub_parents,
+            dev_begin + dev_sub,
+            sub_devs);
+          ++result.subregions_considered;
+          if (level2.long_count == level2.products()) {
+            result.covered_8x4_products += level2.long_count;
+            ++result.descriptors_8x4;
+            result.descriptor_bytes +=
+              estimated_deferred_subtile_bytes(sub_parents, sub_devs);
+          }
+          else {
+            result.residual_long_products += level2.long_count;
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+struct SubdescriptorReplayGateInput {
+  double mixed_long_coverage = 0.0;
+  double products_per_descriptor = 0.0;
+  double descriptor_to_avoided_bytes = 1.0;
+  double replay_reduction = 0.0;
+  double active_descriptor_fraction = 1.0;
+  double savings_to_maintenance = 0.0;
+};
+
+struct SubdescriptorReplayGateDecision {
+  bool subdivision = false;
+  bool replay = false;
+  bool maintenance = false;
+
+  __host__ __device__ bool proceed() const {
+    return subdivision && replay && maintenance;
+  }
+};
+
+__host__ __device__ inline SubdescriptorReplayGateDecision
+evaluate_subdescriptor_replay_gates(
+  const SubdescriptorReplayGateInput input) {
+  SubdescriptorReplayGateDecision result;
+  result.subdivision = input.mixed_long_coverage >= 0.40
+    && input.products_per_descriptor >= 8.0
+    && input.descriptor_to_avoided_bytes <= 0.25;
+  result.replay = input.replay_reduction >= 0.40
+    && input.active_descriptor_fraction < 0.60;
+  result.maintenance = input.savings_to_maintenance >= 2.0;
+  return result;
+}
+
 struct TileResidentShadowCounts {
   std::uint64_t tiles = 0;
   std::uint64_t all_short_tiles = 0;

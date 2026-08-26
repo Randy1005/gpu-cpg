@@ -795,3 +795,90 @@ TEST_CASE("compressed lpq split update matches family slack boundaries") {
   CHECK(parents[2].parent_idx == 12);
   CHECK(parents[4].parent_idx == 14);
 }
+
+
+TEST_CASE("subdescriptor replay gates require all opportunity and cost bounds") {
+  using gpucpg::tc_pfxt::SubdescriptorReplayGateInput;
+  using gpucpg::tc_pfxt::evaluate_subdescriptor_replay_gates;
+
+  const auto passing = evaluate_subdescriptor_replay_gates(
+    SubdescriptorReplayGateInput{0.75, 32.0, 0.10, 0.65, 0.25, 3.0});
+  CHECK(passing.subdivision);
+  CHECK(passing.replay);
+  CHECK(passing.maintenance);
+  CHECK(passing.proceed());
+
+  auto input = SubdescriptorReplayGateInput{0.75, 32.0, 0.10, 0.65, 0.25, 3.0};
+  input.mixed_long_coverage = 0.39;
+  CHECK_FALSE(evaluate_subdescriptor_replay_gates(input).proceed());
+  input = SubdescriptorReplayGateInput{0.75, 7.9, 0.10, 0.65, 0.25, 3.0};
+  CHECK_FALSE(evaluate_subdescriptor_replay_gates(input).proceed());
+  input = SubdescriptorReplayGateInput{0.75, 32.0, 0.26, 0.65, 0.25, 3.0};
+  CHECK_FALSE(evaluate_subdescriptor_replay_gates(input).proceed());
+  input = SubdescriptorReplayGateInput{0.75, 32.0, 0.10, 0.39, 0.25, 3.0};
+  CHECK_FALSE(evaluate_subdescriptor_replay_gates(input).proceed());
+  input = SubdescriptorReplayGateInput{0.75, 32.0, 0.10, 0.65, 0.60, 3.0};
+  CHECK_FALSE(evaluate_subdescriptor_replay_gates(input).proceed());
+  input = SubdescriptorReplayGateInput{0.75, 32.0, 0.10, 0.65, 0.25, 1.99};
+  CHECK_FALSE(evaluate_subdescriptor_replay_gates(input).proceed());
+}
+
+TEST_CASE("mixed subtile oracle covers uniform 16x8 long regions exactly") {
+  using gpucpg::tc_pfxt::CandidateClass;
+  std::vector<unsigned char> classes(
+    32 * 16, static_cast<unsigned char>(CandidateClass::LONG));
+  const auto result =
+    gpucpg::tc_pfxt::evaluate_mixed_subtiles(classes.data(), 32, 16);
+  CHECK(result.mixed_long_products == 512);
+  CHECK(result.covered_16x8_products == 512);
+  CHECK(result.descriptors_16x8 == 4);
+  CHECK(result.covered_8x4_products == 0);
+  CHECK(result.residual_long_products == 0);
+  CHECK(result.descriptor_bytes
+    == 4 * gpucpg::tc_pfxt::estimated_deferred_subtile_bytes(16, 8));
+}
+
+TEST_CASE("mixed subtile oracle sends only nonuniform boundary long products scalar") {
+  using gpucpg::tc_pfxt::CandidateClass;
+  std::vector<unsigned char> classes(
+    32 * 16, static_cast<unsigned char>(CandidateClass::SHORT));
+  auto set_region = [&](const int parent_begin, const int parent_count,
+                        const int dev_begin, const int dev_count,
+                        const CandidateClass candidate_class) {
+    for (int parent = parent_begin; parent < parent_begin + parent_count; ++parent) {
+      for (int dev = dev_begin; dev < dev_begin + dev_count; ++dev) {
+        classes[parent * 16 + dev] =
+          static_cast<unsigned char>(candidate_class);
+      }
+    }
+  };
+  set_region(0, 16, 0, 8, CandidateClass::LONG);
+  set_region(16, 8, 8, 4, CandidateClass::LONG);
+  classes[31 * 16 + 15] = static_cast<unsigned char>(CandidateClass::LONG);
+  classes[30 * 16 + 15] = static_cast<unsigned char>(CandidateClass::SKIP);
+
+  const auto result =
+    gpucpg::tc_pfxt::evaluate_mixed_subtiles(classes.data(), 32, 16);
+  CHECK(result.mixed_long_products == 161);
+  CHECK(result.covered_16x8_products == 128);
+  CHECK(result.descriptors_16x8 == 1);
+  CHECK(result.covered_8x4_products == 32);
+  CHECK(result.descriptors_8x4 == 1);
+  CHECK(result.residual_long_products == 1);
+  CHECK(result.covered_16x8_products + result.covered_8x4_products
+      + result.residual_long_products == result.mixed_long_products);
+}
+
+TEST_CASE("mixed subtile oracle handles partial tiles without padding products") {
+  using gpucpg::tc_pfxt::CandidateClass;
+  std::vector<unsigned char> classes(
+    10 * 6, static_cast<unsigned char>(CandidateClass::LONG));
+  const auto result =
+    gpucpg::tc_pfxt::evaluate_mixed_subtiles(classes.data(), 10, 6);
+  CHECK(result.mixed_long_products == 60);
+  CHECK(result.covered_16x8_products == 60);
+  CHECK(result.descriptors_16x8 == 1);
+  CHECK(result.residual_long_products == 0);
+  CHECK(result.descriptor_bytes
+    == gpucpg::tc_pfxt::estimated_deferred_subtile_bytes(10, 6));
+}

@@ -5301,6 +5301,148 @@ __global__ void shadow_tc_pfxt_source_local_tile_resident_lpq(
   }
 }
 
+
+__device__ __forceinline__ int tc_pfxt_source_group_begin(
+  const int* group_offsets,
+  const int src,
+  const int source_slot,
+  const bool compact_group_offsets);
+
+__global__ void accumulate_oracle_u64(
+  unsigned long long* stats, const int index, const unsigned long long value) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) atomicAdd(stats + index, value);
+}
+
+__global__ void profile_tc_pfxt_mixed_subtile_oracle(
+  const int n_tiles,
+  const int4* tiles,
+  const unsigned char* tile_classes,
+  const int* active_sources,
+  const int* group_offsets,
+  const int* path_indices,
+  const int* dev_offsets,
+  const float* dev_deltas,
+  const unsigned char* dev_reachable,
+  const PfxtNode* short_pile,
+  const int window_start,
+  const float split,
+  const float final_split,
+  const bool use_final_split,
+  const bool skip_long_paths,
+  const bool compact_group_offsets,
+  unsigned long long* stats) {
+  const int tile_idx = blockIdx.x;
+  if (tile_idx >= n_tiles || tile_classes == nullptr
+      || static_cast<tc_pfxt::CandidateTileClass>(tile_classes[tile_idx])
+        != tc_pfxt::CandidateTileClass::MIXED) {
+    return;
+  }
+
+  __shared__ unsigned char classes[
+    tc_pfxt::DEFERRED_LPQ_MAX_PARENTS * tc_pfxt::DEFERRED_LPQ_MAX_DEVS];
+  __shared__ int parent_count;
+  __shared__ int dev_count;
+  __shared__ int parent_base;
+  __shared__ int dev_base;
+  if (threadIdx.x == 0) {
+    const auto tile = tiles[tile_idx];
+    const int src = active_sources[tile.x];
+    parent_count = tile.w >> 16;
+    dev_count = tile.w & 0xffff;
+    parent_base = tc_pfxt_source_group_begin(
+      group_offsets, src, tile.x, compact_group_offsets) + tile.y;
+    dev_base = dev_offsets[src] + tile.z;
+  }
+  __syncthreads();
+
+  const int products = parent_count * dev_count;
+  for (int product = threadIdx.x; product < products; product += blockDim.x) {
+    const int local_parent = product / dev_count;
+    const int local_dev = product - local_parent * dev_count;
+    auto candidate_class = tc_pfxt::CandidateClass::SKIP;
+    if (dev_reachable == nullptr || dev_reachable[dev_base + local_dev] != 0) {
+      const int active_idx = path_indices[parent_base + local_parent];
+      const int parent_idx = window_start + active_idx;
+      const float slack = short_pile[parent_idx].slack
+        + dev_deltas[dev_base + local_dev];
+      candidate_class = tc_pfxt::classify_candidate(
+        slack, split, final_split, use_final_split, skip_long_paths);
+    }
+    classes[product] = static_cast<unsigned char>(candidate_class);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    const auto result =
+      tc_pfxt::evaluate_mixed_subtiles(classes, parent_count, dev_count);
+    const auto covered =
+      result.covered_16x8_products + result.covered_8x4_products;
+    atomicAdd(stats + 0, 1ULL);
+    atomicAdd(stats + 1, static_cast<unsigned long long>(products));
+    atomicAdd(stats + 2, result.mixed_long_products);
+    atomicAdd(stats + 3, result.covered_16x8_products);
+    atomicAdd(stats + 4, result.descriptors_16x8);
+    atomicAdd(stats + 5, result.covered_8x4_products);
+    atomicAdd(stats + 6, result.descriptors_8x4);
+    atomicAdd(stats + 7, result.residual_long_products);
+    atomicAdd(stats + 8, result.subregions_considered);
+    atomicAdd(stats + 9, result.descriptor_bytes);
+    atomicAdd(stats + 10, covered * sizeof(PfxtNode));
+    if (covered + result.residual_long_products
+        != result.mixed_long_products) {
+      atomicAdd(stats + 11, 1ULL);
+    }
+  }
+}
+
+// Shadow accounting only: production kernels and descriptor state are unchanged.
+// Phase 0 observes a current minimum scan. Phase 1 models a count plus the
+// additional count/promote passes when the split activates any descriptor.
+__global__ void profile_deferred_lpq_selective_replay(
+  const tc_pfxt::DeferredLpqTile* tiles,
+  const int n_tiles,
+  const int* promoted_counts,
+  const int phase,
+  const bool any_promoted,
+  unsigned long long* stats) {
+  const int tile_idx = blockIdx.x;
+  if (tile_idx >= n_tiles) return;
+  const auto& tile = tiles[tile_idx];
+  const int products = tile.parent_count * tile.dev_count;
+  unsigned long long local_remaining = 0;
+  for (int product = threadIdx.x; product < products; product += blockDim.x) {
+    const unsigned mask = 1u << (product & 31);
+    local_remaining +=
+      (tile.promoted[product >> 5] & mask) == 0 ? 1ULL : 0ULL;
+  }
+  using BlockReduce =
+    cub::BlockReduce<unsigned long long, TC_PFXT_PAIR_BLOCK_THREADS>;
+  __shared__ typename BlockReduce::TempStorage storage;
+  const auto remaining = BlockReduce(storage).Sum(local_remaining);
+  if (threadIdx.x != 0) return;
+
+  if (phase == 0) {
+    atomicAdd(stats + 0, remaining);
+    atomicAdd(stats + 1, 1ULL);
+    return;
+  }
+
+  const int promoted = promoted_counts == nullptr ? 0 : promoted_counts[tile_idx];
+  atomicAdd(stats + 2, 1ULL);
+  atomicAdd(stats + 3, 1ULL);
+  atomicAdd(stats + 4, remaining * (any_promoted ? 3ULL : 1ULL));
+  if (promoted > 0) {
+    atomicAdd(stats + 5, 1ULL);
+    atomicAdd(stats + 6, remaining);
+    atomicAdd(stats + 7, static_cast<unsigned long long>(promoted));
+  }
+  else {
+    atomicAdd(stats + 8, 1ULL);
+    atomicAdd(stats + 9, remaining);
+  }
+  if (tile_idx == 0) atomicAdd(stats + 10, 1ULL);
+}
+
 __global__ void cheap_shadow_tc_pfxt_source_local_tile_resident_lpq(
   const int n_tiles,
   const int4* tiles,
@@ -8530,6 +8672,8 @@ struct TcPfxtScratch {
   thrust::device_vector<unsigned long long> source_local_bound_stats;
   thrust::device_vector<unsigned long long> tile_resident_shadow_stats;
   thrust::device_vector<unsigned long long> tile_resident_cheap_shadow_stats;
+  thrust::device_vector<unsigned long long> mixed_subtile_oracle_stats;
+  thrust::device_vector<unsigned long long> selective_replay_oracle_stats;
   thrust::device_vector<unsigned char> source_local_tile_classes;
   thrust::device_vector<TcPfxtSourceLocalParentTileBound> source_local_parent_tile_bounds;
   thrust::device_vector<TcPfxtSourceLocalDevTileBound> source_local_dev_tile_bounds;
@@ -8560,6 +8704,57 @@ static double ratio_or_zero(const std::uint64_t numerator,
   return denominator == 0
     ? 0.0
     : static_cast<double>(numerator) / static_cast<double>(denominator);
+}
+
+static void report_subdescriptor_replay_oracle(
+  const TcPfxtScratch& scratch) {
+  if (scratch.mixed_subtile_oracle_stats.empty()
+      || scratch.selective_replay_oracle_stats.empty()) {
+    return;
+  }
+  // Exactly one device-to-host summary transfer per vector and query.
+  const thrust::host_vector<unsigned long long> mixed(
+    scratch.mixed_subtile_oracle_stats);
+  const thrust::host_vector<unsigned long long> replay(
+    scratch.selective_replay_oracle_stats);
+  const auto covered = mixed[3] + mixed[5];
+  const auto descriptors = mixed[4] + mixed[6];
+  const auto current_evals = replay[0] + replay[4];
+  const auto selective_evals = replay[11] + replay[6];
+  const double coverage = ratio_or_zero(covered, mixed[2]);
+  const double products_per_descriptor = ratio_or_zero(covered, descriptors);
+  const double descriptor_to_avoided_bytes = ratio_or_zero(mixed[9], mixed[10]);
+  const double replay_reduction = current_evals > selective_evals
+    ? ratio_or_zero(current_evals - selective_evals, current_evals)
+    : 0.0;
+  const double active_fraction = ratio_or_zero(replay[5], replay[5] + replay[8]);
+  std::cout << "runtime_summary_tc_subdescriptor_replay_oracle"
+    << " mixed_tiles=" << mixed[0]
+    << " mixed_products=" << mixed[1]
+    << " mixed_long_products=" << mixed[2]
+    << " covered_16x8=" << mixed[3]
+    << " descriptors_16x8=" << mixed[4]
+    << " covered_8x4=" << mixed[5]
+    << " descriptors_8x4=" << mixed[6]
+    << " residual_long=" << mixed[7]
+    << " subregions_considered=" << mixed[8]
+    << " descriptor_bytes=" << mixed[9]
+    << " avoided_node_bytes=" << mixed[10]
+    << " partition_mismatches=" << mixed[11]
+    << " coverage=" << coverage
+    << " products_per_descriptor=" << products_per_descriptor
+    << " descriptor_to_avoided_bytes=" << descriptor_to_avoided_bytes
+    << " initial_deferred_products=" << replay[11]
+    << " current_product_evals=" << current_evals
+    << " selective_product_evals=" << selective_evals
+    << " replay_reduction=" << replay_reduction
+    << " descriptor_checks=" << replay[3]
+    << " active_descriptors=" << replay[5]
+    << " inactive_descriptors=" << replay[8]
+    << " active_fraction=" << active_fraction
+    << " promoted_products=" << replay[7]
+    << " split_invocations=" << replay[10]
+    << '\n';
 }
 
 __global__ void profile_tc_pfxt_gpg_equiv_visits(
@@ -11088,6 +11283,8 @@ static void tc_pfxt_expand_window_single_pass(
   auto& tile_resident_shadow_stats = scratch.tile_resident_shadow_stats;
   auto& tile_resident_cheap_shadow_stats =
     scratch.tile_resident_cheap_shadow_stats;
+  auto& mixed_subtile_oracle_stats = scratch.mixed_subtile_oracle_stats;
+  auto& selective_replay_oracle_stats = scratch.selective_replay_oracle_stats;
   auto& source_local_tile_classes = scratch.source_local_tile_classes;
   auto& source_local_parent_tile_bounds = scratch.source_local_parent_tile_bounds;
   auto& source_local_dev_tile_bounds = scratch.source_local_dev_tile_bounds;
@@ -11155,6 +11352,17 @@ static void tc_pfxt_expand_window_single_pass(
     std::getenv("GPUCPG_TC_PFXT_TILE_RESIDENT_LPQ_SHADOW") != nullptr;
   const bool tile_resident_lpq_cheap_shadow_requested =
     std::getenv("GPUCPG_TC_PFXT_TILE_RESIDENT_LPQ_CHEAP_SHADOW") != nullptr;
+  const bool subdescriptor_replay_oracle_requested =
+    std::getenv("GPUCPG_TC_PFXT_SUBDESCRIPTOR_REPLAY_ORACLE") != nullptr;
+  if (subdescriptor_replay_oracle_requested
+      && mixed_subtile_oracle_stats.empty()) {
+    mixed_subtile_oracle_stats.resize(12);
+    selective_replay_oracle_stats.resize(12);
+    thrust::fill(mixed_subtile_oracle_stats.begin(),
+      mixed_subtile_oracle_stats.end(), 0ULL);
+    thrust::fill(selective_replay_oracle_stats.begin(),
+      selective_replay_oracle_stats.end(), 0ULL);
+  }
   if (use_compact_static_devs) {
     source_local_dev_offsets =
       thrust::raw_pointer_cast(compact_static_devs.offsets.data());
@@ -13639,6 +13847,29 @@ static void tc_pfxt_expand_window_single_pass(
                   : nullptr);
             cudaCheckErrors("tc pfxt source-local count class outputs failed");
           }
+          if (subdescriptor_replay_oracle_requested
+              && use_source_local_tile_classes) {
+            profile_tc_pfxt_mixed_subtile_oracle
+              <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
+                h_n_tiles,
+                thrust::raw_pointer_cast(source_local_tiles.data()),
+                thrust::raw_pointer_cast(source_local_tile_classes.data()),
+                thrust::raw_pointer_cast(source_local_active_sources.data()),
+                active_group_offsets,
+                thrust::raw_pointer_cast(path_indices.data()),
+                source_local_dev_offsets,
+                source_local_dev_deltas,
+                source_local_dev_reachable,
+                thrust::raw_pointer_cast(short_pile.data()),
+                window_start,
+                split,
+                final_split,
+                use_final_split,
+                !fill_longs,
+                use_compact_source_groups,
+                thrust::raw_pointer_cast(mixed_subtile_oracle_stats.data()));
+            cudaCheckErrors("tc pfxt mixed subtile oracle failed");
+          }
           cudaMemcpy(
             h_source_local_class_counts_raw,
             thrust::raw_pointer_cast(source_local_class_counts.data()),
@@ -13986,6 +14217,13 @@ static void tc_pfxt_expand_window_single_pass(
             cudaMemcpyDeviceToHost);
           cudaCheckErrors("tc pfxt source-local copy deferred product count failed");
           scratch.deferred_lpq_remaining += h_deferred_products;
+          if (subdescriptor_replay_oracle_requested && h_deferred_products > 0) {
+            accumulate_oracle_u64<<<1, 1>>>(
+              thrust::raw_pointer_cast(selective_replay_oracle_stats.data()),
+              11,
+              h_deferred_products);
+            cudaCheckErrors("tc pfxt replay oracle initial products failed");
+          }
         }
         thrust::host_vector<int> h_overflow(overflow);
         if (h_overflow[0] != 0) {
@@ -17103,6 +17341,8 @@ void CpGen::report_paths(
     std::getenv("GPUCPG_TC_PFXT_COMPRESSED_LPQ") != nullptr;
   const bool enable_tc_pfxt_deferred_tile_lpq =
     std::getenv("GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ") != nullptr;
+  const bool enable_subdescriptor_replay_oracle =
+    std::getenv("GPUCPG_TC_PFXT_SUBDESCRIPTOR_REPLAY_ORACLE") != nullptr;
   const bool enable_tc_pfxt_threshold_filter =
     std::getenv("GPUCPG_TC_PFXT_THRESHOLD_FILTER") != nullptr;
   const bool enable_tc_pfxt_source_major_candidate =
@@ -18303,6 +18543,19 @@ void CpGen::report_paths(
               thrust::raw_pointer_cast(short_pile.data()),
               thrust::raw_pointer_cast(mins.data()));
           cudaCheckErrors("deferred tile lpq min slack failed");
+          if (enable_subdescriptor_replay_oracle
+              && !tc_pfxt_scratch.selective_replay_oracle_stats.empty()) {
+            profile_deferred_lpq_selective_replay
+              <<<static_cast<int>(tiles.size()), TC_PFXT_PAIR_BLOCK_THREADS>>>(
+                thrust::raw_pointer_cast(tiles.data()),
+                static_cast<int>(tiles.size()),
+                nullptr,
+                0,
+                false,
+                thrust::raw_pointer_cast(
+                  tc_pfxt_scratch.selective_replay_oracle_stats.data()));
+            cudaCheckErrors("deferred replay oracle min scan failed");
+          }
           return *thrust::min_element(
             thrust::device, mins.begin(), mins.end());
         };
@@ -18324,8 +18577,22 @@ void CpGen::report_paths(
               split,
               thrust::raw_pointer_cast(counts.data()));
           cudaCheckErrors("deferred tile lpq count promoted failed");
-          return thrust::reduce(
+          const int promoted = thrust::reduce(
             thrust::device, counts.begin(), counts.end(), 0);
+          if (enable_subdescriptor_replay_oracle
+              && !tc_pfxt_scratch.selective_replay_oracle_stats.empty()) {
+            profile_deferred_lpq_selective_replay
+              <<<static_cast<int>(tiles.size()), TC_PFXT_PAIR_BLOCK_THREADS>>>(
+                thrust::raw_pointer_cast(tiles.data()),
+                static_cast<int>(tiles.size()),
+                thrust::raw_pointer_cast(counts.data()),
+                1,
+                promoted > 0,
+                thrust::raw_pointer_cast(
+                  tc_pfxt_scratch.selective_replay_oracle_stats.data()));
+            cudaCheckErrors("deferred replay oracle count scan failed");
+          }
+          return promoted;
         };
         auto deferred_lpq_promote_device = [&](const float split,
                                                const int base_short) {
@@ -19642,6 +19909,10 @@ void CpGen::report_paths(
       }
     }
     std::cout << "pfxt expansion completed in " << timer.get_elapsed_time()/1ms << " ms.\n";
+
+    if (enable_subdescriptor_replay_oracle) {
+      report_subdescriptor_replay_oracle(tc_pfxt_scratch);
+    }
 
     if (std::getenv("GPUCPG_TC_PFXT_ADAPTIVE_DEFER") != nullptr
         && !tc_pfxt_scratch.defer_oracle_telemetry_size.empty()) {
