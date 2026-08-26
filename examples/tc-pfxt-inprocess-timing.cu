@@ -54,7 +54,7 @@ Args parse_args(int argc, char* argv[]) {
   if (args.benchmark.empty() || args.k <= 0) {
     throw std::runtime_error("missing --benchmark or positive --k");
   }
-  if (args.mode != "all") {
+  if (args.mode != "all" && args.mode != "gpg-adaptive") {
     gpucpg::tc_pfxt_inprocess::parse_run_mode(args.mode);
   }
   if (args.warmup < 0 || args.trials <= 0) {
@@ -67,7 +67,7 @@ void print_usage(const char* argv0, const std::exception& e) {
   std::cerr
     << "usage: " << argv0
     << " --benchmark FILE --k K "
-    << "[--mode gpg|gpg-deferred|tile-deferred|adaptive|all] "
+    << "[--mode gpg|gpg-deferred|tile-deferred|adaptive|gpg-adaptive|all] "
     << "[--warmup N] [--trials N] [--reset-device]\n"
     << "error: " << e.what() << '\n';
 }
@@ -147,6 +147,12 @@ int main(int argc, char* argv[]) {
       run_mode(cpgen, args, "gpg");
       run_mode(cpgen, args, "gpg-deferred");
       run_mode(cpgen, args, "tile-deferred");
+      run_mode(cpgen, args, "adaptive");
+    }
+    else if (args.mode == "gpg-adaptive") {
+      // GPG does not populate TC metadata, so adaptive remains a true cold
+      // setup while both arms share only common input parsing/construction.
+      run_mode(cpgen, args, "gpg");
       run_mode(cpgen, args, "adaptive");
     }
     else {

@@ -7570,6 +7570,261 @@ struct TcPfxtDeviceCompactStaticDeviationCsr {
   }
 };
 
+struct TcPfxtGpuBvssBuildStats {
+  int scalar_d2h_transfers = 0;
+};
+
+__global__ void emit_tc_pfxt_bvss_edge_keys(
+  const int n_nodes, const int* row_ptr, const int* col_idx,
+  const int* succs, unsigned long long* keys, unsigned int* masks) {
+  const int src = blockIdx.x * blockDim.x + threadIdx.x;
+  if (src >= n_nodes) return;
+  const auto interval = static_cast<unsigned int>(src / 8);
+  const auto source_mask = 1u << (src % 8);
+  for (int edge = row_ptr[src]; edge < row_ptr[src + 1]; ++edge) {
+    const int dst = col_idx[edge];
+    if (dst == succs[src]) { keys[edge] = ~0ULL; masks[edge] = 0; }
+    else {
+      keys[edge] = (static_cast<unsigned long long>(interval) << 32)
+        | static_cast<unsigned int>(dst);
+      masks[edge] = source_mask;
+    }
+  }
+}
+
+__global__ void count_tc_pfxt_bvss_interval_slices(
+  const unsigned long long* keys, const int n_keys, int* interval_counts) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_keys) {
+    const auto key = keys[i];
+    if (key != ~0ULL) {
+      atomicAdd(interval_counts + static_cast<unsigned int>(key >> 32), 1);
+    }
+  }
+}
+
+__global__ void pack_tc_pfxt_bvss_intervals(
+  const int n_intervals, const int* slice_offsets, const int* real_ptrs,
+  const unsigned long long* keys, const unsigned int* slice_masks,
+  int* virtual_to_real, unsigned char* slice_counts, int* row_ids,
+  unsigned int* packed_masks) {
+  const int interval = blockIdx.x;
+  const int lane = threadIdx.x;
+  if (interval >= n_intervals || lane >= 32) return;
+  const int slice_begin = slice_offsets[interval];
+  const int slice_end = slice_offsets[interval + 1];
+  const int first_vss = real_ptrs[interval];
+  const int n_vss = real_ptrs[interval + 1] - first_vss;
+  for (int local_vss = 0; local_vss < n_vss; ++local_vss) {
+    const int vss = first_vss + local_vss;
+    const int begin = slice_begin + local_vss * 128;
+    const int end = min(begin + 128, slice_end);
+    if (lane == 0) {
+      virtual_to_real[vss] = interval;
+      slice_counts[vss] = static_cast<unsigned char>(end - begin);
+    }
+    unsigned int packed = 0;
+    for (int chunk = 0; chunk < 4; ++chunk) {
+      const int slice = begin + chunk * 32 + lane;
+      const int row_slot = vss * 128 + lane * 4 + chunk;
+      if (slice < end) {
+        row_ids[row_slot] = static_cast<int>(keys[slice]);
+        packed |= slice_masks[slice] << (8 * chunk);
+      }
+    }
+    packed_masks[vss * 32 + lane] = packed;
+  }
+}
+
+static TcPfxtGpuBvssBuildStats build_tc_pfxt_bvss_on_device(
+  const int n_nodes, const int n_edges, const int* d_row_ptr,
+  const int* d_col_idx, const int* d_succs, TcPfxtDeviceBvss& out) {
+  TcPfxtGpuBvssBuildStats stats;
+  out.n_intervals = (n_nodes + 7) / 8;
+  if (n_nodes <= 0 || n_edges <= 0) {
+    out.real_ptrs.assign(static_cast<std::size_t>(out.n_intervals) + 1, 0);
+    out.n_vss = 0;
+    return stats;
+  }
+  thrust::device_vector<unsigned long long> keys(n_edges), unique_keys(n_edges);
+  thrust::device_vector<unsigned int> masks(n_edges), unique_masks(n_edges);
+  emit_tc_pfxt_bvss_edge_keys<<<std::max(1, ROUNDUPBLOCKS(n_nodes, 256)), 256>>>(
+    n_nodes, d_row_ptr, d_col_idx, d_succs,
+    thrust::raw_pointer_cast(keys.data()), thrust::raw_pointer_cast(masks.data()));
+  cudaCheckErrors("tc pfxt GPU BVSS key emission failed");
+  thrust::sort_by_key(keys.begin(), keys.end(), masks.begin());
+  const auto reduced_end = thrust::reduce_by_key(
+    keys.begin(), keys.end(), masks.begin(), unique_keys.begin(), unique_masks.begin(),
+    thrust::equal_to<unsigned long long>(), thrust::bit_or<unsigned int>());
+  int unique_count = static_cast<int>(reduced_end.first - unique_keys.begin());
+  thrust::device_vector<int> interval_counts(out.n_intervals, 0);
+  if (unique_count > 0) {
+    count_tc_pfxt_bvss_interval_slices<<<std::max(1, ROUNDUPBLOCKS(unique_count, 256)), 256>>>(
+      thrust::raw_pointer_cast(unique_keys.data()), unique_count,
+      thrust::raw_pointer_cast(interval_counts.data()));
+    cudaCheckErrors("tc pfxt GPU BVSS interval count failed");
+  }
+  thrust::device_vector<int> slice_offsets(out.n_intervals + 1, 0);
+  thrust::inclusive_scan(interval_counts.begin(), interval_counts.end(), slice_offsets.begin() + 1);
+  thrust::device_vector<int> interval_vss_counts(out.n_intervals);
+  thrust::transform(interval_counts.begin(), interval_counts.end(), interval_vss_counts.begin(),
+    [] __device__ (const int count) { return (count + 127) / 128; });
+  out.real_ptrs.resize(out.n_intervals + 1);
+  thrust::fill(out.real_ptrs.begin(), out.real_ptrs.end(), 0);
+  thrust::inclusive_scan(interval_vss_counts.begin(), interval_vss_counts.end(),
+    out.real_ptrs.begin() + 1);
+  cudaMemcpy(&out.n_vss, thrust::raw_pointer_cast(out.real_ptrs.data()) + out.n_intervals,
+    sizeof(out.n_vss), cudaMemcpyDeviceToHost);
+  ++stats.scalar_d2h_transfers;
+  out.virtual_to_real.resize(out.n_vss);
+  out.slice_counts.resize(out.n_vss);
+  out.row_ids.assign(static_cast<std::size_t>(out.n_vss) * 128, -1);
+  out.masks.resize(static_cast<std::size_t>(out.n_vss) * 32);
+  if (out.n_vss > 0) {
+    pack_tc_pfxt_bvss_intervals<<<out.n_intervals, 32>>>(
+      out.n_intervals, thrust::raw_pointer_cast(slice_offsets.data()),
+      thrust::raw_pointer_cast(out.real_ptrs.data()),
+      thrust::raw_pointer_cast(unique_keys.data()), thrust::raw_pointer_cast(unique_masks.data()),
+      thrust::raw_pointer_cast(out.virtual_to_real.data()),
+      thrust::raw_pointer_cast(out.slice_counts.data()),
+      thrust::raw_pointer_cast(out.row_ids.data()), thrust::raw_pointer_cast(out.masks.data()));
+    cudaCheckErrors("tc pfxt GPU BVSS packing failed");
+  }
+  return stats;
+}
+
+__global__ void count_tc_pfxt_compact_deviations(
+  const int n_nodes, const int* row_ptr, const int* col_idx,
+  const int* succs, const int* dists, int* counts) {
+  const int src = blockIdx.x * blockDim.x + threadIdx.x;
+  if (src >= n_nodes) return;
+  const int src_dist = dists[src];
+  int count = 0;
+  if (src_dist != INT_MAX) {
+    for (int edge = row_ptr[src]; edge < row_ptr[src + 1]; ++edge) {
+      const int dst = col_idx[edge];
+      count += dst != succs[src] && dists[dst] != INT_MAX;
+    }
+  }
+  counts[src] = count;
+}
+
+__global__ void fill_tc_pfxt_compact_deviations(
+  const int n_nodes, const int* row_ptr, const int* col_idx,
+  const float* weights, const int* succs, const int* dists,
+  const int* offsets, int* dsts, float* deltas) {
+  const int src = blockIdx.x * blockDim.x + threadIdx.x;
+  if (src >= n_nodes || dists[src] == INT_MAX) return;
+  int output = offsets[src];
+  for (int edge = row_ptr[src]; edge < row_ptr[src + 1]; ++edge) {
+    const int dst = col_idx[edge];
+    if (dst == succs[src] || dists[dst] == INT_MAX) continue;
+    dsts[output] = dst;
+    // The library is compiled with --use_fast_math, but these cached deltas
+    // must match the host reference rather than accumulate approximate-divide
+    // error across a long product chain.
+    deltas[output] = __fdiv_rn(static_cast<float>(dists[dst]), float(SCALE_UP))
+      + weights[edge]
+      - __fdiv_rn(static_cast<float>(dists[src]), float(SCALE_UP));
+    ++output;
+  }
+}
+
+static int build_tc_pfxt_compact_deviations_on_device(
+  const int n_nodes, const int* d_row_ptr, const int* d_col_idx,
+  const float* d_weights, const int* d_succs, const int* d_dists,
+  TcPfxtDeviceCompactStaticDeviationCsr& out) {
+  out.offsets.resize(static_cast<std::size_t>(n_nodes) + 1);
+  thrust::fill(out.offsets.begin(), out.offsets.end(), 0);
+  if (n_nodes <= 0) {
+    out.dsts.clear();
+    out.deltas.clear();
+    return 0;
+  }
+  thrust::device_vector<int> counts(n_nodes);
+  count_tc_pfxt_compact_deviations
+    <<<std::max(1, ROUNDUPBLOCKS(n_nodes, 256)), 256>>>(
+      n_nodes, d_row_ptr, d_col_idx, d_succs, d_dists,
+      thrust::raw_pointer_cast(counts.data()));
+  cudaCheckErrors("tc pfxt GPU compact deviation count failed");
+  thrust::inclusive_scan(counts.begin(), counts.end(), out.offsets.begin() + 1);
+  int total = 0;
+  cudaMemcpy(&total, thrust::raw_pointer_cast(out.offsets.data()) + n_nodes,
+    sizeof(total), cudaMemcpyDeviceToHost);
+  out.dsts.resize(total);
+  out.deltas.resize(total);
+  if (total > 0) {
+    fill_tc_pfxt_compact_deviations
+      <<<std::max(1, ROUNDUPBLOCKS(n_nodes, 256)), 256>>>(
+        n_nodes, d_row_ptr, d_col_idx, d_weights, d_succs, d_dists,
+        thrust::raw_pointer_cast(out.offsets.data()),
+        thrust::raw_pointer_cast(out.dsts.data()),
+        thrust::raw_pointer_cast(out.deltas.data()));
+    cudaCheckErrors("tc pfxt GPU compact deviation fill failed");
+  }
+  return total;
+}
+
+namespace tc_pfxt {
+
+HostBvss build_adev_bvss_from_fanout_csr_gpu_for_test(
+  const int n_nodes, const std::vector<int>& row_ptr,
+  const std::vector<int>& col_idx, const std::vector<int>& succs) {
+  validate_inputs(n_nodes, row_ptr, col_idx, succs);
+  const thrust::device_vector<int> d_row_ptr(row_ptr);
+  const thrust::device_vector<int> d_col_idx(col_idx);
+  const thrust::device_vector<int> d_succs(succs);
+  TcPfxtDeviceBvss device;
+  build_tc_pfxt_bvss_on_device(
+    n_nodes, static_cast<int>(col_idx.size()),
+    thrust::raw_pointer_cast(d_row_ptr.data()),
+    thrust::raw_pointer_cast(d_col_idx.data()),
+    thrust::raw_pointer_cast(d_succs.data()), device);
+  cudaDeviceSynchronize();
+  HostBvss out;
+  out.n_intervals = device.n_intervals;
+  out.n_vss = device.n_vss;
+  const thrust::host_vector<int> real_ptrs(device.real_ptrs);
+  const thrust::host_vector<int> virtual_to_real(device.virtual_to_real);
+  const thrust::host_vector<unsigned char> slice_counts(device.slice_counts);
+  const thrust::host_vector<int> row_ids(device.row_ids);
+  const thrust::host_vector<unsigned int> masks(device.masks);
+  out.real_ptrs.assign(real_ptrs.begin(), real_ptrs.end());
+  out.virtual_to_real.assign(virtual_to_real.begin(), virtual_to_real.end());
+  out.slice_counts.assign(slice_counts.begin(), slice_counts.end());
+  out.row_ids.assign(row_ids.begin(), row_ids.end());
+  out.masks.assign(masks.begin(), masks.end());
+  for (const auto count : out.slice_counts) out.unpadded_slices += count;
+  for (const auto mask : out.masks) out.total_set_bits += popcount32(mask);
+  return out;
+}
+
+CompactStaticDeviationCsr build_compact_static_deviation_csr_gpu_for_test(
+  const int n_nodes, const std::vector<int>& row_ptr,
+  const std::vector<int>& col_idx, const std::vector<float>& weights,
+  const std::vector<int>& succs, const std::vector<int>& dists) {
+  const thrust::device_vector<int> d_row_ptr(row_ptr), d_col_idx(col_idx);
+  const thrust::device_vector<float> d_weights(weights);
+  const thrust::device_vector<int> d_succs(succs), d_dists(dists);
+  TcPfxtDeviceCompactStaticDeviationCsr device;
+  build_tc_pfxt_compact_deviations_on_device(
+    n_nodes, thrust::raw_pointer_cast(d_row_ptr.data()),
+    thrust::raw_pointer_cast(d_col_idx.data()),
+    thrust::raw_pointer_cast(d_weights.data()),
+    thrust::raw_pointer_cast(d_succs.data()),
+    thrust::raw_pointer_cast(d_dists.data()), device);
+  cudaDeviceSynchronize();
+  const thrust::host_vector<int> offsets(device.offsets), dsts(device.dsts);
+  const thrust::host_vector<float> deltas(device.deltas);
+  CompactStaticDeviationCsr out;
+  out.offsets.assign(offsets.begin(), offsets.end());
+  out.dsts.assign(dsts.begin(), dsts.end());
+  out.deltas.assign(deltas.begin(), deltas.end());
+  return out;
+}
+
+}  // namespace tc_pfxt
+
 struct CpGen::TcPfxtStaticCache {
   bool enabled = false;
   int hits = 0;
@@ -17351,6 +17606,8 @@ void CpGen::report_paths(
             : local_tc_pfxt_chain_product_upper_bounds;
 		    TcPfxtScratch tc_pfxt_scratch;
         bool tc_pfxt_static_hit = false;
+        const bool profile_tc_pfxt_setup_stages =
+          std::getenv("GPUCPG_TC_PFXT_SETUP_STAGE_PROFILE") != nullptr;
         const auto tc_pfxt_static_setup_begin =
           std::chrono::steady_clock::now();
 		    if (enable_tc_pfxt) {
@@ -17366,32 +17623,66 @@ void CpGen::report_paths(
             std::cout << "tc_pfxt_static_cache=hit tc_static=1\n";
           }
           else {
-	      const auto h_bvss = tc_pfxt::build_adev_bvss_from_fanout_csr(
-	        N,
-	        _h_fanout_adjp,
-	        _h_fanout_adjncy,
-	        std::vector<int>(_h_succs.begin(), _h_succs.end()),
-	        8);
-	      tc_pfxt_bvss.real_ptrs = h_bvss.real_ptrs;
-	      tc_pfxt_bvss.virtual_to_real = h_bvss.virtual_to_real;
-	      tc_pfxt_bvss.slice_counts = h_bvss.slice_counts;
-	      tc_pfxt_bvss.row_ids = h_bvss.row_ids;
-	      tc_pfxt_bvss.masks = h_bvss.masks;
-	      tc_pfxt_bvss.n_intervals = h_bvss.n_intervals;
-	      tc_pfxt_bvss.n_vss = h_bvss.n_vss;
-	      const auto one_mma_vss = std::count_if(
-	        h_bvss.slice_counts.begin(),
-	        h_bvss.slice_counts.end(),
-	        [](const unsigned char count) { return count <= 64; });
-		      std::cout << "tc_pfxt_bvss_n_vss=" << h_bvss.n_vss
-		        << ", comp_ratio=" << h_bvss.compression_ratio() << '\n';
-          std::cout << "tc_pfxt_bvss_one_mma_vss=" << one_mma_vss
-            << ", static_mma_reduction="
-            << (h_bvss.n_vss == 0
-              ? 0.0
-              : static_cast<double>(one_mma_vss)
-                / static_cast<double>(2LL * h_bvss.n_vss))
-            << std::endl;
+            const auto bvss_setup_begin = std::chrono::steady_clock::now();
+            if (std::getenv("GPUCPG_TC_PFXT_CPU_BVSS_SETUP") == nullptr) {
+              const auto gpu_stats = build_tc_pfxt_bvss_on_device(
+                N, M, d_fanout_adjp, d_fanout_adjncy, d_succs, tc_pfxt_bvss);
+              if (profile_tc_pfxt_setup_stages) {
+                cudaDeviceSynchronize();
+              }
+              if (std::getenv("GPUCPG_TC_PFXT_VALIDATE_GPU_BVSS_SETUP") != nullptr) {
+                const auto expected = tc_pfxt::build_adev_bvss_from_fanout_csr(
+                  N, _h_fanout_adjp, _h_fanout_adjncy,
+                  std::vector<int>(_h_succs.begin(), _h_succs.end()), 8);
+                const thrust::host_vector<int> real_ptrs(tc_pfxt_bvss.real_ptrs);
+                const thrust::host_vector<int> virtual_to_real(
+                  tc_pfxt_bvss.virtual_to_real);
+                const thrust::host_vector<unsigned char> slice_counts(
+                  tc_pfxt_bvss.slice_counts);
+                const thrust::host_vector<int> row_ids(tc_pfxt_bvss.row_ids);
+                const thrust::host_vector<unsigned int> masks(tc_pfxt_bvss.masks);
+                const bool matches =
+                  tc_pfxt_bvss.n_intervals == expected.n_intervals
+                  && tc_pfxt_bvss.n_vss == expected.n_vss
+                  && std::vector<int>(real_ptrs.begin(), real_ptrs.end()) == expected.real_ptrs
+                  && std::vector<int>(virtual_to_real.begin(), virtual_to_real.end())
+                    == expected.virtual_to_real
+                  && std::vector<unsigned char>(slice_counts.begin(), slice_counts.end())
+                    == expected.slice_counts
+                  && std::vector<int>(row_ids.begin(), row_ids.end()) == expected.row_ids
+                  && std::vector<std::uint32_t>(masks.begin(), masks.end()) == expected.masks;
+                std::cout << "tc_pfxt_gpu_bvss_equivalence"
+                  << " match=" << (matches ? 1 : 0)
+                  << " cpu_n_vss=" << expected.n_vss
+                  << " gpu_n_vss=" << tc_pfxt_bvss.n_vss << '\n';
+                if (!matches) {
+                  throw std::runtime_error(
+                    "GPU BVSS setup does not match CPU reference");
+                }
+              }
+              std::cout << "tc_pfxt_bvss_builder=gpu"
+                << " n_vss=" << tc_pfxt_bvss.n_vss
+                << " scalar_d2h=" << gpu_stats.scalar_d2h_transfers << '\n';
+            }
+            else {
+              const auto h_bvss = tc_pfxt::build_adev_bvss_from_fanout_csr(
+                N, _h_fanout_adjp, _h_fanout_adjncy,
+                std::vector<int>(_h_succs.begin(), _h_succs.end()), 8);
+              tc_pfxt_bvss.real_ptrs = h_bvss.real_ptrs;
+              tc_pfxt_bvss.virtual_to_real = h_bvss.virtual_to_real;
+              tc_pfxt_bvss.slice_counts = h_bvss.slice_counts;
+              tc_pfxt_bvss.row_ids = h_bvss.row_ids;
+              tc_pfxt_bvss.masks = h_bvss.masks;
+              tc_pfxt_bvss.n_intervals = h_bvss.n_intervals;
+              tc_pfxt_bvss.n_vss = h_bvss.n_vss;
+              std::cout << "tc_pfxt_bvss_builder=cpu"
+                << " n_vss=" << h_bvss.n_vss
+                << " unique_slices=" << h_bvss.unpadded_slices << '\n';
+            }
+            const double bvss_setup_ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - bvss_setup_begin).count();
+            std::cout << "tc_pfxt_static_setup_stage stage=bvss"
+              << " setup_ms=" << bvss_setup_ms << '\n';
           if (tc_pfxt_use_static_cache) {
             _tc_pfxt_static_cache->bvss_valid = true;
           }
@@ -17399,6 +17690,64 @@ void CpGen::report_paths(
               && (enable_tc_pfxt_source_local_profile
                 || enable_tc_pfxt_source_local_candidate
                 || enable_tc_pfxt_aligned_bvss)) {
+            const auto compact_setup_begin = std::chrono::steady_clock::now();
+            const bool gpu_compact_setup =
+              !_sptc_incremental_profile_pending
+              && !enable_tc_pfxt_aligned_bvss
+              && std::getenv("GPUCPG_TC_PFXT_CPU_COMPACT_SETUP") == nullptr;
+            if (gpu_compact_setup) {
+              const int compact_edges = build_tc_pfxt_compact_deviations_on_device(
+                N, d_fanout_adjp, d_fanout_adjncy, d_fanout_wgts,
+                d_succs, d_dists_cache, tc_pfxt_compact_static_devs);
+              if (std::getenv("GPUCPG_TC_PFXT_VALIDATE_GPU_COMPACT_SETUP") != nullptr) {
+                const auto expected = tc_pfxt::build_compact_static_deviation_csr(
+                  N, _h_fanout_adjp, _h_fanout_adjncy, _h_fanout_wgts,
+                  std::vector<int>(_h_succs.begin(), _h_succs.end()), h_dists);
+                const thrust::host_vector<int> offsets(
+                  tc_pfxt_compact_static_devs.offsets);
+                const thrust::host_vector<int> dsts(tc_pfxt_compact_static_devs.dsts);
+                const thrust::host_vector<float> deltas(
+                  tc_pfxt_compact_static_devs.deltas);
+                const bool offsets_match =
+                  std::vector<int>(offsets.begin(), offsets.end()) == expected.offsets;
+                const bool dsts_match =
+                  std::vector<int>(dsts.begin(), dsts.end()) == expected.dsts;
+                double max_delta_diff = 0.0;
+                std::size_t first_delta_mismatch = expected.deltas.size();
+                for (std::size_t i = 0; i < deltas.size(); ++i) {
+                  const double diff = std::fabs(
+                    static_cast<double>(deltas[i]) - expected.deltas[i]);
+                  max_delta_diff = std::max(max_delta_diff, diff);
+                  if (first_delta_mismatch == expected.deltas.size() && diff > 1e-5) {
+                    first_delta_mismatch = i;
+                  }
+                }
+                const bool deltas_match =
+                  deltas.size() == expected.deltas.size()
+                  && first_delta_mismatch == expected.deltas.size();
+                const bool matches =
+                  offsets_match && dsts_match && deltas_match;
+                std::cout << "tc_pfxt_gpu_compact_equivalence"
+                  << " match=" << (matches ? 1 : 0)
+                  << " offsets_match=" << (offsets_match ? 1 : 0)
+                  << " dsts_match=" << (dsts_match ? 1 : 0)
+                  << " deltas_match=" << (deltas_match ? 1 : 0)
+                  << " max_delta_diff=" << max_delta_diff
+                  << " first_delta_mismatch=" << first_delta_mismatch
+                  << " cpu_edges=" << expected.dsts.size()
+                  << " gpu_edges=" << compact_edges << '\n';
+                if (!matches) {
+                  throw std::runtime_error(
+                    "GPU compact deviation setup does not match CPU reference");
+                }
+              }
+              std::cout << "tc_pfxt_compact_builder=gpu"
+                << " edges=" << compact_edges << " scalar_d2h=1\n";
+              if (tc_pfxt_use_static_cache) {
+                _tc_pfxt_static_cache->compact_devs_valid = true;
+              }
+            }
+            else {
             const auto h_compact_devs = tc_pfxt::build_compact_static_deviation_csr(
               N,
               _h_fanout_adjp,
@@ -17491,6 +17840,14 @@ void CpGen::report_paths(
             if (tc_pfxt_use_static_cache) {
               _tc_pfxt_static_cache->compact_devs_valid = true;
             }
+            }
+            if (profile_tc_pfxt_setup_stages) {
+              cudaDeviceSynchronize();
+            }
+            const double compact_setup_ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - compact_setup_begin).count();
+            std::cout << "tc_pfxt_static_setup_stage stage=compact_deviations"
+              << " setup_ms=" << compact_setup_ms << '\n';
           }
           else if (enable_tc_pfxt_source_local_profile
               || enable_tc_pfxt_source_local_candidate) {

@@ -331,6 +331,12 @@ struct CompactStaticDeviationCsr {
   std::vector<float> deltas;
 };
 
+// Test-only host-copy wrapper for the production GPU constructor.
+CompactStaticDeviationCsr build_compact_static_deviation_csr_gpu_for_test(
+  int n_nodes, const std::vector<int>& row_ptr,
+  const std::vector<int>& col_idx, const std::vector<float>& weights,
+  const std::vector<int>& succs, const std::vector<int>& dists);
+
 struct CompressedLpqFamily {
   int src = -1;
   int dst = -1;

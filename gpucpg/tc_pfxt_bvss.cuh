@@ -34,6 +34,13 @@ struct HostBvss {
   }
 };
 
+// Test hook implemented by gpucpg.cu. It intentionally returns a host copy so
+// unit tests can compare the logical GPU construction against the CPU oracle;
+// production setup never uses this round trip.
+HostBvss build_adev_bvss_from_fanout_csr_gpu_for_test(
+  int n_nodes, const std::vector<int>& row_ptr,
+  const std::vector<int>& col_idx, const std::vector<int>& succs);
+
 inline int popcount32(std::uint32_t value) {
   return __builtin_popcount(value);
 }

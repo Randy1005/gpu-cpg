@@ -2,9 +2,52 @@
 #include <doctest.h>
 
 #include <gpucpg/tc_pfxt_bvss.cuh>
+#include <gpucpg/tc_pfxt_candidates.cuh>
 
 #include <algorithm>
+#include <limits>
 #include <vector>
+
+TEST_CASE("GPU BVSS setup is physically equivalent to the CPU oracle") {
+  const int n = 10;
+  const std::vector<int> row_ptr {0, 3, 4, 7, 7, 8, 8, 8, 8, 8, 8};
+  const std::vector<int> col_idx {1, 1, 9, 8, 0, 9, 9, 2};
+  const std::vector<int> succs {9, 8, 0, -1, 2, -1, -1, -1, -1, -1};
+  const auto cpu = gpucpg::tc_pfxt::build_adev_bvss_from_fanout_csr(
+    n, row_ptr, col_idx, succs, 8);
+  const auto gpu = gpucpg::tc_pfxt::build_adev_bvss_from_fanout_csr_gpu_for_test(
+    n, row_ptr, col_idx, succs);
+  CHECK(gpu.n_intervals == cpu.n_intervals);
+  CHECK(gpu.n_vss == cpu.n_vss);
+  CHECK(gpu.real_ptrs == cpu.real_ptrs);
+  CHECK(gpu.virtual_to_real == cpu.virtual_to_real);
+  CHECK(gpu.slice_counts == cpu.slice_counts);
+  CHECK(gpu.row_ids == cpu.row_ids);
+  CHECK(gpu.masks == cpu.masks);
+  CHECK(gpu.unpadded_slices == cpu.unpadded_slices);
+  CHECK(gpu.total_set_bits == cpu.total_set_bits);
+}
+
+TEST_CASE("GPU compact deviation setup is exactly equivalent to CPU") {
+  const int inf = std::numeric_limits<int>::max();
+  const int n = 5;
+  const std::vector<int> row_ptr {0, 3, 4, 5, 6, 6};
+  const std::vector<int> col_idx {1, 2, 4, 3, 4, 0};
+  const std::vector<float> weights {1.25f, 2.5f, 4.0f, 3.0f, 1.0f, 0.5f};
+  const std::vector<int> succs {1, 3, 4, 0, -1};
+  const std::vector<int> dists {10000, 20000, 30000, 40000, inf};
+  const auto cpu = gpucpg::tc_pfxt::build_compact_static_deviation_csr(
+    n, row_ptr, col_idx, weights, succs, dists);
+  const auto gpu =
+    gpucpg::tc_pfxt::build_compact_static_deviation_csr_gpu_for_test(
+      n, row_ptr, col_idx, weights, succs, dists);
+  CHECK(gpu.offsets == cpu.offsets);
+  CHECK(gpu.dsts == cpu.dsts);
+  REQUIRE(gpu.deltas.size() == cpu.deltas.size());
+  for (std::size_t i = 0; i < cpu.deltas.size(); ++i) {
+    CHECK(gpu.deltas[i] == cpu.deltas[i]);
+  }
+}
 
 TEST_CASE("tc pfxt transposed A_dev BVSS maps destination rows to deviation sources") {
   const int n = 10;
