@@ -171,6 +171,125 @@ private:
   int _capacity = 0;
 };
 
+// Candidate piles need vector-like logical sizing, but constructing every
+// PfxtNode between the old and new size is pure overhead: production kernels
+// overwrite every reserved output slot. Arena mode therefore keeps raw,
+// reusable storage and makes resize() a logical-tail update only. Legacy mode
+// delegates to device_vector so the opt-in path can be compared directly.
+class TcPfxtNodePile {
+public:
+  explicit TcPfxtNodePile(const bool arena_enabled = false)
+    : _arena_enabled(arena_enabled) {}
+
+  TcPfxtNodePile(const std::vector<PfxtNode>& initial,
+                 const bool arena_enabled,
+                 const int arena_capacity = 0)
+    : _arena_enabled(arena_enabled) {
+    if (_arena_enabled) {
+      reserve(std::max(arena_capacity, static_cast<int>(initial.size())));
+      _size = static_cast<int>(initial.size());
+      _high_water = _size;
+      if (!initial.empty()) {
+        cudaMemcpy(_arena.data(), initial.data(),
+          initial.size() * sizeof(PfxtNode), cudaMemcpyHostToDevice);
+        cudaCheckErrors("tc pfxt initialize node arena failed");
+      }
+    }
+    else {
+      _vector = initial;
+    }
+  }
+
+  void reserve(const int capacity) {
+    if (!_arena_enabled) {
+      _vector.reserve(capacity);
+      return;
+    }
+    if (capacity <= _arena.capacity()) {
+      return;
+    }
+    if (_size != 0) {
+      throw std::runtime_error(
+        "tc pfxt node arena must be fully reserved before use");
+    }
+    _arena.reserve(capacity);
+  }
+
+  void resize(const int size) {
+    if (size < 0) {
+      throw std::runtime_error("tc pfxt node pile received negative size");
+    }
+    if (!_arena_enabled) {
+      _vector.resize(static_cast<std::size_t>(size));
+      return;
+    }
+    if (size > _arena.capacity()) {
+      throw std::runtime_error(
+        "tc pfxt node arena capacity exceeded (one-shot run aborted)");
+    }
+    _size = size;
+  }
+
+  void commit_size(const int size) {
+    resize(size);
+    _high_water = std::max(_high_water, size);
+  }
+
+  void clear() {
+    if (_arena_enabled) {
+      _size = 0;
+    }
+    else {
+      _vector.clear();
+    }
+  }
+
+  void release() {
+    if (_arena_enabled) {
+      _size = 0;
+    }
+    else {
+      thrust::device_vector<PfxtNode>().swap(_vector);
+    }
+  }
+
+  void shrink_to_fit() {
+    if (!_arena_enabled) {
+      _vector.shrink_to_fit();
+    }
+  }
+
+  [[nodiscard]] PfxtNode* data() {
+    return _arena_enabled ? _arena.data()
+                          : thrust::raw_pointer_cast(_vector.data());
+  }
+  [[nodiscard]] const PfxtNode* data() const {
+    return _arena_enabled ? _arena.data()
+                          : thrust::raw_pointer_cast(_vector.data());
+  }
+  [[nodiscard]] int size() const {
+    return _arena_enabled ? _size : static_cast<int>(_vector.size());
+  }
+  [[nodiscard]] int capacity() const {
+    return _arena_enabled ? _arena.capacity()
+                          : static_cast<int>(_vector.capacity());
+  }
+  [[nodiscard]] int high_water() const { return _high_water; }
+  [[nodiscard]] bool arena_enabled() const { return _arena_enabled; }
+  [[nodiscard]] bool empty() const { return size() == 0; }
+  auto begin() { return thrust::device_pointer_cast(data()); }
+  auto end() { return begin() + size(); }
+  auto begin() const { return thrust::device_pointer_cast(data()); }
+  auto end() const { return begin() + size(); }
+
+private:
+  bool _arena_enabled = false;
+  int _size = 0;
+  int _high_water = 0;
+  TcPfxtDeviceBuffer<PfxtNode> _arena;
+  thrust::device_vector<PfxtNode> _vector;
+};
+
 void tc_pfxt_reserve_scan_temp(TcPfxtDeviceBuffer<unsigned char>& temp,
                                const std::size_t bytes) {
   if (bytes == 0) {
@@ -5301,148 +5420,6 @@ __global__ void shadow_tc_pfxt_source_local_tile_resident_lpq(
   }
 }
 
-
-__device__ __forceinline__ int tc_pfxt_source_group_begin(
-  const int* group_offsets,
-  const int src,
-  const int source_slot,
-  const bool compact_group_offsets);
-
-__global__ void accumulate_oracle_u64(
-  unsigned long long* stats, const int index, const unsigned long long value) {
-  if (threadIdx.x == 0 && blockIdx.x == 0) atomicAdd(stats + index, value);
-}
-
-__global__ void profile_tc_pfxt_mixed_subtile_oracle(
-  const int n_tiles,
-  const int4* tiles,
-  const unsigned char* tile_classes,
-  const int* active_sources,
-  const int* group_offsets,
-  const int* path_indices,
-  const int* dev_offsets,
-  const float* dev_deltas,
-  const unsigned char* dev_reachable,
-  const PfxtNode* short_pile,
-  const int window_start,
-  const float split,
-  const float final_split,
-  const bool use_final_split,
-  const bool skip_long_paths,
-  const bool compact_group_offsets,
-  unsigned long long* stats) {
-  const int tile_idx = blockIdx.x;
-  if (tile_idx >= n_tiles || tile_classes == nullptr
-      || static_cast<tc_pfxt::CandidateTileClass>(tile_classes[tile_idx])
-        != tc_pfxt::CandidateTileClass::MIXED) {
-    return;
-  }
-
-  __shared__ unsigned char classes[
-    tc_pfxt::DEFERRED_LPQ_MAX_PARENTS * tc_pfxt::DEFERRED_LPQ_MAX_DEVS];
-  __shared__ int parent_count;
-  __shared__ int dev_count;
-  __shared__ int parent_base;
-  __shared__ int dev_base;
-  if (threadIdx.x == 0) {
-    const auto tile = tiles[tile_idx];
-    const int src = active_sources[tile.x];
-    parent_count = tile.w >> 16;
-    dev_count = tile.w & 0xffff;
-    parent_base = tc_pfxt_source_group_begin(
-      group_offsets, src, tile.x, compact_group_offsets) + tile.y;
-    dev_base = dev_offsets[src] + tile.z;
-  }
-  __syncthreads();
-
-  const int products = parent_count * dev_count;
-  for (int product = threadIdx.x; product < products; product += blockDim.x) {
-    const int local_parent = product / dev_count;
-    const int local_dev = product - local_parent * dev_count;
-    auto candidate_class = tc_pfxt::CandidateClass::SKIP;
-    if (dev_reachable == nullptr || dev_reachable[dev_base + local_dev] != 0) {
-      const int active_idx = path_indices[parent_base + local_parent];
-      const int parent_idx = window_start + active_idx;
-      const float slack = short_pile[parent_idx].slack
-        + dev_deltas[dev_base + local_dev];
-      candidate_class = tc_pfxt::classify_candidate(
-        slack, split, final_split, use_final_split, skip_long_paths);
-    }
-    classes[product] = static_cast<unsigned char>(candidate_class);
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    const auto result =
-      tc_pfxt::evaluate_mixed_subtiles(classes, parent_count, dev_count);
-    const auto covered =
-      result.covered_16x8_products + result.covered_8x4_products;
-    atomicAdd(stats + 0, 1ULL);
-    atomicAdd(stats + 1, static_cast<unsigned long long>(products));
-    atomicAdd(stats + 2, result.mixed_long_products);
-    atomicAdd(stats + 3, result.covered_16x8_products);
-    atomicAdd(stats + 4, result.descriptors_16x8);
-    atomicAdd(stats + 5, result.covered_8x4_products);
-    atomicAdd(stats + 6, result.descriptors_8x4);
-    atomicAdd(stats + 7, result.residual_long_products);
-    atomicAdd(stats + 8, result.subregions_considered);
-    atomicAdd(stats + 9, result.descriptor_bytes);
-    atomicAdd(stats + 10, covered * sizeof(PfxtNode));
-    if (covered + result.residual_long_products
-        != result.mixed_long_products) {
-      atomicAdd(stats + 11, 1ULL);
-    }
-  }
-}
-
-// Shadow accounting only: production kernels and descriptor state are unchanged.
-// Phase 0 observes a current minimum scan. Phase 1 models a count plus the
-// additional count/promote passes when the split activates any descriptor.
-__global__ void profile_deferred_lpq_selective_replay(
-  const tc_pfxt::DeferredLpqTile* tiles,
-  const int n_tiles,
-  const int* promoted_counts,
-  const int phase,
-  const bool any_promoted,
-  unsigned long long* stats) {
-  const int tile_idx = blockIdx.x;
-  if (tile_idx >= n_tiles) return;
-  const auto& tile = tiles[tile_idx];
-  const int products = tile.parent_count * tile.dev_count;
-  unsigned long long local_remaining = 0;
-  for (int product = threadIdx.x; product < products; product += blockDim.x) {
-    const unsigned mask = 1u << (product & 31);
-    local_remaining +=
-      (tile.promoted[product >> 5] & mask) == 0 ? 1ULL : 0ULL;
-  }
-  using BlockReduce =
-    cub::BlockReduce<unsigned long long, TC_PFXT_PAIR_BLOCK_THREADS>;
-  __shared__ typename BlockReduce::TempStorage storage;
-  const auto remaining = BlockReduce(storage).Sum(local_remaining);
-  if (threadIdx.x != 0) return;
-
-  if (phase == 0) {
-    atomicAdd(stats + 0, remaining);
-    atomicAdd(stats + 1, 1ULL);
-    return;
-  }
-
-  const int promoted = promoted_counts == nullptr ? 0 : promoted_counts[tile_idx];
-  atomicAdd(stats + 2, 1ULL);
-  atomicAdd(stats + 3, 1ULL);
-  atomicAdd(stats + 4, remaining * (any_promoted ? 3ULL : 1ULL));
-  if (promoted > 0) {
-    atomicAdd(stats + 5, 1ULL);
-    atomicAdd(stats + 6, remaining);
-    atomicAdd(stats + 7, static_cast<unsigned long long>(promoted));
-  }
-  else {
-    atomicAdd(stats + 8, 1ULL);
-    atomicAdd(stats + 9, remaining);
-  }
-  if (tile_idx == 0) atomicAdd(stats + 10, 1ULL);
-}
-
 __global__ void cheap_shadow_tc_pfxt_source_local_tile_resident_lpq(
   const int n_tiles,
   const int4* tiles,
@@ -6678,12 +6655,6 @@ __global__ void count_tc_pfxt_source_local_tile_candidate_classes_bounded(
         skip_long_paths));
   }
   __syncthreads();
-  if (!use_ordered_endpoints && threadIdx.x == 0) {
-    tile_class_raw = static_cast<unsigned char>(
-      tc_pfxt::CandidateTileClass::MIXED);
-  }
-  __syncthreads();
-
   auto tile_class =
     static_cast<tc_pfxt::CandidateTileClass>(tile_class_raw);
   unsigned long long short_count = 0;
@@ -6752,10 +6723,7 @@ __global__ void count_tc_pfxt_source_local_tile_candidate_classes_bounded(
     atomicAdd(class_counts + 1, long_count);
     atomicAdd(class_counts + 2, skip_count);
     if (tile_classes != nullptr) {
-      tile_classes[tile_idx] = static_cast<unsigned char>(
-        tile_class == tc_pfxt::CandidateTileClass::ALL_SKIP
-          ? tc_pfxt::CandidateTileClass::ALL_SKIP
-          : tc_pfxt::CandidateTileClass::MIXED);
+      tile_classes[tile_idx] = static_cast<unsigned char>(tile_class);
     }
     if (bound_stats != nullptr) {
       const unsigned long long products =
@@ -6943,6 +6911,12 @@ __global__ void fill_tc_pfxt_source_local_tile_candidates(
   __shared__ int short_tile_base;
   __shared__ int long_tile_base;
   __shared__ unsigned char tile_class_raw;
+  __shared__ unsigned int fused_class_mask;
+  __shared__ unsigned char fused_candidate_classes[512];
+  __shared__ float fused_candidate_slacks[512];
+  using DeferredMinReduce = cub::BlockReduce<
+    float, TC_PFXT_PAIR_BLOCK_THREADS>;
+  __shared__ typename DeferredMinReduce::TempStorage deferred_min_storage;
 
   if (threadIdx.x == 0) {
     const auto tile = tiles[tile_idx];
@@ -6962,6 +6936,57 @@ __global__ void fill_tc_pfxt_source_local_tile_candidates(
   __syncthreads();
 
   const int n_products = parent_count * dev_count;
+  const bool fuse_tile_classification =
+    tile_classes == nullptr && deferred_tiles != nullptr;
+  if (fuse_tile_classification) {
+    if (threadIdx.x == 0) fused_class_mask = 0;
+    __syncthreads();
+    unsigned int thread_class_mask = 0;
+    for (int product = threadIdx.x; product < n_products;
+         product += blockDim.x) {
+      const int local_parent = product / dev_count;
+      const int local_dev = product - local_parent * dev_count;
+      const int active_idx = path_indices[parent_base + local_parent];
+      const int parent_idx = window_start + active_idx;
+      auto candidate_class = tc_pfxt::CandidateClass::SKIP;
+      float new_slack = 0.0f;
+      if (dev_reachable == nullptr
+          || dev_reachable[dev_base + local_dev] != 0) {
+        new_slack =
+          short_pile[parent_idx].slack + dev_deltas[dev_base + local_dev];
+        candidate_class = tc_pfxt::classify_candidate(
+          new_slack, split, final_split, use_final_split, skip_long_paths);
+      }
+      fused_candidate_classes[product] =
+        static_cast<unsigned char>(candidate_class);
+      fused_candidate_slacks[product] = new_slack;
+      thread_class_mask |= 1u << static_cast<unsigned int>(candidate_class);
+    }
+    const unsigned int warp_class_mask =
+      __reduce_or_sync(0xffffffffu, thread_class_mask);
+    if ((threadIdx.x & 31) == 0) {
+      atomicOr(&fused_class_mask, warp_class_mask);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      if (fused_class_mask
+          == 1u << static_cast<unsigned int>(tc_pfxt::CandidateClass::SKIP)) {
+        tile_class_raw =
+          static_cast<unsigned char>(tc_pfxt::CandidateTileClass::ALL_SKIP);
+      }
+      else if (fused_class_mask
+          == 1u << static_cast<unsigned int>(tc_pfxt::CandidateClass::SHORT)) {
+        tile_class_raw =
+          static_cast<unsigned char>(tc_pfxt::CandidateTileClass::ALL_SHORT);
+      }
+      else if (fused_class_mask
+          == 1u << static_cast<unsigned int>(tc_pfxt::CandidateClass::LONG)) {
+        tile_class_raw =
+          static_cast<unsigned char>(tc_pfxt::CandidateTileClass::ALL_LONG);
+      }
+    }
+    __syncthreads();
+  }
   const auto tile_class =
     static_cast<tc_pfxt::CandidateTileClass>(tile_class_raw);
   if (tile_class == tc_pfxt::CandidateTileClass::ALL_SKIP) {
@@ -7008,6 +7033,18 @@ __global__ void fill_tc_pfxt_source_local_tile_candidates(
         const int active_idx = path_indices[parent_base + i];
         deferred.parent_indices[i] = window_start + active_idx;
       }
+      __syncthreads();
+      float local_min = FLT_MAX;
+      for (int product = threadIdx.x; product < n_products;
+           product += blockDim.x) {
+        const int local_parent = product / dev_count;
+        const int local_dev = product - local_parent * dev_count;
+        const int parent_idx = deferred.parent_indices[local_parent];
+        local_min = fminf(local_min,
+          short_pile[parent_idx].slack + dev_deltas[dev_base + local_dev]);
+      }
+      const float minimum = DeferredMinReduce(deferred_min_storage).Reduce(
+        local_min, cuda::minimum<>{});
       return;
     }
     if (!emit_short && long_pile == nullptr) {
@@ -7074,7 +7111,13 @@ __global__ void fill_tc_pfxt_source_local_tile_candidates(
       const int active_idx = path_indices[parent_base + local_parent];
       parent_idx = window_start + active_idx;
       dst = dev_dsts[dev_base + local_dev];
-      if (dev_reachable == nullptr || dev_reachable[dev_base + local_dev] != 0) {
+      if (fuse_tile_classification) {
+        new_slack = fused_candidate_slacks[product];
+        candidate_class = static_cast<tc_pfxt::CandidateClass>(
+          fused_candidate_classes[product]);
+      }
+      else if (dev_reachable == nullptr
+               || dev_reachable[dev_base + local_dev] != 0) {
         const auto& node = short_pile[parent_idx];
         new_slack = node.slack + dev_deltas[dev_base + local_dev];
         candidate_class = tc_pfxt::classify_candidate(
@@ -7712,7 +7755,7 @@ __global__ void expand_short_pile_update_final_window(
 
 static std::uint64_t dump_short_pile_hops(
   const std::string& filename,
-  thrust::device_vector<PfxtNode>& short_pile,
+  TcPfxtNodePile& short_pile,
   int window_start,
   int window_end,
   const thrust::host_vector<int>& succs,
@@ -7748,7 +7791,7 @@ static std::uint64_t dump_short_pile_hops(
 
 static std::uint64_t dump_expand_short_pile_candidates(
   const std::string& filename,
-  thrust::device_vector<PfxtNode>& short_pile,
+  TcPfxtNodePile& short_pile,
   int window_start,
   int window_end,
   const std::vector<int>& fanout_adjp,
@@ -8672,8 +8715,6 @@ struct TcPfxtScratch {
   thrust::device_vector<unsigned long long> source_local_bound_stats;
   thrust::device_vector<unsigned long long> tile_resident_shadow_stats;
   thrust::device_vector<unsigned long long> tile_resident_cheap_shadow_stats;
-  thrust::device_vector<unsigned long long> mixed_subtile_oracle_stats;
-  thrust::device_vector<unsigned long long> selective_replay_oracle_stats;
   thrust::device_vector<unsigned char> source_local_tile_classes;
   thrust::device_vector<TcPfxtSourceLocalParentTileBound> source_local_parent_tile_bounds;
   thrust::device_vector<TcPfxtSourceLocalDevTileBound> source_local_dev_tile_bounds;
@@ -8704,57 +8745,6 @@ static double ratio_or_zero(const std::uint64_t numerator,
   return denominator == 0
     ? 0.0
     : static_cast<double>(numerator) / static_cast<double>(denominator);
-}
-
-static void report_subdescriptor_replay_oracle(
-  const TcPfxtScratch& scratch) {
-  if (scratch.mixed_subtile_oracle_stats.empty()
-      || scratch.selective_replay_oracle_stats.empty()) {
-    return;
-  }
-  // Exactly one device-to-host summary transfer per vector and query.
-  const thrust::host_vector<unsigned long long> mixed(
-    scratch.mixed_subtile_oracle_stats);
-  const thrust::host_vector<unsigned long long> replay(
-    scratch.selective_replay_oracle_stats);
-  const auto covered = mixed[3] + mixed[5];
-  const auto descriptors = mixed[4] + mixed[6];
-  const auto current_evals = replay[0] + replay[4];
-  const auto selective_evals = replay[11] + replay[6];
-  const double coverage = ratio_or_zero(covered, mixed[2]);
-  const double products_per_descriptor = ratio_or_zero(covered, descriptors);
-  const double descriptor_to_avoided_bytes = ratio_or_zero(mixed[9], mixed[10]);
-  const double replay_reduction = current_evals > selective_evals
-    ? ratio_or_zero(current_evals - selective_evals, current_evals)
-    : 0.0;
-  const double active_fraction = ratio_or_zero(replay[5], replay[5] + replay[8]);
-  std::cout << "runtime_summary_tc_subdescriptor_replay_oracle"
-    << " mixed_tiles=" << mixed[0]
-    << " mixed_products=" << mixed[1]
-    << " mixed_long_products=" << mixed[2]
-    << " covered_16x8=" << mixed[3]
-    << " descriptors_16x8=" << mixed[4]
-    << " covered_8x4=" << mixed[5]
-    << " descriptors_8x4=" << mixed[6]
-    << " residual_long=" << mixed[7]
-    << " subregions_considered=" << mixed[8]
-    << " descriptor_bytes=" << mixed[9]
-    << " avoided_node_bytes=" << mixed[10]
-    << " partition_mismatches=" << mixed[11]
-    << " coverage=" << coverage
-    << " products_per_descriptor=" << products_per_descriptor
-    << " descriptor_to_avoided_bytes=" << descriptor_to_avoided_bytes
-    << " initial_deferred_products=" << replay[11]
-    << " current_product_evals=" << current_evals
-    << " selective_product_evals=" << selective_evals
-    << " replay_reduction=" << replay_reduction
-    << " descriptor_checks=" << replay[3]
-    << " active_descriptors=" << replay[5]
-    << " inactive_descriptors=" << replay[8]
-    << " active_fraction=" << active_fraction
-    << " promoted_products=" << replay[7]
-    << " split_invocations=" << replay[10]
-    << '\n';
 }
 
 __global__ void profile_tc_pfxt_gpg_equiv_visits(
@@ -8904,7 +8894,7 @@ static void profile_tc_pfxt_source_selectivity(
   const tc_pfxt::PairMeta* d_pair_meta,
   const thrust::device_vector<int>& group_offsets,
   const thrust::device_vector<int>& path_indices,
-  const thrust::device_vector<PfxtNode>& short_pile,
+  const TcPfxtNodePile& short_pile,
   const int window_start,
   const int* d_dists_cache,
   const float split,
@@ -10465,8 +10455,8 @@ static void tc_pfxt_expand_window(
   int* d_succs,
   int* d_next_dev_vertex,
   int* d_dists_cache,
-  thrust::device_vector<PfxtNode>& short_pile,
-  thrust::device_vector<PfxtNode>& long_pile,
+  TcPfxtNodePile& short_pile,
+  TcPfxtNodePile& long_pile,
   int& short_pile_size,
   int& long_pile_size,
   int window_start,
@@ -10740,10 +10730,10 @@ static void tc_pfxt_expand_window(
   h_num_long_paths = reached_k_after_window ? 0 : h_long_count[0];
 
   short_pile_size += h_num_short_paths;
-  short_pile.resize(short_pile_size);
+  short_pile.commit_size(short_pile_size);
   if (reached_k_after_window) {
     long_pile.clear();
-    thrust::device_vector<PfxtNode>().swap(long_pile);
+    long_pile.release();
     long_pile_size = 0;
     set_kernel<<<1, 1>>>(d_tail_long, 0);
     cudaCheckErrors("tc pfxt reset long tail failed");
@@ -10752,7 +10742,7 @@ static void tc_pfxt_expand_window(
     long_pile_size += h_num_long_paths;
   }
   if (!skip_long_paths && !reached_k_after_window) {
-    long_pile.resize(long_pile_size);
+    long_pile.commit_size(long_pile_size);
   }
   light_profiler.end_candidate_resize(resize_detail_start);
 
@@ -10962,8 +10952,8 @@ static void tc_pfxt_expand_window_single_pass(
   int* d_succs,
   int* d_next_dev_vertex,
   int* d_dists_cache,
-  thrust::device_vector<PfxtNode>& short_pile,
-  thrust::device_vector<PfxtNode>& long_pile,
+  TcPfxtNodePile& short_pile,
+  TcPfxtNodePile& long_pile,
   int& short_pile_size,
   int& long_pile_size,
   int window_start,
@@ -11108,7 +11098,6 @@ static void tc_pfxt_expand_window_single_pass(
     && std::getenv("GPUCPG_TC_PFXT_TILE_RESIDENT_LPQ_SHADOW") == nullptr
     && std::getenv("GPUCPG_TC_PFXT_TILE_RESIDENT_LPQ_CHEAP_SHADOW") == nullptr
     && std::getenv("GPUCPG_TC_PFXT_TILE_FILTER_PROFILE") == nullptr
-    && std::getenv("GPUCPG_TC_PFXT_TILE_BOUND_FASTPATH") == nullptr
     && std::getenv("GPUCPG_TC_PFXT_SHORT_TILE_BOUNDS_O1") == nullptr;
   if (candidate_fallback_needed
       && (force_atomic_fallback || atomic_fallback_for_memory)) {
@@ -11283,8 +11272,6 @@ static void tc_pfxt_expand_window_single_pass(
   auto& tile_resident_shadow_stats = scratch.tile_resident_shadow_stats;
   auto& tile_resident_cheap_shadow_stats =
     scratch.tile_resident_cheap_shadow_stats;
-  auto& mixed_subtile_oracle_stats = scratch.mixed_subtile_oracle_stats;
-  auto& selective_replay_oracle_stats = scratch.selective_replay_oracle_stats;
   auto& source_local_tile_classes = scratch.source_local_tile_classes;
   auto& source_local_parent_tile_bounds = scratch.source_local_parent_tile_bounds;
   auto& source_local_dev_tile_bounds = scratch.source_local_dev_tile_bounds;
@@ -11352,17 +11339,6 @@ static void tc_pfxt_expand_window_single_pass(
     std::getenv("GPUCPG_TC_PFXT_TILE_RESIDENT_LPQ_SHADOW") != nullptr;
   const bool tile_resident_lpq_cheap_shadow_requested =
     std::getenv("GPUCPG_TC_PFXT_TILE_RESIDENT_LPQ_CHEAP_SHADOW") != nullptr;
-  const bool subdescriptor_replay_oracle_requested =
-    std::getenv("GPUCPG_TC_PFXT_SUBDESCRIPTOR_REPLAY_ORACLE") != nullptr;
-  if (subdescriptor_replay_oracle_requested
-      && mixed_subtile_oracle_stats.empty()) {
-    mixed_subtile_oracle_stats.resize(12);
-    selective_replay_oracle_stats.resize(12);
-    thrust::fill(mixed_subtile_oracle_stats.begin(),
-      mixed_subtile_oracle_stats.end(), 0ULL);
-    thrust::fill(selective_replay_oracle_stats.begin(),
-      selective_replay_oracle_stats.end(), 0ULL);
-  }
   if (use_compact_static_devs) {
     source_local_dev_offsets =
       thrust::raw_pointer_cast(compact_static_devs.offsets.data());
@@ -11776,7 +11752,7 @@ static void tc_pfxt_expand_window_single_pass(
         }
         if (substep_reaches_k && long_pile_size > 0) {
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           long_pile_size = 0;
         }
         if (substep_reaches_k && !deferred_lpq_tiles.empty()) {
@@ -12272,7 +12248,7 @@ static void tc_pfxt_expand_window_single_pass(
       }
 
       short_pile_size = h_tail_short;
-      short_pile.resize(short_pile_size);
+      short_pile.commit_size(short_pile_size);
       const int substep_short = h_tail_short - base_short;
       total_short += substep_short;
       total_pair_count += fused_stats.pairs;
@@ -13380,7 +13356,6 @@ static void tc_pfxt_expand_window_single_pass(
           && use_compact_static_devs
           && fill_longs
           && !use_tile_native_short_only
-          && !use_tile_bound_fastpath
           && source_local_parent_tile <= tc_pfxt::DEFERRED_LPQ_MAX_PARENTS
           && source_local_dev_tile <= tc_pfxt::DEFERRED_LPQ_MAX_DEVS;
 	        bool source_local_tile_bounds_ready = false;
@@ -13475,7 +13450,15 @@ static void tc_pfxt_expand_window_single_pass(
 	          }
 	          source_local_tile_bounds_ready = true;
 	        };
-	        if (h_n_tiles > 0) {
+	        const bool arena_shadow_exact_count = short_pile.arena_enabled()
+          && std::getenv("GPUCPG_TC_PFXT_CANDIDATE_ARENA_SHADOW_COUNT")
+            != nullptr;
+        const bool arena_elide_exact_count = short_pile.arena_enabled()
+          && (!use_source_local_tile_classes || use_deferred_lpq || !fill_longs)
+          && !use_tile_bound_fastpath
+          && !profile_tf32_mma_classification
+          && !profile_source_local_tile_filter;
+        if (h_n_tiles > 0) {
 	          auto count_detail_start = light_profiler.begin();
           source_local_class_counts.resize(4);
           thrust::fill(
@@ -13776,6 +13759,7 @@ static void tc_pfxt_expand_window_single_pass(
                 << '\n';
             }
           }
+          if (!arena_elide_exact_count || arena_shadow_exact_count) {
           // Tile-native short-only used to skip this count and discover its
           // required output size by overflowing and replaying the fill.  Run
           // the exact count up front so every query launch is one-shot.
@@ -13847,29 +13831,6 @@ static void tc_pfxt_expand_window_single_pass(
                   : nullptr);
             cudaCheckErrors("tc pfxt source-local count class outputs failed");
           }
-          if (subdescriptor_replay_oracle_requested
-              && use_source_local_tile_classes) {
-            profile_tc_pfxt_mixed_subtile_oracle
-              <<<h_n_tiles, TC_PFXT_PAIR_BLOCK_THREADS>>>(
-                h_n_tiles,
-                thrust::raw_pointer_cast(source_local_tiles.data()),
-                thrust::raw_pointer_cast(source_local_tile_classes.data()),
-                thrust::raw_pointer_cast(source_local_active_sources.data()),
-                active_group_offsets,
-                thrust::raw_pointer_cast(path_indices.data()),
-                source_local_dev_offsets,
-                source_local_dev_deltas,
-                source_local_dev_reachable,
-                thrust::raw_pointer_cast(short_pile.data()),
-                window_start,
-                split,
-                final_split,
-                use_final_split,
-                !fill_longs,
-                use_compact_source_groups,
-                thrust::raw_pointer_cast(mixed_subtile_oracle_stats.data()));
-            cudaCheckErrors("tc pfxt mixed subtile oracle failed");
-          }
           cudaMemcpy(
             h_source_local_class_counts_raw,
             thrust::raw_pointer_cast(source_local_class_counts.data()),
@@ -13878,6 +13839,7 @@ static void tc_pfxt_expand_window_single_pass(
           cudaCheckErrors("tc pfxt source-local copy class outputs failed");
           if (!use_tile_native_short_only) {
             record_defer_oracle_sample();
+          }
           }
           light_profiler.end_candidate_count(count_detail_start);
         }
@@ -13895,22 +13857,32 @@ static void tc_pfxt_expand_window_single_pass(
         // particular, retain the exact count for tile-native short-only fills
         // so their first launch has sufficient capacity and never needs an
         // overflow-driven replay.
-        int short_added_capacity = static_cast<int>(
+        const int counted_short_added = static_cast<int>(
           tc_pfxt::short_output_capacity(allocation_counts.short_count));
-        int long_added_capacity = fill_longs
+        const int counted_long_added = fill_longs
           ? allocation_counts.long_count
+          : 0;
+        int short_added_capacity = arena_elide_exact_count
+          ? short_pile.capacity() - base_short
+          : counted_short_added;
+        int long_added_capacity = fill_longs
+          ? (arena_elide_exact_count
+              ? long_pile.capacity() - base_long
+              : counted_long_added)
           : 0;
         // The adaptive decision has already been synchronized above. When it
         // selected DEFERRED, use the same compact allocation as fixed defer.
         const bool deferred_selected = use_deferred_lpq
           && (!adaptive_defer_requested
               || !adaptive_ordinary_this_substep);
-        const int materialized_long_capacity = static_cast<int>(
-          tc_pfxt::materialized_long_capacity(
-            static_cast<std::uint64_t>(long_added_capacity),
-            h_source_local_class_counts_raw[3],
-            deferred_selected));
-        if (!use_tile_native_short_only
+        const int materialized_long_capacity = arena_elide_exact_count
+          ? long_added_capacity
+          : static_cast<int>(tc_pfxt::materialized_long_capacity(
+              static_cast<std::uint64_t>(long_added_capacity),
+              h_source_local_class_counts_raw[3],
+              deferred_selected));
+        if (!arena_elide_exact_count
+            && !use_tile_native_short_only
             && short_added_capacity + long_added_capacity > source_local_max_slots) {
           throw std::runtime_error(
             "tc pfxt source-local exact candidate slot limit exceeded");
@@ -14170,7 +14142,7 @@ static void tc_pfxt_expand_window_single_pass(
                 short_limit,
                 fill_longs ? base_long + materialized_long_capacity : base_long,
                 thrust::raw_pointer_cast(overflow.data()),
-                use_source_local_tile_classes
+                use_source_local_tile_classes && !arena_elide_exact_count
                   ? thrust::raw_pointer_cast(source_local_tile_classes.data())
                   : nullptr,
                 use_compact_source_groups,
@@ -14217,13 +14189,6 @@ static void tc_pfxt_expand_window_single_pass(
             cudaMemcpyDeviceToHost);
           cudaCheckErrors("tc pfxt source-local copy deferred product count failed");
           scratch.deferred_lpq_remaining += h_deferred_products;
-          if (subdescriptor_replay_oracle_requested && h_deferred_products > 0) {
-            accumulate_oracle_u64<<<1, 1>>>(
-              thrust::raw_pointer_cast(selective_replay_oracle_stats.data()),
-              11,
-              h_deferred_products);
-            cudaCheckErrors("tc pfxt replay oracle initial products failed");
-          }
         }
         thrust::host_vector<int> h_overflow(overflow);
         if (h_overflow[0] != 0) {
@@ -14259,16 +14224,17 @@ static void tc_pfxt_expand_window_single_pass(
               h_source_local_class_counts_raw[0];
           }
         }
-        else if (substep_short != short_added_capacity
-            || substep_long != long_added_capacity) {
+        else if ((!arena_elide_exact_count || arena_shadow_exact_count)
+            && (substep_short != counted_short_added
+              || substep_long != counted_long_added)) {
           throw std::runtime_error(
             "tc pfxt source-local counted/fill output mismatch");
         }
         short_pile_size = h_tail_short;
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         if (fill_longs) {
           long_pile_size = h_tail_long;
-          long_pile.resize(long_pile_size);
+          long_pile.commit_size(long_pile_size);
         }
         else {
           long_pile_size = base_long;
@@ -14276,7 +14242,7 @@ static void tc_pfxt_expand_window_single_pass(
         const bool substep_reaches_k = short_pile_size >= k;
         if (substep_reaches_k && long_pile_size > 0) {
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           long_pile_size = 0;
           set_kernel<<<1, 1>>>(d_tail_long, 0);
           cudaCheckErrors("tc pfxt source-local clear long tail failed");
@@ -14399,7 +14365,7 @@ static void tc_pfxt_expand_window_single_pass(
         }
         if (substep_reaches_k && long_pile_size > 0) {
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           compressed_lpq_families.clear();
           compressed_lpq_parents.clear();
           long_pile_size = 0;
@@ -14412,7 +14378,7 @@ static void tc_pfxt_expand_window_single_pass(
         const int base_parent = static_cast<int>(compressed_lpq_parents.size());
         auto resize_detail_start = light_profiler.begin();
         short_pile_size += h_short_added;
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         if (fill_longs) {
           compressed_lpq_families.resize(base_family + n_pairs);
           compressed_lpq_parents.resize(base_parent + h_long_added);
@@ -14513,7 +14479,7 @@ static void tc_pfxt_expand_window_single_pass(
         }
         if (substep_reaches_k && long_pile_size > 0) {
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           long_pile_size = 0;
           set_kernel<<<1, 1>>>(d_tail_long, 0);
           cudaCheckErrors("tc pfxt threshold filter clear long tail failed");
@@ -14522,10 +14488,10 @@ static void tc_pfxt_expand_window_single_pass(
         const int base_short = short_pile_size;
         const int base_long = long_pile_size;
         short_pile_size += h_short_added;
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         if (fill_longs && h_long_added > 0) {
           long_pile_size += h_long_added;
-          long_pile.resize(long_pile_size);
+          long_pile.commit_size(long_pile_size);
         }
 
         fill_tc_pfxt_pair_candidates_threshold
@@ -14761,10 +14727,10 @@ static void tc_pfxt_expand_window_single_pass(
         const int substep_short = h_tail_short - base_short;
         const int substep_long = fill_longs ? h_tail_long - base_long : 0;
         short_pile_size = h_tail_short;
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         if (fill_longs) {
           long_pile_size = h_tail_long;
-          long_pile.resize(long_pile_size);
+          long_pile.commit_size(long_pile_size);
         }
         else {
           long_pile_size = base_long;
@@ -14772,7 +14738,7 @@ static void tc_pfxt_expand_window_single_pass(
         const bool substep_reaches_k = short_pile_size >= k;
         if (substep_reaches_k && long_pile_size > 0) {
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           long_pile_size = 0;
           set_kernel<<<1, 1>>>(d_tail_long, 0);
           cudaCheckErrors("tc pfxt source-major clear long tail failed");
@@ -14939,10 +14905,10 @@ static void tc_pfxt_expand_window_single_pass(
         int substep_short = h_tail_short - base_short;
         int substep_long = fill_longs ? h_tail_long - base_long : 0;
         short_pile_size = h_tail_short;
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         if (fill_longs) {
           long_pile_size = h_tail_long;
-          long_pile.resize(long_pile_size);
+          long_pile.commit_size(long_pile_size);
         }
         else {
           long_pile_size = base_long;
@@ -14950,7 +14916,7 @@ static void tc_pfxt_expand_window_single_pass(
         const bool substep_reaches_k = short_pile_size >= k;
         if (substep_reaches_k && long_pile_size > 0) {
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           long_pile_size = 0;
           set_kernel<<<1, 1>>>(d_tail_long, 0);
           cudaCheckErrors("tc pfxt single-work clear long tail failed");
@@ -15110,7 +15076,7 @@ static void tc_pfxt_expand_window_single_pass(
           gpucpg_nvtx_push("tc_clear_lpq_after_reach_k");
           auto finalize_detail_start = light_profiler.begin();
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           long_pile_size = 0;
           set_kernel<<<1, 1>>>(d_tail_long, 0);
           cudaCheckErrors("tc pfxt chunk clear long tail failed");
@@ -15123,10 +15089,10 @@ static void tc_pfxt_expand_window_single_pass(
         gpucpg_nvtx_push("tc_chunked_resize_output_piles");
         auto resize_detail_start = light_profiler.begin();
         short_pile_size += substep_short;
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         if (fill_longs && substep_long > 0) {
           long_pile_size += substep_long;
-          long_pile.resize(long_pile_size);
+          long_pile.commit_size(long_pile_size);
         }
         light_profiler.end_candidate_resize(resize_detail_start);
         gpucpg_nvtx_pop();
@@ -15304,7 +15270,7 @@ static void tc_pfxt_expand_window_single_pass(
           gpucpg_nvtx_push("tc_clear_lpq_after_reach_k");
           auto finalize_detail_start = light_profiler.begin();
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           long_pile_size = 0;
           set_kernel<<<1, 1>>>(d_tail_long, 0);
           cudaCheckErrors("tc pfxt single clear long tail failed");
@@ -15317,10 +15283,10 @@ static void tc_pfxt_expand_window_single_pass(
         gpucpg_nvtx_push("tc_single_resize_output_piles");
         auto resize_detail_start = light_profiler.begin();
         short_pile_size += h_short_added;
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         if (fill_longs && h_long_added > 0) {
           long_pile_size += h_long_added;
-          long_pile.resize(long_pile_size);
+          long_pile.commit_size(long_pile_size);
         }
         light_profiler.end_candidate_resize(resize_detail_start);
         gpucpg_nvtx_pop();
@@ -15664,7 +15630,7 @@ static void tc_pfxt_expand_window_single_pass(
   h_num_short_paths = total_short;
   if (reached_k_after_window) {
     long_pile.clear();
-    thrust::device_vector<PfxtNode>().swap(long_pile);
+    long_pile.release();
     long_pile_size = 0;
     scratch.deferred_lpq_tiles.clear();
     scratch.deferred_lpq_remaining = 0;
@@ -17341,8 +17307,6 @@ void CpGen::report_paths(
     std::getenv("GPUCPG_TC_PFXT_COMPRESSED_LPQ") != nullptr;
   const bool enable_tc_pfxt_deferred_tile_lpq =
     std::getenv("GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ") != nullptr;
-  const bool enable_subdescriptor_replay_oracle =
-    std::getenv("GPUCPG_TC_PFXT_SUBDESCRIPTOR_REPLAY_ORACLE") != nullptr;
   const bool enable_tc_pfxt_threshold_filter =
     std::getenv("GPUCPG_TC_PFXT_THRESHOLD_FILTER") != nullptr;
   const bool enable_tc_pfxt_source_major_candidate =
@@ -17411,8 +17375,47 @@ void CpGen::report_paths(
       : (enable_tc_pfxt_fusion ? 256 : 128);
 
   // prepare short and long pile
-  thrust::device_vector<PfxtNode> short_pile(_h_pfxt_nodes);
-  thrust::device_vector<PfxtNode> long_pile;
+  const bool enable_tc_pfxt_candidate_arena =
+    enable_tc_pfxt
+    && std::getenv("GPUCPG_TC_PFXT_CANDIDATE_ARENA") != nullptr;
+  int tc_pfxt_short_arena_capacity = 0;
+  int tc_pfxt_long_arena_capacity = 0;
+  if (enable_tc_pfxt_candidate_arena) {
+    std::size_t free_mem = 0;
+    std::size_t total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    cudaCheckErrors("tc pfxt candidate arena memory query failed");
+    const int requested_slots = get_env_int_or_default(
+      "GPUCPG_TC_PFXT_CANDIDATE_ARENA_SLOTS",
+      get_env_int_or_default(
+        "GPUCPG_TC_PFXT_SOURCE_LOCAL_MAX_SLOTS", 400000000));
+    const int short_percent = get_env_int_or_default(
+      "GPUCPG_TC_PFXT_CANDIDATE_ARENA_SHORT_PERCENT", 25);
+    const int memory_percent = get_env_int_or_default(
+      "GPUCPG_TC_PFXT_CANDIDATE_ARENA_MEMORY_PERCENT", 70);
+    const auto capacities = tc_pfxt::candidate_arena_capacities(
+      requested_slots,
+      static_cast<std::uint64_t>(free_mem),
+      sizeof(PfxtNode),
+      std::max(k, tc_pfxt_min_short_capacity),
+      short_percent,
+      memory_percent);
+    tc_pfxt_short_arena_capacity = capacities.short_capacity;
+    tc_pfxt_long_arena_capacity = capacities.long_capacity;
+    if (!capacities.valid) {
+      throw std::runtime_error(
+        "tc pfxt candidate arena cannot satisfy minimum one-shot capacity");
+    }
+  }
+  TcPfxtNodePile short_pile(
+    _h_pfxt_nodes,
+    enable_tc_pfxt_candidate_arena,
+    tc_pfxt_short_arena_capacity);
+  TcPfxtNodePile long_pile(enable_tc_pfxt_candidate_arena);
+  if (enable_tc_pfxt_candidate_arena) {
+    long_pile.reserve(tc_pfxt_long_arena_capacity);
+  }
+
   if (enable_tc_pfxt) {
     const auto short_capacity = std::max(k, tc_pfxt_min_short_capacity);
     short_pile.reserve(short_capacity);
@@ -17860,7 +17863,7 @@ void CpGen::report_paths(
   }
   else if (pe_method == PfxtExpMethod::SHORT_LONG) {
     // sort the initial paths by slack (use a tmp storage, don't affect the original path storage)
-    thrust::host_vector<PfxtNode> tmp_paths(short_pile);
+    thrust::host_vector<PfxtNode> tmp_paths(short_pile.begin(), short_pile.end());
     thrust::sort(tmp_paths.begin(), tmp_paths.end(), pfxt_node_comp());
 
     // determine the initial split by picking the slack at the top N percentile
@@ -17872,7 +17875,7 @@ void CpGen::report_paths(
     int h_num_long_paths = short_pile_size-h_num_short_paths;
 
     long_pile_size = h_num_long_paths;
-    long_pile.resize(long_pile_size);
+    long_pile.commit_size(long_pile_size);
     d_long_pile = thrust::raw_pointer_cast(long_pile.data());
 
     // update the tail of the long pile
@@ -17897,7 +17900,7 @@ void CpGen::report_paths(
 
     // down-size short pile
     short_pile_size = h_num_short_paths;
-    short_pile.resize(short_pile_size);
+    short_pile.commit_size(short_pile_size);
     d_short_pile = thrust::raw_pointer_cast(short_pile.data());
 
     // update the tail of the short pile
@@ -18543,19 +18546,6 @@ void CpGen::report_paths(
               thrust::raw_pointer_cast(short_pile.data()),
               thrust::raw_pointer_cast(mins.data()));
           cudaCheckErrors("deferred tile lpq min slack failed");
-          if (enable_subdescriptor_replay_oracle
-              && !tc_pfxt_scratch.selective_replay_oracle_stats.empty()) {
-            profile_deferred_lpq_selective_replay
-              <<<static_cast<int>(tiles.size()), TC_PFXT_PAIR_BLOCK_THREADS>>>(
-                thrust::raw_pointer_cast(tiles.data()),
-                static_cast<int>(tiles.size()),
-                nullptr,
-                0,
-                false,
-                thrust::raw_pointer_cast(
-                  tc_pfxt_scratch.selective_replay_oracle_stats.data()));
-            cudaCheckErrors("deferred replay oracle min scan failed");
-          }
           return *thrust::min_element(
             thrust::device, mins.begin(), mins.end());
         };
@@ -18577,22 +18567,8 @@ void CpGen::report_paths(
               split,
               thrust::raw_pointer_cast(counts.data()));
           cudaCheckErrors("deferred tile lpq count promoted failed");
-          const int promoted = thrust::reduce(
+          return thrust::reduce(
             thrust::device, counts.begin(), counts.end(), 0);
-          if (enable_subdescriptor_replay_oracle
-              && !tc_pfxt_scratch.selective_replay_oracle_stats.empty()) {
-            profile_deferred_lpq_selective_replay
-              <<<static_cast<int>(tiles.size()), TC_PFXT_PAIR_BLOCK_THREADS>>>(
-                thrust::raw_pointer_cast(tiles.data()),
-                static_cast<int>(tiles.size()),
-                thrust::raw_pointer_cast(counts.data()),
-                1,
-                promoted > 0,
-                thrust::raw_pointer_cast(
-                  tc_pfxt_scratch.selective_replay_oracle_stats.data()));
-            cudaCheckErrors("deferred replay oracle count scan failed");
-          }
-          return promoted;
         };
         auto deferred_lpq_promote_device = [&](const float split,
                                                const int base_short) {
@@ -18645,7 +18621,6 @@ void CpGen::report_paths(
 	    while (true) {
       // get current expansion window size
       curr_expansion_window_size = h_window_end-h_window_start;
-
 	      // if expansion window size > 0, we have short paths to expand
 	      if (curr_expansion_window_size > 0) {
 	        const auto curr_step = short_long_expansion_steps + 1;
@@ -18766,7 +18741,7 @@ void CpGen::report_paths(
 	          d_long_pile = long_pile.empty() ? nullptr : thrust::raw_pointer_cast(long_pile.data());
 	          if (short_pile_size >= k) {
 	            long_pile.clear();
-	            thrust::device_vector<PfxtNode>().swap(long_pile);
+	            long_pile.release();
 	            tc_pfxt_scratch.compressed_lpq_families.clear();
 	            tc_pfxt_scratch.compressed_lpq_parents.clear();
 	            long_pile_size = 0;
@@ -18859,14 +18834,14 @@ void CpGen::report_paths(
         short_pile_size += h_num_short_paths;
         std::cout << "expanding...short_pile_size=" << short_pile_size <<
           " (added " << h_num_short_paths << " short paths)\n";
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(short_pile.data());
 
         if (short_pile_size >= k) {
           // can free up the long pile if we have enough short paths
           if (long_pile_size > 0) {
             long_pile.clear();
-            thrust::device_vector<PfxtNode>().swap(long_pile);
+            long_pile.release();
             long_pile_size = 0;
           }
 
@@ -18918,7 +18893,7 @@ void CpGen::report_paths(
           long_pile_size += h_num_long_paths;
           std::cout << "expanding...long_pile_size=" << long_pile_size <<
             " (added " << h_num_long_paths << " long paths)\n";
-          long_pile.resize(long_pile_size);
+          long_pile.commit_size(long_pile_size);
           d_long_pile = thrust::raw_pointer_cast(long_pile.data());
 
           if (final_window_size > 0) {
@@ -18988,7 +18963,7 @@ void CpGen::report_paths(
           // current split/window, but drop LPQ because no later split is needed.
           if (long_pile_size > 0) {
             long_pile.clear();
-            thrust::device_vector<PfxtNode>().swap(long_pile);
+            long_pile.release();
             tc_pfxt_scratch.compressed_lpq_families.clear();
             tc_pfxt_scratch.compressed_lpq_parents.clear();
             long_pile_size = 0;
@@ -19007,7 +18982,7 @@ void CpGen::report_paths(
 
           // copy the final window to the short pile
           short_pile_size += long_pile_size;
-          short_pile.resize(short_pile_size);
+          short_pile.commit_size(short_pile_size);
           d_short_pile = thrust::raw_pointer_cast(short_pile.data());
           std::cout << "copying final window (long pile) to short pile.\n";
           thrust::copy(
@@ -19523,7 +19498,7 @@ void CpGen::report_paths(
         std::cout << "short_pile_size (after split update)="
           << short_pile_size <<
           " (added " << h_num_short_paths << " short paths)\n";
-        short_pile.resize(short_pile_size);
+        short_pile.commit_size(short_pile_size);
         d_short_pile = thrust::raw_pointer_cast(short_pile.data());
 
         if (!fixed_split_inc_amount) {
@@ -19574,7 +19549,7 @@ void CpGen::report_paths(
         if (short_pile_size >= k) {
           // can clear the long pile if we have enough short paths
           long_pile.clear();
-          thrust::device_vector<PfxtNode>().swap(long_pile);
+          long_pile.release();
           tc_pfxt_scratch.compressed_lpq_families.clear();
           tc_pfxt_scratch.compressed_lpq_parents.clear();
           tc_pfxt_scratch.deferred_lpq_tiles.clear();
@@ -19611,6 +19586,17 @@ void CpGen::report_paths(
     thrust::device_free(tail_final_window);
     thrust::device_free(tail_long);
     thrust::device_free(tail_short);
+    if (enable_tc_pfxt_candidate_arena) {
+      std::cout << "tc_pfxt_candidate_arena_summary"
+        << " short_capacity=" << short_pile.capacity()
+        << " long_capacity=" << long_pile.capacity()
+        << " short_high_water=" << short_pile.high_water()
+        << " long_high_water=" << long_pile.high_water()
+        << " reserved_bytes="
+        << static_cast<std::uint64_t>(
+          short_pile.capacity() + long_pile.capacity()) * sizeof(PfxtNode)
+        << "\n";
+    }
     total_gen_paths = short_pile_size;
     timer.stop();
     if (enable_tc_pfxt) {
@@ -19909,10 +19895,6 @@ void CpGen::report_paths(
       }
     }
     std::cout << "pfxt expansion completed in " << timer.get_elapsed_time()/1ms << " ms.\n";
-
-    if (enable_subdescriptor_replay_oracle) {
-      report_subdescriptor_replay_oracle(tc_pfxt_scratch);
-    }
 
     if (std::getenv("GPUCPG_TC_PFXT_ADAPTIVE_DEFER") != nullptr
         && !tc_pfxt_scratch.defer_oracle_telemetry_size.empty()) {

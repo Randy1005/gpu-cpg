@@ -61,10 +61,10 @@ Args parse_args(int argc, char* argv[]) {
       "missing --benchmark, --ks, or baseline selection");
   }
   if (args.current_gpg_baseline
-      && (args.mode != "all" || args.ks.size() != 1
-          || args.baseline_output.empty())) {
+      && ((args.mode != "all" && args.mode != "gpg")
+          || args.ks.size() != 1 || args.baseline_output.empty())) {
     throw std::runtime_error(
-      "--current-gpg-baseline requires --mode all, one K, and --baseline-output");
+      "--current-gpg-baseline requires --mode gpg|all, one K, and --baseline-output");
   }
   if (args.mode != "all") {
     gpucpg::tc_pfxt_inprocess::parse_run_mode(args.mode);

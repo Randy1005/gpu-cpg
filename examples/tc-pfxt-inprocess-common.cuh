@@ -177,7 +177,7 @@ inline void configure_run_mode(const RunMode mode) {
   setenv("GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS", "1", 1);
   setenv("GPUCPG_TC_PFXT_TILE_NATIVE_CANDIDATE", "1", 1);
   setenv("GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ", "1", 1);
-  setenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_MAX_SLOTS", "300000000", 1);
+  setenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_MAX_SLOTS", "400000000", 1);
   if (mode == RunMode::TILE_DEFERRED || mode == RunMode::ADAPTIVE) {
     setenv("GPUCPG_TC_PFXT_COMPACT_SOURCE_GROUPS", "1", 1);
     setenv("GPUCPG_TC_PFXT_SHORT_TILE_BOUNDS", "1", 1);
