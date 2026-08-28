@@ -8043,15 +8043,28 @@ __global__ void fill_tc_pfxt_compact_deviations(
   }
 }
 
+struct TcPfxtCompactBuildStageStats {
+  double offsets_ms = 0.0;
+  double payload_ms = 0.0;
+};
+
 static int build_tc_pfxt_compact_deviations_on_device(
   const int n_nodes, const int* d_row_ptr, const int* d_col_idx,
   const float* d_weights, const int* d_succs, const int* d_dists,
-  TcPfxtDeviceCompactStaticDeviationCsr& out) {
+  TcPfxtDeviceCompactStaticDeviationCsr& out,
+  TcPfxtCompactBuildStageStats* stage_stats = nullptr) {
+  const auto offsets_begin = stage_stats == nullptr
+    ? std::chrono::steady_clock::time_point{}
+    : std::chrono::steady_clock::now();
   out.offsets.resize(static_cast<std::size_t>(n_nodes) + 1);
   thrust::fill(out.offsets.begin(), out.offsets.end(), 0);
   if (n_nodes <= 0) {
-    out.dsts.clear();
-    out.deltas.clear();
+    out.dsts.clear(); out.deltas.clear();
+    if (stage_stats != nullptr) {
+      cudaDeviceSynchronize();
+      stage_stats->offsets_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - offsets_begin).count();
+    }
     return 0;
   }
   thrust::device_vector<int> counts(n_nodes);
@@ -8064,8 +8077,14 @@ static int build_tc_pfxt_compact_deviations_on_device(
   int total = 0;
   cudaMemcpy(&total, thrust::raw_pointer_cast(out.offsets.data()) + n_nodes,
     sizeof(total), cudaMemcpyDeviceToHost);
-  out.dsts.resize(total);
-  out.deltas.resize(total);
+  if (stage_stats != nullptr) {
+    stage_stats->offsets_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - offsets_begin).count();
+  }
+  const auto payload_begin = stage_stats == nullptr
+    ? std::chrono::steady_clock::time_point{}
+    : std::chrono::steady_clock::now();
+  out.dsts.resize(total); out.deltas.resize(total);
   if (total > 0) {
     fill_tc_pfxt_compact_deviations
       <<<std::max(1, ROUNDUPBLOCKS(n_nodes, 256)), 256>>>(
@@ -8074,6 +8093,11 @@ static int build_tc_pfxt_compact_deviations_on_device(
         thrust::raw_pointer_cast(out.dsts.data()),
         thrust::raw_pointer_cast(out.deltas.data()));
     cudaCheckErrors("tc pfxt GPU compact deviation fill failed");
+  }
+  if (stage_stats != nullptr) {
+    cudaDeviceSynchronize();
+    stage_stats->payload_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - payload_begin).count();
   }
   return total;
 }
@@ -17994,9 +18018,17 @@ void CpGen::report_paths(
               && !enable_tc_pfxt_aligned_bvss
               && std::getenv("GPUCPG_TC_PFXT_CPU_COMPACT_SETUP") == nullptr;
             if (gpu_compact_setup) {
+              TcPfxtCompactBuildStageStats compact_stage_stats;
               const int compact_edges = build_tc_pfxt_compact_deviations_on_device(
                 N, d_fanout_adjp, d_fanout_adjncy, d_fanout_wgts,
-                d_succs, d_dists_cache, tc_pfxt_compact_static_devs);
+                d_succs, d_dists_cache, tc_pfxt_compact_static_devs,
+                profile_tc_pfxt_setup_stages ? &compact_stage_stats : nullptr);
+              if (profile_tc_pfxt_setup_stages) {
+                std::cout << "tc_pfxt_static_setup_stage stage=compact_offsets"
+                  << " setup_ms=" << compact_stage_stats.offsets_ms << '\n';
+                std::cout << "tc_pfxt_static_setup_stage stage=compact_payload"
+                  << " setup_ms=" << compact_stage_stats.payload_ms << '\n';
+              }
               if (std::getenv("GPUCPG_TC_PFXT_VALIDATE_GPU_COMPACT_SETUP") != nullptr) {
                 const auto expected = tc_pfxt::build_compact_static_deviation_csr(
                   N, _h_fanout_adjp, _h_fanout_adjncy, _h_fanout_wgts,
@@ -18175,6 +18207,7 @@ void CpGen::report_paths(
             && !tc_pfxt_compact_static_devs.empty()
             && !(tc_pfxt_use_static_cache
               && _tc_pfxt_static_cache->ordinary_chain_bound_valid)) {
+          const auto chain_bounds_begin = std::chrono::steady_clock::now();
           tc_pfxt_chain_product_upper_bounds.resize(N);
           compute_tc_pfxt_chain_product_upper_bounds
             <<<std::max(1, ROUNDUPBLOCKS(N, 256)), 256>>>(
@@ -18194,6 +18227,14 @@ void CpGen::report_paths(
             _tc_pfxt_static_cache->max_chain_products =
               tc_pfxt_max_chain_products;
             _tc_pfxt_static_cache->ordinary_chain_bound_valid = true;
+          }
+          if (profile_tc_pfxt_setup_stages) {
+            cudaDeviceSynchronize();
+            const double chain_bounds_ms =
+              std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - chain_bounds_begin).count();
+            std::cout << "tc_pfxt_static_setup_stage stage=chain_bounds"
+              << " setup_ms=" << chain_bounds_ms << '\n';
           }
         }
         const int tc_pfxt_ordinary_low = get_env_int_or_default(

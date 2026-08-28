@@ -1,0 +1,15 @@
+case,exactness_pass,switching_identical,no_bvss_setup,no_bvss_mma
+M6,1,1,1,1
+cage15,1,1,1,1
+des_perf_d20,1,1,1,1
+des_perf_d40,1,1,1,1
+leon2_d10,1,1,1,1
+leon2_d30,1,1,1,1
+leon3mp_d20,1,1,1,1
+leon3mp_d50,1,1,1,1
+netcard_base,1,1,1,1
+netcard_d20,1,1,1,1
+netcard_d50,1,1,1,1
+nlpkkt120,1,1,1,1
+vga_lcd_d20,1,1,1,1
+vga_lcd_d50,1,1,1,1
