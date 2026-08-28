@@ -82,6 +82,76 @@ The table deliberately samples sparse originals, low and high circuit
 densities, multiple circuit families, and the three naturally dense
 non-circuit graphs. The progression is not limited to netcard d50.
 
+All adaptive work executed during PFXT is included in these runtimes. That
+includes GPU statistics collection, the mode decision, probation/hysteresis,
+descriptor bookkeeping, and arena management. Graph loading, propagation,
+and construction of reusable graph-static metadata are outside
+`total_pfxt_ms` and therefore outside the progression table.
+
+## Where adaptive time goes
+
+The following diagnostic run enables the lightweight GPU event profiler on
+four large or high-density cases. `Headline PFXT` is the uninstrumented
+five-trial median used in the progression result. The other PFXT columns come
+from one separately validated profiled run, so they expose the breakdown but
+are not substituted into the headline result.
+
+| Case | Headline PFXT | Cold static setup | Adaptive stats/decision | Remaining PFXT | Profiled PFXT | Decision share |
+|---|---:|---:|---:|---:|---:|---:|
+| netcard d50 | 85.266 ms | 86.659 ms | 0.172 ms | 96.295 ms | 96.466 ms | 0.18% |
+| leon2 d30 | 658.022 ms | 53.538 ms | 20.752 ms | 643.698 ms | 664.450 ms | 3.12% |
+| leon2 d50 | 90.609 ms | 92.612 ms | 0.453 ms | 102.444 ms | 102.897 ms | 0.44% |
+| leon3mp d50 | 61.484 ms | 75.646 ms | 0.302 ms | 70.568 ms | 70.870 ms | 0.43% |
+
+`Cold static setup` is a one-time preparation cost whose outputs remain on the
+GPU. It is not a component of `Profiled PFXT`; add the two only when discussing
+cold first-query latency, not the PFXT-only headline. A second query on an
+unchanged graph reports a static-cache hit and zero setup time. The setup is
+small relative to the 658 ms `leon2_d30` query, but its 75–93 ms is material
+for the faster cases and therefore relies on reuse in an iterative workload.
+In plain language, setup prepares three reusable lookup structures:
+
+1. It packs graph reachability/non-tree-edge relationships into BVSS masks for
+   the shared pipeline.
+2. It builds a compact source-major list of each vertex's usable deviations,
+   storing only destination and added slack instead of repeatedly walking the
+   original graph.
+3. It computes per-chain product upper bounds used for cheap ordinary-path
+   safety checks.
+
+BVSS construction is the largest cold-setup component (42–74 ms in this
+sample), even though the source-local headline path does not execute BVSS MMA.
+Avoiding that unused preparation when no BVSS fallback is needed is a remaining
+cold-start optimization opportunity; it does not affect the PFXT-only table.
+
+The adaptive decision itself remains inside PFXT. For each evaluated substep,
+GPU kernels count active parents and their possible parent/deviation products.
+The policy uses products per active path as its primary intensity signal. It
+selects ordinary processing below 60, deferred processing above 70, and in the
+60–70 transition band samples candidate classes and selects deferral when at
+least 50% of sampled weight would be skipped. State and statistics stay on the
+GPU; the host copies telemetry only after the run for this report.
+
+### Example decision trace: leon2 d30
+
+`leon2_d30` is useful because its K=1M run executed 111 adaptive substeps: 51
+ordinary, 60 deferred, and 26 switches. The rows below are consecutive
+substeps from one late outer-step window. Products per path is calculated from
+the exact GPU counters shown in the trace.
+
+| Outer step | Chain substep | Active paths | Products | Products/path | Selected mode | Why |
+|---:|---:|---:|---:|---:|---|---|
+| 17 | 1 | 17,429,841 | 5,825,055,935 | 334.20 | deferred (switch) | Far above the 70 high gate; avoiding eager long/skip materialization is worthwhile. |
+| 17 | 2 | 17,429,841 | 6,214,046,343 | 356.52 | deferred | Intensity remains far above 70. |
+| 17 | 5 | 17,423,565 | 3,217,319,412 | 184.65 | deferred | Still well above the high gate. |
+| 17 | 6 | 17,398,188 | 1,182,574,370 | 67.97 | deferred | In the 60–70 transition band; sampled skip evidence kept deferral selected. |
+| 17 | 7 | 17,079,552 | 712,298,264 | 41.70 | ordinary (switch) | Below the 60 low gate; descriptor deferral would add overhead without enough products to avoid. |
+
+This illustrates why the policy is recalibrated during traversal rather than
+chosen once from graph density. The same graph moves from hundreds of products
+per active path to fewer than 60 as the chain drains, and the implementation
+switches back to the simpler ordinary path at that point.
+
 ## Reproduction tutorial
 
 ### 1. Configure the RTX 5090 build
