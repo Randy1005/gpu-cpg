@@ -8146,7 +8146,6 @@ struct CpGen::TcPfxtStaticCache {
   int m = 0;
   int graph_diameter = 0;
   bool sfxt_valid = false;
-  bool bvss_valid = false;
   bool aligned_bvss_valid = false;
   bool compact_devs_valid = false;
   bool ordinary_chain_bound_valid = false;
@@ -8168,7 +8167,6 @@ struct CpGen::TcPfxtStaticCache {
   thrust::device_vector<int> fanout_to_fanin;
   bool graph_weights_valid = false;
 
-  TcPfxtDeviceBvss bvss;
   TcPfxtDeviceBvss aligned_bvss;
   TcPfxtDeviceCompactStaticDeviationCsr compact_devs;
   thrust::device_vector<unsigned long long> chain_product_upper_bounds;
@@ -8181,17 +8179,17 @@ struct CpGen::TcPfxtStaticCache {
     return enabled && sfxt_valid && matches_graph(candidate_n, candidate_m);
   }
 
-  bool can_reuse_tc_static(const int candidate_n,
-                           const int candidate_m,
-                           const bool need_compact_devs) const {
-    return can_reuse_sfxt(candidate_n, candidate_m)
-      && bvss_valid
-      && (!need_compact_devs || compact_devs_valid);
+  bool can_reuse_source_local_static(const int candidate_n,
+                                     const int candidate_m,
+                                     const bool need_compact_devs) const {
+    return tc_pfxt::source_local_static_cache_ready(
+      can_reuse_sfxt(candidate_n, candidate_m),
+      compact_devs_valid,
+      need_compact_devs);
   }
 
   void clear_static_payload() {
     sfxt_valid = false;
-    bvss_valid = false;
     aligned_bvss_valid = false;
     compact_devs_valid = false;
     ordinary_chain_bound_valid = false;
@@ -8213,13 +8211,6 @@ struct CpGen::TcPfxtStaticCache {
     thrust::device_vector<float>().swap(fanout_wgts);
     thrust::device_vector<int>().swap(fanout_to_fanin);
     graph_weights_valid = false;
-    thrust::device_vector<int>().swap(bvss.real_ptrs);
-    thrust::device_vector<int>().swap(bvss.virtual_to_real);
-    thrust::device_vector<unsigned char>().swap(bvss.slice_counts);
-    thrust::device_vector<int>().swap(bvss.row_ids);
-    thrust::device_vector<unsigned int>().swap(bvss.masks);
-    bvss.n_intervals = 0;
-    bvss.n_vss = 0;
     thrust::device_vector<int>().swap(aligned_bvss.real_ptrs);
     thrust::device_vector<int>().swap(aligned_bvss.virtual_to_real);
     thrust::device_vector<unsigned char>().swap(aligned_bvss.slice_counts);
@@ -8237,7 +8228,7 @@ bool CpGen::_has_incremental_cache_candidate() const {
   const auto* cache = _tc_pfxt_static_cache.get();
   return std::getenv("GPUCPG_SPTC_INCREMENTAL_PROFILE") == nullptr
     && cache != nullptr
-    && cache->can_reuse_tc_static(
+    && cache->can_reuse_source_local_static(
       static_cast<int>(num_verts()), static_cast<int>(num_edges()), true)
     && cache->graph_weights_valid;
 }
@@ -17958,10 +17949,9 @@ void CpGen::report_paths(
           && _tc_pfxt_static_cache
           && _tc_pfxt_static_cache->enabled
           && enable_tc_pfxt;
-        auto& tc_pfxt_bvss =
-          tc_pfxt_use_static_cache
-            ? _tc_pfxt_static_cache->bvss
-            : local_tc_pfxt_bvss;
+        // The production source-local path does not consume BVSS. Keep an
+        // empty compatibility object only for the legacy call interface.
+        auto& tc_pfxt_bvss = local_tc_pfxt_bvss;
         auto& tc_pfxt_aligned_bvss =
           tc_pfxt_use_static_cache
             ? _tc_pfxt_static_cache->aligned_bvss
@@ -17986,7 +17976,7 @@ void CpGen::report_paths(
             tc_pfxt_use_static_cache
             && (!enable_tc_pfxt_aligned_bvss
               || _tc_pfxt_static_cache->aligned_bvss_valid)
-            && _tc_pfxt_static_cache->can_reuse_tc_static(
+            && _tc_pfxt_static_cache->can_reuse_source_local_static(
               N,
               M,
               tc_pfxt_need_compact_static_devs);
@@ -17994,69 +17984,6 @@ void CpGen::report_paths(
             std::cout << "tc_pfxt_static_cache=hit tc_static=1\n";
           }
           else {
-            const auto bvss_setup_begin = std::chrono::steady_clock::now();
-            if (std::getenv("GPUCPG_TC_PFXT_CPU_BVSS_SETUP") == nullptr) {
-              const auto gpu_stats = build_tc_pfxt_bvss_on_device(
-                N, M, d_fanout_adjp, d_fanout_adjncy, d_succs, tc_pfxt_bvss);
-              if (profile_tc_pfxt_setup_stages) {
-                cudaDeviceSynchronize();
-              }
-              if (std::getenv("GPUCPG_TC_PFXT_VALIDATE_GPU_BVSS_SETUP") != nullptr) {
-                const auto expected = tc_pfxt::build_adev_bvss_from_fanout_csr(
-                  N, _h_fanout_adjp, _h_fanout_adjncy,
-                  std::vector<int>(_h_succs.begin(), _h_succs.end()), 8);
-                const thrust::host_vector<int> real_ptrs(tc_pfxt_bvss.real_ptrs);
-                const thrust::host_vector<int> virtual_to_real(
-                  tc_pfxt_bvss.virtual_to_real);
-                const thrust::host_vector<unsigned char> slice_counts(
-                  tc_pfxt_bvss.slice_counts);
-                const thrust::host_vector<int> row_ids(tc_pfxt_bvss.row_ids);
-                const thrust::host_vector<unsigned int> masks(tc_pfxt_bvss.masks);
-                const bool matches =
-                  tc_pfxt_bvss.n_intervals == expected.n_intervals
-                  && tc_pfxt_bvss.n_vss == expected.n_vss
-                  && std::vector<int>(real_ptrs.begin(), real_ptrs.end()) == expected.real_ptrs
-                  && std::vector<int>(virtual_to_real.begin(), virtual_to_real.end())
-                    == expected.virtual_to_real
-                  && std::vector<unsigned char>(slice_counts.begin(), slice_counts.end())
-                    == expected.slice_counts
-                  && std::vector<int>(row_ids.begin(), row_ids.end()) == expected.row_ids
-                  && std::vector<std::uint32_t>(masks.begin(), masks.end()) == expected.masks;
-                std::cout << "tc_pfxt_gpu_bvss_equivalence"
-                  << " match=" << (matches ? 1 : 0)
-                  << " cpu_n_vss=" << expected.n_vss
-                  << " gpu_n_vss=" << tc_pfxt_bvss.n_vss << '\n';
-                if (!matches) {
-                  throw std::runtime_error(
-                    "GPU BVSS setup does not match CPU reference");
-                }
-              }
-              std::cout << "tc_pfxt_bvss_builder=gpu"
-                << " n_vss=" << tc_pfxt_bvss.n_vss
-                << " scalar_d2h=" << gpu_stats.scalar_d2h_transfers << '\n';
-            }
-            else {
-              const auto h_bvss = tc_pfxt::build_adev_bvss_from_fanout_csr(
-                N, _h_fanout_adjp, _h_fanout_adjncy,
-                std::vector<int>(_h_succs.begin(), _h_succs.end()), 8);
-              tc_pfxt_bvss.real_ptrs = h_bvss.real_ptrs;
-              tc_pfxt_bvss.virtual_to_real = h_bvss.virtual_to_real;
-              tc_pfxt_bvss.slice_counts = h_bvss.slice_counts;
-              tc_pfxt_bvss.row_ids = h_bvss.row_ids;
-              tc_pfxt_bvss.masks = h_bvss.masks;
-              tc_pfxt_bvss.n_intervals = h_bvss.n_intervals;
-              tc_pfxt_bvss.n_vss = h_bvss.n_vss;
-              std::cout << "tc_pfxt_bvss_builder=cpu"
-                << " n_vss=" << h_bvss.n_vss
-                << " unique_slices=" << h_bvss.unpadded_slices << '\n';
-            }
-            const double bvss_setup_ms = std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - bvss_setup_begin).count();
-            std::cout << "tc_pfxt_static_setup_stage stage=bvss"
-              << " setup_ms=" << bvss_setup_ms << '\n';
-          if (tc_pfxt_use_static_cache) {
-            _tc_pfxt_static_cache->bvss_valid = true;
-          }
           if ((enable_tc_pfxt_compact_static_devs || enable_tc_pfxt_aligned_bvss)
               && (enable_tc_pfxt_source_local_profile
                 || enable_tc_pfxt_source_local_candidate

@@ -53,6 +53,14 @@ __global__ void exercise_telemetry(
   }
 }
 
+TEST_CASE("source-local static cache readiness does not depend on BVSS") {
+  using gpucpg::tc_pfxt::source_local_static_cache_ready;
+  CHECK(source_local_static_cache_ready(true, false, false));
+  CHECK_FALSE(source_local_static_cache_ready(true, false, true));
+  CHECK(source_local_static_cache_ready(true, true, true));
+  CHECK_FALSE(source_local_static_cache_ready(false, true, true));
+}
+
 TEST_CASE("adaptive policy selects ordinary below its intensity gate") {
   CHECK(gpucpg::tc_pfxt::choose_adaptive_mode(
           {100, 5999, 100, 100}, {60, 70, 50})

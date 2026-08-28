@@ -46,6 +46,15 @@ struct AdaptivePolicy {
   int min_skip_percent = 50;
 };
 
+// Source-local adaptive traversal consumes compact deviations, not BVSS.
+// Keep cache readiness tied only to the payloads selected by that traversal.
+__host__ __device__ inline bool source_local_static_cache_ready(
+  const bool sfxt_ready,
+  const bool compact_devs_ready,
+  const bool need_compact_devs) {
+  return sfxt_ready && (!need_compact_devs || compact_devs_ready);
+}
+
 struct AdaptiveOracleContribution {
   std::uint64_t active_paths = 0;
   std::uint64_t parent_dev_products = 0;
