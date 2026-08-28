@@ -1,0 +1,15 @@
+case,mode_passes,inprocess_exactness_pass
+M6,4,1
+cage15,4,1
+des_perf_d20,4,1
+des_perf_d40,4,1
+leon2_d10,4,1
+leon2_d30,4,1
+leon3mp_d20,4,1
+leon3mp_d50,4,1
+netcard_base,4,1
+netcard_d20,4,1
+netcard_d50,4,1
+nlpkkt120,4,1
+vga_lcd_d20,4,1
+vga_lcd_d50,4,1

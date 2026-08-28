@@ -56,31 +56,41 @@ After charging the current optimized setup, its cold-query geometric mean is
 
 ## Diverse progression table
 
-The table uses a dependency-aware cold-query convention. Fixed defer requires no
-BVSS/compact-deviation setup, so its runtime is PFXT alone. Adaptive and
-arena-adaptive require those structures, so both are charged the same current
-optimized GPU setup time. Each speedup is the corresponding campaign's GPG
-PFXT runtime divided by the checkpoint runtime shown. This is a normalized
-current-setup comparison, not a claim that the optimized setup existed at the
-earlier checkpoints.
+The table uses the requested checkpoint convention: GPG and fixed defer report
+their measured PFXT time, while adaptive is charged its current optimized
+one-time static setup plus its measured PFXT time. Each parenthesized speedup is
+the same row's GPG PFXT time divided by the displayed checkpoint time. Graph
+loading and propagation are excluded throughout.
 
-| Case | Fixed time | Fixed speedup | Adaptive cold time | Adaptive cold speedup | Arena cold time | Arena cold speedup |
-|---|---:|---:|---:|---:|---:|---:|
-| netcard base | 24.488 ms | 0.2947x | 9.871 ms | 0.7311x | 8.818 ms | 0.8203x |
-| netcard d20 | 160.081 ms | 0.5488x | 98.957 ms | 0.8878x | 90.095 ms | 0.9737x |
-| netcard d50 | 115.259 ms | 3.2433x | 190.541 ms | 1.9619x | 171.997 ms | 2.1688x |
-| leon2 d10 | 87.034 ms | 0.6287x | 59.669 ms | 0.9170x | 51.092 ms | 1.0716x |
-| leon2 d30 | 1,938.810 ms | 2.4731x | 1,121.694 ms | 4.2747x | 711.516 ms | 6.7221x |
-| leon3mp d20 | 185.879 ms | 0.4895x | 89.751 ms | 1.0138x | 83.637 ms | 1.0873x |
-| leon3mp d50 | 78.034 ms | 1.9432x | 147.227 ms | 1.0300x | 137.136 ms | 1.1037x |
-| vga_lcd d20 | 138.305 ms | 0.7886x | 78.016 ms | 1.3981x | 61.056 ms | 1.7870x |
-| vga_lcd d50 | 89.014 ms | 1.4070x | 69.916 ms | 1.7914x | 53.415 ms | 2.3489x |
-| des_perf d20 | 85.093 ms | 0.3789x | 25.214 ms | 1.2788x | 20.926 ms | 1.5075x |
-| des_perf d40 | 74.486 ms | 1.2975x | 79.202 ms | 1.2202x | 68.134 ms | 1.4004x |
-| cage15 | 110.878 ms | 0.2048x | 37.215 ms | 0.6101x | 32.057 ms | 0.7010x |
-| M6 | 75.053 ms | 0.8999x | 23.222 ms | 2.9085x | 18.905 ms | 3.5632x |
-| nlpkkt120 | 10.900 ms | 0.5452x | 24.062 ms | 0.2470x | 21.793 ms | 0.2737x |
-| **29-case geometric mean** | — | **0.8429x** | — | **1.1519x** | — | **1.3683x** |
+There is an implementation nuance behind that convention. The current shared
+`gpg-deferred` executable constructs BVSS and compact-deviation metadata before
+its measured PFXT region, even though the fixed-defer number below does not
+charge that construction. It is therefore a historical fixed-defer PFXT
+checkpoint, not the end-to-end cold latency of the current shared executable.
+Adaptive cold time does charge the setup because adaptive's production path
+depends on those reusable structures. A strict current-executable cold-latency
+comparison would charge setup to fixed defer as well.
+
+Each PFXT entry is the median of three measured trials after one warmup. All 14
+cases passed exact K=1M cost validation in all four modes before timing, and no
+capacity retry, overflow, or fallback was accepted.
+
+| Case | GPG time | Fixed defer time (speedup) | Adaptive cold time (speedup) |
+|---|---:|---:|---:|
+| netcard base | 7.340 ms | 24.352 ms (0.3014x) | 9.886 ms (0.7425x) |
+| netcard d20 | 88.299 ms | 159.746 ms (0.5527x) | 99.320 ms (0.8890x) |
+| netcard d50 | 373.770 ms | 116.097 ms (3.2195x) | 191.625 ms (1.9505x) |
+| leon2 d10 | 54.477 ms | 87.203 ms (0.6247x) | 59.936 ms (0.9089x) |
+| leon2 d30 | 4,761.130 ms | 1,965.030 ms (2.4229x) | 1,125.697 ms (4.2295x) |
+| leon3mp d20 | 90.853 ms | 187.866 ms (0.4836x) | 90.585 ms (1.0030x) |
+| leon3mp d50 | 152.325 ms | 79.174 ms (1.9239x) | 149.048 ms (1.0220x) |
+| vga_lcd d20 | 109.109 ms | 140.087 ms (0.7789x) | 78.437 ms (1.3910x) |
+| vga_lcd d50 | 125.395 ms | 87.419 ms (1.4344x) | 69.891 ms (1.7942x) |
+| des_perf d20 | 31.756 ms | 82.640 ms (0.3843x) | 25.120 ms (1.2642x) |
+| des_perf d40 | 95.642 ms | 73.131 ms (1.3078x) | 77.508 ms (1.2340x) |
+| cage15 | 22.537 ms | 111.190 ms (0.2027x) | 36.965 ms (0.6097x) |
+| M6 | 68.546 ms | 75.354 ms (0.9097x) | 23.304 ms (2.9414x) |
+| nlpkkt120 | 5.950 ms | 11.457 ms (0.5193x) | 23.742 ms (0.2506x) |
 
 The table deliberately samples sparse originals, low and high circuit
 densities, multiple circuit families, and the three naturally dense
@@ -88,9 +98,9 @@ non-circuit graphs. The progression is not limited to netcard d50.
 
 All adaptive work executed during PFXT is included in these runtimes. That
 includes GPU statistics collection, the mode decision, probation/hysteresis,
-descriptor bookkeeping, and arena management. The adaptive and arena-adaptive
-cold times additionally include optimized static setup; fixed defer does not
-need it. Graph loading and propagation remain outside every table entry.
+and descriptor bookkeeping. Adaptive cold time additionally includes the
+optimized static setup. Graph loading and propagation remain outside every
+table entry.
 
 ## Where adaptive time goes
 
@@ -114,8 +124,9 @@ in the progression table above.
 on an unchanged graph reports a static-cache hit, making this column zero. In
 the table, `PFXT` means the rest of the profiled query after separately timed
 decision kernels are subtracted. For netcard d50, the comparable profiled
-PFXT total is 115.682 ms versus the 103.810 ms unprofiled adaptive PFXT used in
-the progression calculation: an 11.4% diagnostic-run increase, not the apparent
+PFXT total is 115.682 ms versus the 104.332 ms fresh unprofiled adaptive
+PFXT used in
+the progression calculation: a 10.9% diagnostic-run increase, not the apparent
 twofold gap obtained by incorrectly adding cold setup to only one side. In plain language, setup prepares three reusable lookup structures:
 
 1. It packs graph reachability/non-tree-edge relationships into BVSS masks for
@@ -129,15 +140,22 @@ twofold gap obtained by incorrectly adding cold setup to only one side. In plain
 BVSS construction is the largest cold-setup component (42–74 ms in this
 sample), even though the source-local headline path does not execute BVSS MMA.
 Avoiding that unused preparation when no BVSS fallback is needed is a remaining
-cold-start optimization opportunity; it does not affect the PFXT-only table.
+cold-start optimization opportunity; it does not affect the breakdown's\nPFXT column.
 
-The adaptive decision itself remains inside PFXT. For each evaluated substep,
-GPU kernels count active parents and their possible parent/deviation products.
-The policy uses products per active path as its primary intensity signal. It
-selects ordinary processing below 60, deferred processing above 70, and in the
-60–70 transition band samples candidate classes and selects deferral when at
-least 50% of sampled weight would be skipped. State and statistics stay on the
-GPU; the host copies telemetry only after the run for this report.
+The adaptive decision itself remains inside PFXT. For each evaluated chain
+substep, GPU kernels count active parent paths and their possible
+parent/deviation products. The policy uses products per active path as its
+primary intensity signal. It selects ordinary processing below 60, deferred
+processing above 70, and in the inclusive 60–70 transition band samples
+candidate classes and selects deferral when at least 50% of sampled weight
+would be skipped. Here, `70` means 70 possible parent/deviation products per
+active path; it is not a graph-wide deviation count. State and statistics stay
+on the GPU; the host copies telemetry only after the run for this report.
+
+The 60/70/50 gates are fixed defaults used for every graph in this campaign.
+They were calibrated empirically on the benchmark suite; they are not derived
+from each graph and should not be read as universal constants. Replacing them
+with a graph-derived or online cost model remains the principled next step.
 
 ### Example decision trace: leon2 d30
 
@@ -145,6 +163,17 @@ GPU; the host copies telemetry only after the run for this report.
 ordinary, 60 deferred, and 26 switches. The rows below are consecutive
 substeps from one late outer-step window. Products per path is calculated from
 the exact GPU counters shown in the trace.
+
+An **outer step** is one PFXT expansion-window iteration: it processes the
+current short-path window and then advances that window (or promotes deferred
+long paths when the window drains). A **chain substep** is one hop of the
+active cursors along their SFXT successor chains inside that outer step.
+**Active paths** counts parent path records in the current window whose chain
+cursor is still valid at that hop; it is not a count of unique graph vertices.
+**Products** is the sum of possible parent/deviation combinations associated
+with those active parents and spur sources. Each product is classified as
+short, long, or skip, and deferred processing avoids eagerly materializing the
+long and skip classes.
 
 | Outer step | Chain substep | Active paths | Products | Products/path | Selected mode | Why |
 |---:|---:|---:|---:|---:|---|---|
