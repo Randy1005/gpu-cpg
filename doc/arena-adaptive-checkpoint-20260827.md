@@ -75,6 +75,12 @@ Each PFXT entry is the median of three measured trials after one warmup. All 14
 cases passed exact K=1M cost validation in all four modes before timing, and no
 capacity retry, overflow, or fallback was accepted.
 
+The optimized static setup did not materially change adaptive PFXT execution.
+Against the prior uninstrumented adaptive campaign, the fresh adaptive PFXT
+medians have a 0.50% median absolute change and a 2.47% maximum absolute change
+across these 14 cases. That is run-to-run variation, while the setup reduction
+appears only in the separately charged cold-setup component.
+
 | Case | GPG time | Fixed defer time (speedup) | Adaptive cold time (speedup) |
 |---|---:|---:|---:|
 | netcard base | 7.340 ms | 24.352 ms (0.3014x) | 9.886 ms (0.7425x) |
