@@ -53,30 +53,31 @@ versus GPG.
 
 ## Diverse progression table
 
-All entries are `GPG runtime / checkpoint runtime`; values above 1 are wins.
-The first two columns come from the final three-trial transparent run. The
-arena column comes from the later standalone five-trial median campaign. Both
-used CUDA 13.1, `sm_120`, RTX 5090, K=1M, one warmup, GPU-idle process gates,
-and current GPG goldens. Compare trends across checkpoints; minor differences
+All speedup entries are `GPG runtime / checkpoint runtime`; values above 1
+are wins. The final column is the uninstrumented arena-adaptive PFXT runtime.
+The first two speedup columns come from the final three-trial transparent run.
+The arena speedup and runtime come from the later standalone five-trial median
+campaign. Both campaigns used CUDA 13.1, `sm_120`, RTX 5090, K=1M, one
+warmup, GPU-idle process gates, and current GPG goldens. Compare trends across checkpoints; minor differences
 also include the stated trial aggregation change.
 
-| Case | Fixed defer | Adaptive checkpoint | Arena-adaptive |
-|---|---:|---:|---:|
-| netcard base | 0.2947x | 1.0430x | 1.2331x |
-| netcard d20 | 0.5488x | 1.3280x | 1.5312x |
-| netcard d50 | 3.2433x | 3.6010x | 4.3749x |
-| leon2 d10 | 0.6287x | 1.3253x | 1.6739x |
-| leon2 d30 | 2.4731x | 4.4888x | 7.2685x |
-| leon3mp d20 | 0.4895x | 1.4875x | 1.6519x |
-| leon3mp d50 | 1.9432x | 2.1186x | 2.4618x |
-| vga_lcd d20 | 0.7886x | 1.4779x | 1.9196x |
-| vga_lcd d50 | 1.4070x | 2.1235x | 2.9536x |
-| des_perf d20 | 0.3789x | 1.4755x | 1.7959x |
-| des_perf d40 | 1.2975x | 1.3376x | 1.5595x |
-| cage15 | 0.2048x | 1.1960x | 1.6256x |
-| M6 | 0.8999x | 3.6820x | 4.8025x |
-| nlpkkt120 | 0.5452x | 1.0570x | 1.7786x |
-| **29-case geometric mean** | **0.8429x** | **1.6593x** | **2.1246x** |
+| Case | Fixed defer | Adaptive checkpoint | Arena-adaptive | Arena PFXT runtime |
+|---|---:|---:|---:|---:|
+| netcard base | 0.2947x | 1.0430x | 1.2331x | 5.867 ms |
+| netcard d20 | 0.5488x | 1.3280x | 1.5312x | 57.291 ms |
+| netcard d50 | 3.2433x | 3.6010x | 4.3749x | 85.266 ms |
+| leon2 d10 | 0.6287x | 1.3253x | 1.6739x | 32.708 ms |
+| leon2 d30 | 2.4731x | 4.4888x | 7.2685x | 658.022 ms |
+| leon3mp d20 | 0.4895x | 1.4875x | 1.6519x | 55.054 ms |
+| leon3mp d50 | 1.9432x | 2.1186x | 2.4618x | 61.484 ms |
+| vga_lcd d20 | 0.7886x | 1.4779x | 1.9196x | 56.840 ms |
+| vga_lcd d50 | 1.4070x | 2.1235x | 2.9536x | 42.479 ms |
+| des_perf d20 | 0.3789x | 1.4755x | 1.7959x | 17.565 ms |
+| des_perf d40 | 1.2975x | 1.3376x | 1.5595x | 61.185 ms |
+| cage15 | 0.2048x | 1.1960x | 1.6256x | 13.824 ms |
+| M6 | 0.8999x | 3.6820x | 4.8025x | 14.027 ms |
+| nlpkkt120 | 0.5452x | 1.0570x | 1.7786x | 3.353 ms |
+| **29-case geometric mean** | **0.8429x** | **1.6593x** | **2.1246x** | — |
 
 The table deliberately samples sparse originals, low and high circuit
 densities, multiple circuit families, and the three naturally dense
@@ -90,26 +91,25 @@ and construction of reusable graph-static metadata are outside
 
 ## Where adaptive time goes
 
-The following diagnostic run enables the lightweight GPU event profiler on
-four large or high-density cases. `Headline PFXT` is the uninstrumented
-five-trial median used in the progression result. The other PFXT columns come
-from one separately validated profiled run, so they expose the breakdown but
-are not substituted into the headline result.
+The following cold first-query breakdown comes from separately validated runs
+with the lightweight GPU event profiler enabled. Each percentage uses
+`one-time setup + decision computation + PFXT` as its denominator, so every
+row sums to 100%. Profiling overhead is acceptable here because this table
+explains where time goes; the uninstrumented production medians remain in the
+progression table above.
 
-| Case | Headline PFXT | Cold static setup | Adaptive stats/decision | Remaining PFXT | Profiled PFXT | Decision share |
-|---|---:|---:|---:|---:|---:|---:|
-| netcard d50 | 85.266 ms | 86.659 ms | 0.172 ms | 96.295 ms | 96.466 ms | 0.18% |
-| leon2 d30 | 658.022 ms | 53.538 ms | 20.752 ms | 643.698 ms | 664.450 ms | 3.12% |
-| leon2 d50 | 90.609 ms | 92.612 ms | 0.453 ms | 102.444 ms | 102.897 ms | 0.44% |
-| leon3mp d50 | 61.484 ms | 75.646 ms | 0.302 ms | 70.568 ms | 70.870 ms | 0.43% |
+| Case | One-time setup | Decision computation | PFXT |
+|---|---:|---:|---:|
+| netcard d50 | 86.659 ms (47.32%) | 0.172 ms (0.09%) | 96.295 ms (52.59%) |
+| leon2 d30 | 53.538 ms (7.46%) | 20.752 ms (2.89%) | 643.698 ms (89.65%) |
+| leon2 d50 | 92.612 ms (47.37%) | 0.453 ms (0.23%) | 102.444 ms (52.40%) |
+| leon3mp d50 | 75.646 ms (51.63%) | 0.302 ms (0.21%) | 70.568 ms (48.16%) |
 
-`Cold static setup` is a one-time preparation cost whose outputs remain on the
-GPU. It is not a component of `Profiled PFXT`; add the two only when discussing
-cold first-query latency, not the PFXT-only headline. A second query on an
-unchanged graph reports a static-cache hit and zero setup time. The setup is
-small relative to the 658 ms `leon2_d30` query, but its 75–93 ms is material
-for the faster cases and therefore relies on reuse in an iterative workload.
-In plain language, setup prepares three reusable lookup structures:
+`One-time setup` prepares data whose outputs remain on the GPU. A second query
+on an unchanged graph reports a static-cache hit, making this column zero. In
+the table, `PFXT` means the rest of the profiled query after separately timed
+decision kernels are subtracted. In plain language, setup prepares three
+reusable lookup structures:
 
 1. It packs graph reachability/non-tree-edge relationships into BVSS masks for
    the shared pipeline.
