@@ -28,11 +28,11 @@ TEST_CASE("tc pfxt inprocess parses and configures adaptive mode") {
   CHECK(parse_run_mode("adaptive") == RunMode::ADAPTIVE);
   CHECK(std::string(run_mode_name(RunMode::ADAPTIVE)) == "adaptive");
   configure_run_mode(RunMode::ADAPTIVE);
-  REQUIRE(std::getenv("GPUCPG_TC_PFXT_ADAPTIVE_DEFER") != nullptr);
-  REQUIRE(std::getenv("GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ") != nullptr);
+  REQUIRE(std::getenv("GPUCPG_ADAPTIVE_PFXT_ADAPTIVE_DEFER") != nullptr);
+  REQUIRE(std::getenv("GPUCPG_ADAPTIVE_PFXT_DEFERRED_TILE_LPQ") != nullptr);
   configure_run_mode(RunMode::GPG);
-  CHECK(std::getenv("GPUCPG_TC_PFXT_ADAPTIVE_DEFER") == nullptr);
-  CHECK(std::getenv("GPUCPG_TC_PFXT_DEFERRED_TILE_LPQ") == nullptr);
+  CHECK(std::getenv("GPUCPG_ADAPTIVE_PFXT_ADAPTIVE_DEFER") == nullptr);
+  CHECK(std::getenv("GPUCPG_ADAPTIVE_PFXT_DEFERRED_TILE_LPQ") == nullptr);
 }
 
 TEST_CASE("tc pfxt inprocess compares TC costs against golden prefix") {
@@ -104,10 +104,10 @@ TEST_CASE("tc pfxt inprocess caches static setup across repeated TC runs") {
   cpgen.read_input(filename);
   cpgen.enable_tc_pfxt_static_cache(true);
 
-  setenv("GPUCPG_TC_PFXT_SINGLE_PASS", "1", 1);
-  setenv("GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE", "1", 1);
-  setenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE", "1", 1);
-  setenv("GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS", "1", 1);
+  setenv("GPUCPG_ADAPTIVE_PFXT_SINGLE_PASS", "1", 1);
+  setenv("GPUCPG_ADAPTIVE_PFXT_SINGLE_WORK_CANDIDATE", "1", 1);
+  setenv("GPUCPG_ADAPTIVE_PFXT_SOURCE_LOCAL_CANDIDATE", "1", 1);
+  setenv("GPUCPG_ADAPTIVE_PFXT_COMPACT_STATIC_DEVS", "1", 1);
 
   const auto first = gpucpg::tc_pfxt_inprocess::run_paths(
     cpgen, 2, gpucpg::tc_pfxt_inprocess::RunMode::TILE_DEFERRED);
@@ -118,8 +118,8 @@ TEST_CASE("tc pfxt inprocess caches static setup across repeated TC runs") {
   CHECK(cpgen.tc_pfxt_static_cache_misses() == 1);
   CHECK(cpgen.tc_pfxt_static_cache_hits() == 1);
 
-  unsetenv("GPUCPG_TC_PFXT_SINGLE_PASS");
-  unsetenv("GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE");
-  unsetenv("GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE");
-  unsetenv("GPUCPG_TC_PFXT_COMPACT_STATIC_DEVS");
+  unsetenv("GPUCPG_ADAPTIVE_PFXT_SINGLE_PASS");
+  unsetenv("GPUCPG_ADAPTIVE_PFXT_SINGLE_WORK_CANDIDATE");
+  unsetenv("GPUCPG_ADAPTIVE_PFXT_SOURCE_LOCAL_CANDIDATE");
+  unsetenv("GPUCPG_ADAPTIVE_PFXT_COMPACT_STATIC_DEVS");
 }

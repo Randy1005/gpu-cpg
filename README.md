@@ -48,7 +48,7 @@ copy them into the shown paths before running the commands.
 This is the current proposal configuration.
 
 ```bash
-GPUCPG_ENABLE_TC_PFXT=1 \
+GPUCPG_ENABLE_ADAPTIVE_PFXT=1 \
 GPUCPG_TC_PFXT_SINGLE_PASS=1 \
 GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE=1 \
 GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE=1 \
@@ -77,7 +77,7 @@ Generate or reuse a GPG cost file, then compare multiple K prefixes:
 ```
 
 ```bash
-GPUCPG_ENABLE_TC_PFXT=1 \
+GPUCPG_ENABLE_ADAPTIVE_PFXT=1 \
 GPUCPG_TC_PFXT_SINGLE_PASS=1 \
 GPUCPG_TC_PFXT_SINGLE_WORK_CANDIDATE=1 \
 GPUCPG_TC_PFXT_SOURCE_LOCAL_CANDIDATE=1 \

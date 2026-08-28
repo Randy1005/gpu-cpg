@@ -17,10 +17,10 @@ std::vector<float> run_paths(
   const int k,
   const bool enable_tc_pfxt) {
   if (enable_tc_pfxt) {
-    setenv("GPUCPG_ENABLE_TC_PFXT", "1", 1);
+    setenv("GPUCPG_ENABLE_ADAPTIVE_PFXT", "1", 1);
   }
   else {
-    unsetenv("GPUCPG_ENABLE_TC_PFXT");
+    unsetenv("GPUCPG_ENABLE_ADAPTIVE_PFXT");
   }
 
   cpgen.reset();
@@ -224,7 +224,7 @@ int main(int argc, char* argv[]) {
           && second.size() == static_cast<std::size_t>(k)
           && max_diff == 0.0f;
         std::cout << (pass ? "REPEAT CHECK PASS\n" : "REPEAT CHECK FAIL\n");
-        unsetenv("GPUCPG_ENABLE_TC_PFXT");
+        unsetenv("GPUCPG_ENABLE_ADAPTIVE_PFXT");
         return pass ? EXIT_SUCCESS : EXIT_FAILURE;
       }
 
@@ -244,7 +244,7 @@ int main(int argc, char* argv[]) {
             << " total_pfxt_ms=" << short_long_pfxt_ms(cpgen)
             << '\n';
           if (costs.size() != static_cast<std::size_t>(k)) {
-            unsetenv("GPUCPG_ENABLE_TC_PFXT");
+            unsetenv("GPUCPG_ENABLE_ADAPTIVE_PFXT");
             return EXIT_FAILURE;
           }
         }
@@ -262,7 +262,7 @@ int main(int argc, char* argv[]) {
             << " total_pfxt_ms=" << total_ms
             << '\n';
           if (costs.size() != static_cast<std::size_t>(k)) {
-            unsetenv("GPUCPG_ENABLE_TC_PFXT");
+            unsetenv("GPUCPG_ENABLE_ADAPTIVE_PFXT");
             return EXIT_FAILURE;
           }
         }
@@ -283,7 +283,7 @@ int main(int argc, char* argv[]) {
           << " min_pfxt_ms=" << (measured.empty() ? 0.0 : min_v)
           << " max_pfxt_ms=" << max_v
           << '\n';
-        unsetenv("GPUCPG_ENABLE_TC_PFXT");
+        unsetenv("GPUCPG_ENABLE_ADAPTIVE_PFXT");
         return EXIT_SUCCESS;
       }
     }
@@ -315,7 +315,7 @@ int main(int argc, char* argv[]) {
       write_costs(*args.tc_out_file, tc);
       std::cout << "tc_costs_written=" << *args.tc_out_file << '\n';
     }
-    unsetenv("GPUCPG_ENABLE_TC_PFXT");
+    unsetenv("GPUCPG_ENABLE_ADAPTIVE_PFXT");
     if (args.mode == "tc-timing") {
       std::cout << "tc_count=" << tc.size() << '\n';
       return tc.size() == static_cast<std::size_t>(k) ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -371,7 +371,7 @@ int main(int argc, char* argv[]) {
       : EXIT_FAILURE;
   }
   catch (const std::exception& e) {
-    unsetenv("GPUCPG_ENABLE_TC_PFXT");
+    unsetenv("GPUCPG_ENABLE_ADAPTIVE_PFXT");
     std::cerr << "GATE 5 ERROR: " << e.what() << '\n';
     return EXIT_FAILURE;
   }

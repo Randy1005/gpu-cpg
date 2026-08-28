@@ -2,18 +2,20 @@
 
 ## Executive result
 
-Arena-adaptive is the current production checkpoint. On the RTX 5090 K=1M
-suite it provides a **1.3683x geometric-mean cold first-query speedup over
-GPG** across 29 graph/density cases. Its reusable
-PFXT-only geometric-mean speedup is **2.1246x**. Every reported top-K result was checked against the
-current GPG golden output, and benchmark runs with a retry, capacity overflow,
-or fallback were rejected.
+Arena-adaptive is the current production checkpoint. On the expanded RTX 5090
+K=1M suite it provides a **1.7746x geometric-mean cold first-query speedup over
+GPG** across 43 cases: five original circuits, all five d10--d50 densities for
+each circuit family, three non-circuits, and ten x8/x16 task-graph replicas.
+Its reusable PFXT-only geometric-mean speedup is **2.0336x**. It wins all 43
+reused-query comparisons and 40 of 43 cold-query comparisons. Every reported
+top-K result was checked against the current GPG golden output, and benchmark
+runs with a retry, capacity overflow, or fallback were rejected.
 
-This is a CUDA/BVSS path-generation result, not evidence of Tensor Core
-throughput. The historical `TC-PFXT` names remain in the implementation, but
-the decisive gains described here come from deferred materialization,
-GPU-resident adaptive selection, fused candidate generation, and reusable
-candidate storage.
+This is a CUDA source-local path-generation result, not evidence of Tensor
+Core throughput. The decisive gains described here come from deferred
+materialization, GPU-resident adaptive selection, fused candidate generation,
+and reusable candidate storage. The production path does not build BVSS or
+execute its MMA consumer.
 
 ## Progression
 
@@ -28,7 +30,10 @@ traffic, and later bookkeeping.
 Fixed deferral proved the mechanism but not a usable global policy. Dense
 cases benefited strongly, while sparse or low-product-intensity cases paid
 descriptor/classification overhead without avoiding enough materialization.
-Its 29-case geometric mean was only **0.8429x** versus GPG.
+Its historical 29-case geometric mean was only **0.8429x** versus GPG. On the
+expanded 43-case suite it falls to **0.4139x**, primarily because eagerly
+retaining deferred work is especially harmful on the deeper x8/x16 task
+graphs.
 
 ### First checkpoint: GPU-resident adaptive deferral
 
@@ -47,60 +52,66 @@ short and long `PfxtNode` storage once, changes logical sizes without
 constructing unused nodes, and lets the fused source-local fill classify and
 reserve outputs directly. No candidate-generation retry is accepted.
 
-The validated default request is 400M slots with a 25:75 short/long split and
-a 70% free-memory cap. On the RTX 5090 campaign this yielded 100M short and
-300M long slots (9.6 GB), covering observed peaks of 81,543,398 short and
-242,555,415 long slots. Arena-adaptive reaches **2.1246x** PFXT-only geometric mean versus GPG.
-After charging the current optimized setup, its cold-query geometric mean is
-**1.3683x**.
+The original 29-case checkpoint used 400M slots with a 25:75 short/long split.
+The expanded task graphs exposed a different high-water shape: des_perf x16
+exceeded the old 100M short partition, while the older suite still required
+more than 242M long slots. The validated expanded-suite request is therefore
+500M slots with a 40:60 split and the same 70% free-memory cap, yielding 200M
+short and 300M long slots (12 GB) on the RTX 5090.
+
+With that one-shot policy, arena-adaptive reaches **2.0336x** PFXT-only
+geometric mean versus GPG across all 43 cases. After charging the complete
+adaptive-only setup, its cold-query geometric mean is **1.7746x**. On the 33
+unscaled cases alone the corresponding results are **2.0014x** and
+**1.8104x**; the ten scaled task graphs achieve **2.1439x** and **1.6614x**.
 
 ## Diverse progression table
 
-The table uses the requested checkpoint convention: GPG and fixed defer report
-their measured PFXT time, while adaptive is charged its current optimized
-one-time static setup plus its measured PFXT time. Each parenthesized speedup is
-the same row's GPG PFXT time divided by the displayed checkpoint time. Graph
-loading and propagation are excluded throughout.
+The table uses the checkpoint convention: GPG and fixed defer report measured
+PFXT, while adaptive cold time is its complete adaptive-only setup plus
+measured PFXT. Each parenthesized speedup is the same row's GPG PFXT divided
+by the displayed checkpoint time. Common graph loading and SFXT propagation
+are excluded throughout.
 
-There is an implementation nuance behind that convention. The current shared
-`gpg-deferred` executable constructs BVSS and compact-deviation metadata before
-its measured PFXT region, even though the fixed-defer number below does not
-charge that construction. It is therefore a historical fixed-defer PFXT
-checkpoint, not the end-to-end cold latency of the current shared executable.
-Adaptive cold time does charge the setup because adaptive's production path
-depends on those reusable structures. A strict current-executable cold-latency
-comparison would charge setup to fixed defer as well.
+Adaptive setup now has a clean boundary. GPG and adaptive execute the same SFXT
+successor-finalization path; all adaptive-only deviation counting, offset
+scan, compact destination/slack emission, and chain-bound construction are
+charged to setup. Fixed defer is retained as a historical mechanism checkpoint
+and reports PFXT only.
 
-Each PFXT entry is the median of three measured trials after one warmup. All 14
-cases passed exact K=1M cost validation in all four modes before timing, and no
-capacity retry, overflow, or fallback was accepted.
-
-The optimized static setup did not materially change adaptive PFXT execution.
-Against the prior uninstrumented adaptive campaign, the fresh adaptive PFXT
-medians have a 0.50% median absolute change and a 2.47% maximum absolute change
-across these 14 cases. That is run-to-run variation, while the setup reduction
-appears only in the separately charged cold-setup component.
+Each PFXT entry is the median of three measured trials after one warmup. All 43
+cases in the stored CSV passed current-GPG K=1M cost validation in fixed-defer
+and adaptive modes before timing. No capacity retry, overflow, or fallback was
+accepted. The table samples 19 rows; the CSV contains every density, original
+circuit, scaled task graph, and non-circuit.
 
 | Case | GPG time | Fixed defer time (speedup) | Adaptive cold time (speedup) |
 |---|---:|---:|---:|
-| netcard base | 7.340 ms | 24.352 ms (0.3014x) | 9.886 ms (0.7425x) |
-| netcard d20 | 88.299 ms | 159.746 ms (0.5527x) | 99.320 ms (0.8890x) |
-| netcard d50 | 373.770 ms | 116.097 ms (3.2195x) | 191.625 ms (1.9505x) |
-| leon2 d10 | 54.477 ms | 87.203 ms (0.6247x) | 59.936 ms (0.9089x) |
-| leon2 d30 | 4,761.130 ms | 1,965.030 ms (2.4229x) | 1,125.697 ms (4.2295x) |
-| leon3mp d20 | 90.853 ms | 187.866 ms (0.4836x) | 90.585 ms (1.0030x) |
-| leon3mp d50 | 152.325 ms | 79.174 ms (1.9239x) | 149.048 ms (1.0220x) |
-| vga_lcd d20 | 109.109 ms | 140.087 ms (0.7789x) | 78.437 ms (1.3910x) |
-| vga_lcd d50 | 125.395 ms | 87.419 ms (1.4344x) | 69.891 ms (1.7942x) |
-| des_perf d20 | 31.756 ms | 82.640 ms (0.3843x) | 25.120 ms (1.2642x) |
-| des_perf d40 | 95.642 ms | 73.131 ms (1.3078x) | 77.508 ms (1.2340x) |
-| cage15 | 22.537 ms | 111.190 ms (0.2027x) | 36.965 ms (0.6097x) |
-| M6 | 68.546 ms | 75.354 ms (0.9097x) | 23.304 ms (2.9414x) |
-| nlpkkt120 | 5.950 ms | 11.457 ms (0.5193x) | 23.742 ms (0.2506x) |
+| netcard base | 7.296 ms | 24.433 ms (0.2986x) | 6.307 ms (1.1568x) |
+| netcard d20 | 88.332 ms | 164.803 ms (0.5360x) | 63.691 ms (1.3869x) |
+| netcard d50 | 373.113 ms | 116.445 ms (3.2042x) | 99.232 ms (3.7600x) |
+| leon2 d10 | 54.494 ms | 87.813 ms (0.6206x) | 36.617 ms (1.4882x) |
+| leon2 d30 | 4,799.210 ms | 2,045.620 ms (2.3461x) | 662.746 ms (7.2414x) |
+| leon3mp d20 | 90.692 ms | 189.326 ms (0.4790x) | 60.313 ms (1.5037x) |
+| leon3mp d50 | 151.873 ms | 79.445 ms (1.9117x) | 73.717 ms (2.0602x) |
+| vga_lcd d20 | 109.195 ms | 139.491 ms (0.7828x) | 58.614 ms (1.8630x) |
+| vga_lcd d50 | 125.769 ms | 87.583 ms (1.4360x) | 44.006 ms (2.8580x) |
+| des_perf d20 | 31.772 ms | 83.685 ms (0.3797x) | 18.667 ms (1.7021x) |
+| des_perf d40 | 96.026 ms | 73.252 ms (1.3109x) | 62.659 ms (1.5325x) |
+| cage15 | 22.520 ms | 111.133 ms (0.2026x) | 16.344 ms (1.3779x) |
+| M6 | 68.038 ms | 74.879 ms (0.9086x) | 14.677 ms (4.6358x) |
+| nlpkkt120 | 5.947 ms | 11.452 ms (0.5193x) | 5.733 ms (1.0374x) |
+| netcard x16 | 33.944 ms | 1,717.660 ms (0.0198x) | 19.629 ms (1.7293x) |
+| leon2 x16 | 8.469 ms | 1,414.850 ms (0.0060x) | 14.973 ms (0.5656x) |
+| leon3mp x16 | 59.883 ms | 1,685.690 ms (0.0355x) | 23.231 ms (2.5778x) |
+| vga_lcd x16 | 27.392 ms | 72.812 ms (0.3762x) | 16.214 ms (1.6894x) |
+| des_perf x16 | 245.093 ms | 477.419 ms (0.5134x) | 31.371 ms (7.8128x) |
 
 The table deliberately samples sparse originals, low and high circuit
-densities, multiple circuit families, and the three naturally dense
-non-circuit graphs. The progression is not limited to netcard d50.
+densities, multiple circuit families, all three naturally dense non-circuit
+graphs, and each x16 task-graph family. The three cold losses in the complete
+suite are netcard x8, leon2 x16, and leon3mp x8; all three remain PFXT-only
+wins before setup is charged.
 
 All adaptive work executed during PFXT is included in these runtimes. That
 includes GPU statistics collection, the mode decision, probation/hysteresis,
@@ -110,43 +121,39 @@ table entry.
 
 ## Where adaptive time goes
 
-The following cold first-query breakdown isolates the non-arena adaptive
-implementation: `--mode adaptive` was used with
-`GPUCPG_TC_PFXT_CANDIDATE_ARENA` explicitly unset. The runs were separately
-validated with the lightweight GPU event profiler enabled. Each percentage
-uses `one-time setup + decision computation + PFXT` as its denominator, so
-every row sums to 100%. Profiling overhead is acceptable here because this
-table explains where time goes; the uninstrumented production medians remain
-in the progression table above.
+The following cold first-query breakdown uses the same 500M-slot, 40:60
+arena-adaptive configuration as the headline suite, with the lightweight GPU
+event profiler enabled. Each percentage uses `one-time setup + decision
+computation + PFXT` as its denominator, so every row sums to 100%. Profiling
+overhead is acceptable here because this table explains where time goes; the
+uninstrumented production medians remain in the progression table and full
+CSV.
 
 | Case | One-time setup | Decision computation | PFXT |
 |---|---:|---:|---:|
-| netcard d50 | 86.835 ms (42.88%) | 0.169 ms (0.08%) | 115.513 ms (57.04%) |
-| leon2 d30 | 53.611 ms (4.74%) | 20.854 ms (1.84%) | 1,056.120 ms (93.42%) |
-| leon2 d50 | 93.263 ms (42.12%) | 0.490 ms (0.22%) | 127.679 ms (57.66%) |
-| leon3mp d50 | 75.395 ms (47.80%) | 0.309 ms (0.20%) | 82.040 ms (52.00%) |
+| netcard d50 | 14.743 ms (13.27%) | 0.142 ms (0.13%) | 96.237 ms (86.60%) |
+| leon2 d30 | 9.497 ms (1.43%) | 20.737 ms (3.13%) | 633.115 ms (95.44%) |
+| leon2 d50 | 15.590 ms (13.32%) | 0.421 ms (0.36%) | 101.021 ms (86.32%) |
+| leon3mp d50 | 13.092 ms (15.75%) | 0.279 ms (0.34%) | 69.763 ms (83.92%) |
 
 `One-time setup` prepares data whose outputs remain on the GPU. A second query
-on an unchanged graph reports a static-cache hit, making this column zero. In
-the table, `PFXT` means the rest of the profiled query after separately timed
-decision kernels are subtracted. For netcard d50, the comparable profiled
-PFXT total is 115.682 ms versus the 104.332 ms fresh unprofiled adaptive
-PFXT used in
-the progression calculation: a 10.9% diagnostic-run increase, not the apparent
-twofold gap obtained by incorrectly adding cold setup to only one side. In plain language, setup prepares three reusable lookup structures:
+on an unchanged graph reports a static-cache hit, making this column zero. The
+setup boundary includes every adaptive-only static operation:
 
-1. It packs graph reachability/non-tree-edge relationships into BVSS masks for
-   the shared pipeline.
-2. It builds a compact source-major list of each vertex's usable deviations,
-   storing only destination and added slack instead of repeatedly walking the
-   original graph.
-3. It computes per-chain product upper bounds used for cheap ordinary-path
-   safety checks.
+1. Count each source's reachable non-successor deviations.
+2. Prefix-scan those counts into source-major ranges.
+3. Emit compact destination and added-slack arrays.
+4. Compute per-chain product upper bounds for cheap ordinary-path safety
+   checks.
 
-BVSS construction is the largest cold-setup component (42–74 ms in this
-sample), even though the source-local headline path does not execute BVSS MMA.
-Avoiding that unused preparation when no BVSS fallback is needed is a remaining
-cold-start optimization opportunity; it does not affect the breakdown's\nPFXT column.
+SFXT uses the same successor-finalization path in GPG and adaptive
+(`fused_counts=0`), so none of this work is hidden in common propagation.
+BVSS is not built. In the table, `PFXT` means the remainder of the profiled
+query after separately timed decision kernels are subtracted. For netcard d50,
+the profiled decision-plus-PFXT total is 96.378 ms versus the 84.434 ms
+uninstrumented production median, a 14.1% diagnostic-run increase. The
+progression table therefore uses uninstrumented PFXT and charges only the
+clean setup counter.
 
 The adaptive decision itself remains inside PFXT. For each evaluated chain
 substep, GPU kernels count active parent paths and their possible
@@ -168,7 +175,8 @@ with a graph-derived or online cost model remains the principled next step.
 `leon2_d30` is useful because its K=1M run executed 111 adaptive substeps: 51
 ordinary, 60 deferred, and 26 switches. The rows below are consecutive
 substeps from one late outer-step window. Products per path is calculated from
-the exact GPU counters shown in the trace.
+the exact GPU counters shown in the trace. The fresh 43-case validation log
+reproduces the same counts and sequence.
 
 An **outer step** is one PFXT expansion-window iteration: it processes the
 current short-path window and then advances that window (or promotes deferred
@@ -218,23 +226,21 @@ RTX 5090 timings as that machine's baseline.
 
 The in-process binaries configure the source-local, compact-deviation,
 tile-native, compact-group, deferred-LPQ, short-tile-bound, and adaptive flags
-when `--mode adaptive` is selected. The arena is the one additional opt-in:
+when `--mode adaptive` is selected. The arena and expanded-suite partition are
+the additional opt-ins:
 
 ```bash
-export GPUCPG_TC_PFXT_CANDIDATE_ARENA=1
+export GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA=1
+export GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA_SLOTS=500000000
+export GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA_SHORT_PERCENT=40
+export GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA_MEMORY_PERCENT=70
 ```
 
-The production defaults are:
-
-```bash
-export GPUCPG_TC_PFXT_CANDIDATE_ARENA_SLOTS=400000000
-export GPUCPG_TC_PFXT_CANDIDATE_ARENA_SHORT_PERCENT=25
-export GPUCPG_TC_PFXT_CANDIDATE_ARENA_MEMORY_PERCENT=70
-```
-
-Those three assignments are optional because they match the compiled
-defaults. Override them only after measuring one-shot high-water requirements
-on the target GPU. Capacity failure is an error, not a benchmark retry.
+The older compiled partition is 400M slots at 25:75. It remains sufficient for
+the historical 29-case suite but not des_perf x16, so do not omit the expanded
+overrides when reproducing the 43-case table. The resulting request is 200M
+short plus 300M long `PfxtNode` slots (12 GB) before the free-memory cap.
+Capacity failure is an error, not a benchmark retry.
 
 ### 3. Validate one graph before timing it
 
@@ -244,14 +250,14 @@ mkdir -p "$GPUCPG_GOLDEN_DIR"
 
 # Skip this command when the golden already exists.
 build/examples/tc-pfxt-inprocess-exactness \
-  --benchmark benchmarks/tc_pfxt_crossover/netcard_d50.txt \
+  --benchmark experiments/binary_graph_cache_20260826/netcard_d50.csrbin \
   --current-gpg-baseline \
   --baseline-output "$GPUCPG_GOLDEN_DIR/netcard_d50_k1000000.gpg.costs" \
   --ks 1000000 --mode gpg
 
-GPUCPG_TC_PFXT_CANDIDATE_ARENA=1 \
+GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA=1 \
   build/examples/tc-pfxt-inprocess-exactness \
-  --benchmark benchmarks/tc_pfxt_crossover/netcard_d50.txt \
+  --benchmark experiments/binary_graph_cache_20260826/netcard_d50.csrbin \
   --baseline-file "$GPUCPG_GOLDEN_DIR/netcard_d50_k1000000.gpg.costs" \
   --ks 1000000 --mode adaptive
 ```
@@ -263,13 +269,13 @@ Then measure standalone PFXT-only runtime:
 
 ```bash
 build/examples/tc-pfxt-inprocess-timing \
-  --benchmark benchmarks/tc_pfxt_crossover/netcard_d50.txt \
-  --k 1000000 --mode gpg --warmup 1 --trials 5
+  --benchmark experiments/binary_graph_cache_20260826/netcard_d50.csrbin \
+  --k 1000000 --mode gpg --warmup 1 --trials 3
 
-GPUCPG_TC_PFXT_CANDIDATE_ARENA=1 \
+GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA=1 \
   build/examples/tc-pfxt-inprocess-timing \
-  --benchmark benchmarks/tc_pfxt_crossover/netcard_d50.txt \
-  --k 1000000 --mode adaptive --warmup 1 --trials 5
+  --benchmark experiments/binary_graph_cache_20260826/netcard_d50.csrbin \
+  --k 1000000 --mode adaptive --warmup 1 --trials 3
 ```
 
 These timings isolate PFXT. Common parsing, graph construction, propagation,
@@ -277,29 +283,35 @@ and graph loading are not included in the reported PFXT speedup.
 
 ### 4. Run the complete suite
 
-Set the build and golden directories if they differ from the defaults, then
-run:
+Set the build directory if it differs from the default, then run:
 
 ```bash
 export GPUCPG_BUILD_DIR=$PWD/build
-export GPUCPG_GOLDEN_DIR=$PWD/experiments/gpg-goldens
-scripts/run_arena_adaptive_full_suite.sh \
-  "$PWD" "$PWD/experiments/arena_adaptive_reproduction"
+scripts/run_checkpoint_full_suite.sh \
+  "$PWD" "$PWD/experiments/checkpoint_full_suite_reproduction"
 ```
 
-The script keeps every existing golden and generates only missing files with
-the current GPG implementation. It then waits for an idle GPU before every
-standalone process, validates all 29 adaptive outputs, runs GPG and
-arena-adaptive with one warmup and five measured trials, rejects
-retry/overflow/fallback logs, and writes `comparison.csv` plus `COMPLETE`.
+The script is resumable. It keeps every completed current-GPG golden, waits for
+an idle GPU before every standalone process, validates fixed defer and adaptive
+for all 43 cases, and then runs GPG, fixed defer, and arena-adaptive with one
+warmup and three measured trials. It rejects retry/overflow/fallback logs and
+writes `full_suite.csv` plus `COMPLETE`. The CSV records category, family,
+density, scale, graph size, all three PFXT medians, clean adaptive setup,
+adaptive cold time, speedups, and correctness status.
 
 ## Evidence and boundaries
 
 - First checkpoint: `experiments/transparent_adaptive_20260825/comparison.csv`
-- Arena checkpoint: `experiments/arena_adaptive_checkpoint_20260827/`, a
-  compact copy of the arena-adaptive timing and correctness evidence. Its
-  `cold_progression.csv` records the dependency-aware 29-case cold-query
-  calculation used by the progression table.
+- Historical 29-case arena checkpoint:
+  `experiments/arena_adaptive_checkpoint_20260827/`.
+- Expanded 43-case checkpoint:
+  `experiments/checkpoint_full_suite_20260828/full_suite.csv`, with current
+  GPG goldens, 86 fixed/adaptive validation logs, and 129 timing logs in the
+  same directory.
+- Breakdown profiles:
+  `experiments/checkpoint_full_suite_20260828/timing_profile/`.
+- Decision trace:
+  `experiments/checkpoint_full_suite_20260828/validation/leon2_d30.adaptive.log`.
 - Arena mechanism and focused profile: `doc/candidate-arena-optimization-20260827.md`
 
 The later one-pass replay experiment achieved only 1.00003x geometric mean

@@ -61,7 +61,7 @@ for case_name in "${cases[@]}"; do
   [[ -f "$benchmark" && -f "$golden" ]]
   log="$out_dir/validation/${case_name}.arena-adaptive.log"
   wait_for_idle_gpu
-  GPUCPG_TC_PFXT_CANDIDATE_ARENA=1 \
+  GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA=1 \
     "$exact_bin" --benchmark "$benchmark" --baseline-file "$golden" \
       --ks 1000000 --mode adaptive >"$log" 2>&1
   grep -q '^INPROCESS EXACTNESS PASS$' "$log"
@@ -77,7 +77,7 @@ for case_name in "${cases[@]}"; do
       "$timing_bin" --benchmark "$benchmark" --k 1000000 --mode gpg \
         --warmup 1 --trials 5 >"$log" 2>&1
     else
-      GPUCPG_TC_PFXT_CANDIDATE_ARENA=1 \
+      GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA=1 \
         "$timing_bin" --benchmark "$benchmark" --k 1000000 \
           --mode adaptive --warmup 1 --trials 5 >"$log" 2>&1
     fi
