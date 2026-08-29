@@ -3,13 +3,16 @@
 ## Executive result
 
 Arena-adaptive is the current production checkpoint. On the expanded RTX 5090
-K=1M suite it provides a **1.7746x geometric-mean cold first-query speedup over
+K=1M suite it provides a **1.7746x geometric-mean setup-charged speedup over
 GPG** across 43 cases: five original circuits, all five d10--d50 densities for
 each circuit family, three non-circuits, and ten x8/x16 task-graph replicas.
-Its reusable PFXT-only geometric-mean speedup is **2.0336x**. It wins all 43
-reused-query comparisons and 40 of 43 cold-query comparisons. Every reported
-top-K result was checked against the current GPG golden output, and benchmark
-runs with a retry, capacity overflow, or fallback were rejected.
+Here and below, setup-charged (also called cold-equivalent in the CSV) means
+the observed one-time setup cost plus the median reusable PFXT time; it is not
+the wall time of the warmup/first query. Its reusable PFXT-only geometric-mean
+speedup is **2.0336x**. It wins all 43 reused-query comparisons and 40 of 43
+setup-charged comparisons. Every reported top-K result was checked against the
+current GPG golden output, and benchmark runs with a retry, capacity overflow,
+or fallback were rejected.
 
 This is a CUDA source-local path-generation result, not evidence of Tensor
 Core throughput. The decisive gains described here come from deferred
@@ -42,7 +45,7 @@ per step using GPU-resident product-intensity and skip evidence. Probation,
 hysteresis, and cached telemetry avoided a CPU decision round trip and stopped
 fixed deferral from harming unsuitable steps. It reached **1.6593x** PFXT-only geometric mean versus GPG and won all 29
 cases in its final transparent run. When charged the current optimized static
-setup, its normalized cold-query geometric mean is **1.1519x**.
+setup, its normalized setup-charged geometric mean is **1.1519x**.
 
 ### Current checkpoint: arena-adaptive
 
@@ -53,25 +56,29 @@ constructing unused nodes, and lets the fused source-local fill classify and
 reserve outputs directly. No candidate-generation retry is accepted.
 
 The original 29-case checkpoint used 400M slots with a 25:75 short/long split.
-The expanded task graphs exposed a different high-water shape: des_perf x16
-exceeded the old 100M short partition, while the older suite still required
-more than 242M long slots. The validated expanded-suite request is therefore
-500M slots with a 40:60 split and the same 70% free-memory cap, yielding 200M
-short and 300M long slots (12 GB) on the RTX 5090.
+The expanded campaign was run and validated with a conservative 500M-slot,
+40:60 request and the same 70% free-memory cap, yielding 200M short and 300M
+long slots (12 GB) on the RTX 5090. The final 43-case logs reached at most
+81,543,398 short slots (leon2 d30) and 242,555,345 long slots (des_perf d30).
+Those observed high-water marks also fit the older 100M/300M partition, so the
+stored evidence establishes the 500M/40:60 policy as the tested configuration,
+not as the minimum required capacity. No smaller-policy benchmark comparison
+is claimed here.
 
 With that one-shot policy, arena-adaptive reaches **2.0336x** PFXT-only
 geometric mean versus GPG across all 43 cases. After charging the complete
-adaptive-only setup, its cold-query geometric mean is **1.7746x**. On the 33
+adaptive-only setup, its setup-charged geometric mean is **1.7746x**. On the 33
 unscaled cases alone the corresponding results are **2.0014x** and
 **1.8104x**; the ten scaled task graphs achieve **2.1439x** and **1.6614x**.
 
 ## Diverse progression table
 
 The table uses the checkpoint convention: GPG and fixed defer report measured
-PFXT, while adaptive cold time is its complete adaptive-only setup plus
-measured PFXT. Each parenthesized speedup is the same row's GPG PFXT divided
-by the displayed checkpoint time. Common graph loading and SFXT propagation
-are excluded throughout.
+PFXT, while adaptive setup-charged time is its observed adaptive-only setup
+plus the median reusable PFXT measurement. Each parenthesized speedup is the
+same row's GPG PFXT divided by the displayed checkpoint time. This is a
+normalized cold-equivalent metric, not the measured wall time of the first
+query. Common graph loading and SFXT propagation are excluded throughout.
 
 Adaptive setup now has a clean boundary. GPG and adaptive execute the same SFXT
 successor-finalization path; all adaptive-only deviation counting, offset
@@ -85,7 +92,7 @@ and adaptive modes before timing. No capacity retry, overflow, or fallback was
 accepted. The table samples 19 rows; the CSV contains every density, original
 circuit, scaled task graph, and non-circuit.
 
-| Case | GPG time | Fixed defer time (speedup) | Adaptive cold time (speedup) |
+| Case | GPG time | Fixed defer time (speedup) | Adaptive setup-charged time (speedup) |
 |---|---:|---:|---:|
 | netcard base | 7.296 ms | 24.433 ms (0.2986x) | 6.307 ms (1.1568x) |
 | netcard d20 | 88.332 ms | 164.803 ms (0.5360x) | 63.691 ms (1.3869x) |
@@ -109,25 +116,28 @@ circuit, scaled task graph, and non-circuit.
 
 The table deliberately samples sparse originals, low and high circuit
 densities, multiple circuit families, all three naturally dense non-circuit
-graphs, and each x16 task-graph family. The three cold losses in the complete
-suite are netcard x8, leon2 x16, and leon3mp x8; all three remain PFXT-only
+graphs, and each x16 task-graph family. The three setup-charged losses in the
+complete suite are netcard x8, leon2 x16, and leon3mp x8; all three remain
+PFXT-only
 wins before setup is charged.
 
 All adaptive work executed during PFXT is included in these runtimes. That
 includes GPU statistics collection, the mode decision, probation/hysteresis,
-and descriptor bookkeeping. Adaptive cold time additionally includes the
-optimized static setup. Graph loading and propagation remain outside every
+and descriptor bookkeeping. Adaptive setup-charged time additionally includes
+the optimized static setup. Graph loading and propagation remain outside every
 table entry.
 
 ## Where adaptive time goes
 
-The following cold first-query breakdown uses the same 500M-slot, 40:60
+The following setup-charged breakdown uses the same 500M-slot, 40:60
 arena-adaptive configuration as the headline suite, with the lightweight GPU
-event profiler enabled. Each percentage uses `one-time setup + decision
-computation + PFXT` as its denominator, so every row sums to 100%. Profiling
-overhead is acceptable here because this table explains where time goes; the
-uninstrumented production medians remain in the progression table and full
-CSV.
+event profiler enabled. It combines the cache-miss setup observation with the
+component-wise medians of the three subsequent measured queries. It therefore
+explains the normalized setup-charged metric; it is not one observed first
+query. Each percentage uses `one-time setup + decision computation + PFXT` as
+its denominator, so every row sums to 100%. Profiling overhead is acceptable
+here because this table explains where time goes; the uninstrumented production
+medians remain in the progression table and full CSV.
 
 | Case | One-time setup | Decision computation | PFXT |
 |---|---:|---:|---:|
@@ -162,8 +172,12 @@ primary intensity signal. It selects ordinary processing below 60, deferred
 processing above 70, and in the inclusive 60–70 transition band samples
 candidate classes and selects deferral when at least 50% of sampled weight
 would be skipped. Here, `70` means 70 possible parent/deviation products per
-active path; it is not a graph-wide deviation count. State and statistics stay
-on the GPU; the host copies telemetry only after the run for this report.
+active path; it is not a graph-wide deviation count. The inputs and state that
+select the adaptive mode remain on the GPU, so mode selection itself requires
+no device-to-host decision round trip. Trace telemetry is copied to the host
+after the run for this report. This statement is deliberately limited to the
+adaptive decision: the wider PFXT implementation still has host-visible
+counters and synchronization points.
 
 The 60/70/50 gates are fixed defaults used for every graph in this campaign.
 They were calibrated empirically on the benchmark suite; they are not derived
@@ -236,11 +250,12 @@ export GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA_SHORT_PERCENT=40
 export GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA_MEMORY_PERCENT=70
 ```
 
-The older compiled partition is 400M slots at 25:75. It remains sufficient for
-the historical 29-case suite but not des_perf x16, so do not omit the expanded
-overrides when reproducing the 43-case table. The resulting request is 200M
-short plus 300M long `PfxtNode` slots (12 GB) before the free-memory cap.
-Capacity failure is an error, not a benchmark retry.
+The older compiled partition is 400M slots at 25:75. The final observed
+high-water marks fit that partition, but the published 43-case numbers were
+measured with the expanded overrides; keep them when reproducing this table so
+the configuration is identical. The resulting request is 200M short plus 300M
+long `PfxtNode` slots (12 GB) before the free-memory cap. Capacity failure is
+an error, not a benchmark retry.
 
 ### 3. Validate one graph before timing it
 
@@ -297,23 +312,21 @@ for all 43 cases, and then runs GPG, fixed defer, and arena-adaptive with one
 warmup and three measured trials. It rejects retry/overflow/fallback logs and
 writes `full_suite.csv` plus `COMPLETE`. The CSV records category, family,
 density, scale, graph size, all three PFXT medians, clean adaptive setup,
-adaptive cold time, speedups, and correctness status.
+adaptive setup-charged time (`adaptive_cold_ms`), speedups, and correctness
+status.
 
 ## Evidence and boundaries
 
 - First checkpoint: `experiments/transparent_adaptive_20260825/comparison.csv`
 - Historical 29-case arena checkpoint:
   `experiments/arena_adaptive_checkpoint_20260827/`.
-- Expanded 43-case checkpoint:
-  `experiments/checkpoint_full_suite_20260828/full_suite.csv`, with current
-  GPG goldens, 86 fixed/adaptive validation logs, and 129 timing logs in the
-  same directory.
-- Breakdown profiles:
+- Expanded 43-case checkpoint (committed summary):
+  `experiments/checkpoint_full_suite_20260828/full_suite.csv`.
+- Expanded-suite audit evidence retained in the local worktree but deliberately
+  not committed: current GPG goldens, 86 fixed/adaptive validation logs, and
+  129 timing logs under `experiments/checkpoint_full_suite_20260828/`.
+- Breakdown profiles retained locally:
   `experiments/checkpoint_full_suite_20260828/timing_profile/`.
-- Decision trace:
+- Decision trace retained locally:
   `experiments/checkpoint_full_suite_20260828/validation/leon2_d30.adaptive.log`.
 - Arena mechanism and focused profile: `doc/candidate-arena-optimization-20260827.md`
-
-The later one-pass replay experiment achieved only 1.00003x geometric mean
-over arena-adaptive and regressed leon2 d40 by 2.46%. Its production and test
-code was removed rather than carried as an inactive optimization.
