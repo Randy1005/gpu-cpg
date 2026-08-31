@@ -7,7 +7,7 @@ adaptive tile-deferred path. The focused seven-case arena-versus-legacy study
 below passed current GPG goldens, had no overflow or candidate-generation
 replay, and improved every measured case. A subsequent 29-case production
 validation also passed every golden and is summarized in
-`doc/arena-adaptive-checkpoint-20260827.md`.
+`doc/adaptive-checkpoint-20260831.md`.
 
 Across the sampled suite, median PFXT runtime improves by 13.85–38.58%. The
 geometric-mean speedup is 1.2677x, equivalent to a 21.12% geometric-mean

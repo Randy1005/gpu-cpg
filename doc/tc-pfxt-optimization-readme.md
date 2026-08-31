@@ -1,7 +1,7 @@
 # TC PFXT Optimization Runbook
 
 > **Current checkpoint:** see
-> [arena-adaptive-checkpoint-20260827.md](arena-adaptive-checkpoint-20260827.md)
+> [adaptive-checkpoint-20260831.md](adaptive-checkpoint-20260831.md)
 > for the production configuration, validated results, and reproduction steps.
 
 This note records how to build, validate, and retime the current TC PFXT
