@@ -11,11 +11,33 @@ enum class AdaptiveMode : std::uint64_t {
   UNINITIALIZED = 3,
 };
 
+struct ShortOnlyClassCounts {
+  std::uint64_t short_count = 0;
+  std::uint64_t skip_count = 0;
+};
+
+__host__ __device__ inline ShortOnlyClassCounts
+derive_short_only_class_counts(
+  const std::uint64_t total_products,
+  const std::uint64_t emitted_short) {
+  return ShortOnlyClassCounts{
+    emitted_short,
+    total_products >= emitted_short ? total_products - emitted_short : 0};
+}
+
+__host__ __device__ inline bool valid_short_only_class_counts(
+  const std::uint64_t total_products,
+  const std::uint64_t emitted_short) {
+  return emitted_short <= total_products;
+}
+
 struct AdaptivePolicyInput {
   std::uint64_t active_paths = 0;
   std::uint64_t parent_dev_products = 0;
   std::uint64_t sample_weight = 0;
   std::uint64_t sample_skip_weight = 0;
+  std::uint64_t sample_short_weight = 0;
+  std::uint64_t sample_long_weight = 0;
 };
 
 struct TransparentRuntimeBreakdownMs {
@@ -92,6 +114,15 @@ __host__ __device__ inline bool should_probe_safe_ordinary(
   return bounds_available
     && active_paths >= min_active_paths
     && min_active_paths > 0;
+}
+
+__host__ __device__ inline bool should_warp_aggregate_group_count(
+  const int active_paths,
+  const int min_active_paths,
+  const bool force,
+  const bool disable) {
+  return !disable
+    && (force || (min_active_paths > 0 && active_paths >= min_active_paths));
 }
 
 __host__ __device__ inline unsigned long long chain_product_upper_bound(
@@ -213,6 +244,54 @@ __host__ __device__ inline AdaptiveMode choose_adaptive_mode(
           * input.sample_weight
     ? AdaptiveMode::DEFERRED
     : AdaptiveMode::ORDINARY;
+}
+
+// Smoothly move the break-even intensity between the existing low/high safety
+// bounds using class evidence the adaptive oracle already collects. SKIP work
+// receives full credit because it disappears permanently. LONG work receives a
+// configurable partial credit because deferral postpones it but does not erase it. The decision adds only scalar arithmetic to the
+// existing one-thread device policy kernel.
+__host__ __device__ inline AdaptiveMode choose_dynamic_adaptive_mode(
+  const AdaptivePolicyInput input,
+  const AdaptivePolicy policy,
+  const int long_credit_percent) {
+  if (input.active_paths == 0) {
+    return AdaptiveMode::UNRESOLVED;
+  }
+  if (input.parent_dev_products == 0) {
+    return AdaptiveMode::ORDINARY;
+  }
+  if (input.sample_weight == 0) {
+    return AdaptiveMode::UNRESOLVED;
+  }
+  const std::uint64_t classified_weight =
+    input.sample_short_weight + input.sample_long_weight
+    + input.sample_skip_weight;
+  if (classified_weight == 0) {
+    return AdaptiveMode::UNRESOLVED;
+  }
+  const double bounded_skip_weight = static_cast<double>(
+    input.sample_skip_weight < input.sample_weight
+      ? input.sample_skip_weight : input.sample_weight);
+  const std::uint64_t remaining_weight =
+    input.sample_weight - static_cast<std::uint64_t>(bounded_skip_weight);
+  const double bounded_long_weight = static_cast<double>(
+    input.sample_long_weight < remaining_weight
+      ? input.sample_long_weight : remaining_weight);
+  const double long_credit = static_cast<double>(long_credit_percent) / 100.0;
+  const double avoidable_fraction =
+    (bounded_skip_weight + bounded_long_weight * long_credit)
+    / static_cast<double>(input.sample_weight);
+  const double dynamic_threshold =
+    static_cast<double>(policy.high_products_per_path)
+    - static_cast<double>(
+        policy.high_products_per_path - policy.low_products_per_path)
+      * avoidable_fraction;
+  const double product_intensity =
+    static_cast<double>(input.parent_dev_products)
+    / static_cast<double>(input.active_paths);
+  return product_intensity >= dynamic_threshold
+    ? AdaptiveMode::DEFERRED : AdaptiveMode::ORDINARY;
 }
 
 __host__ __device__ inline AdaptiveMode resolve_adaptive_mode(

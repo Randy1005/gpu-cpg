@@ -81,6 +81,57 @@ TEST_CASE("adaptive policy samples the inclusive transition region") {
         == AdaptiveMode::DEFERRED);
 }
 
+TEST_CASE("dynamic adaptive policy moves its threshold with avoidable work") {
+  using gpucpg::tc_pfxt::choose_dynamic_adaptive_mode;
+  const AdaptivePolicy policy{60, 70, 50};
+
+  CHECK(choose_dynamic_adaptive_mode(
+          {100, 6900, 100, 0, 100, 0}, policy, 0)
+        == AdaptiveMode::ORDINARY);
+  CHECK(choose_dynamic_adaptive_mode(
+          {100, 7000, 100, 0, 100, 0}, policy, 0)
+        == AdaptiveMode::DEFERRED);
+
+  CHECK(choose_dynamic_adaptive_mode(
+          {100, 6799, 100, 20, 50, 30}, policy, 0)
+        == AdaptiveMode::ORDINARY);
+  CHECK(choose_dynamic_adaptive_mode(
+          {100, 6800, 100, 20, 50, 30}, policy, 0)
+        == AdaptiveMode::DEFERRED);
+
+  CHECK(choose_dynamic_adaptive_mode(
+          {100, 6399, 100, 60, 0, 40}, policy, 0)
+        == AdaptiveMode::ORDINARY);
+  CHECK(choose_dynamic_adaptive_mode(
+          {100, 6400, 100, 60, 0, 40}, policy, 0)
+        == AdaptiveMode::DEFERRED);
+}
+
+TEST_CASE("dynamic adaptive policy charges LONG continuation cost") {
+  using gpucpg::tc_pfxt::choose_dynamic_adaptive_mode;
+  const AdaptivePolicy policy{60, 70, 50};
+  const AdaptivePolicyInput input{100, 6700, 100, 20, 50, 30};
+  CHECK(choose_dynamic_adaptive_mode(input, policy, 0)
+        == AdaptiveMode::ORDINARY);
+  CHECK(choose_dynamic_adaptive_mode(input, policy, 50)
+        == AdaptiveMode::DEFERRED);
+  CHECK(choose_dynamic_adaptive_mode(input, policy, 100)
+        == AdaptiveMode::DEFERRED);
+}
+
+TEST_CASE("dynamic adaptive policy requires only existing oracle evidence") {
+  using gpucpg::tc_pfxt::choose_dynamic_adaptive_mode;
+  const AdaptivePolicy policy{60, 70, 50};
+  CHECK(choose_dynamic_adaptive_mode({0, 0, 0, 0, 0, 0}, policy, 0)
+        == AdaptiveMode::UNRESOLVED);
+  CHECK(choose_dynamic_adaptive_mode({100, 0, 0, 0, 0, 0}, policy, 0)
+        == AdaptiveMode::ORDINARY);
+  CHECK(choose_dynamic_adaptive_mode({100, 6500, 0, 0, 0, 0}, policy, 0)
+        == AdaptiveMode::UNRESOLVED);
+  CHECK(choose_dynamic_adaptive_mode({100, 6500, 100, 0, 0, 0}, policy, 0)
+        == AdaptiveMode::UNRESOLVED);
+}
+
 TEST_CASE("adaptive policy reports unresolved when evidence is unavailable") {
   const AdaptivePolicy policy{60, 70, 50};
   CHECK(gpucpg::tc_pfxt::choose_adaptive_mode({0, 0, 0, 0}, policy)
@@ -341,6 +392,22 @@ TEST_CASE("transparent runtime breakdown is non-overlapping") {
         == doctest::Approx(breakdown.total_pfxt_ms));
 }
 
+TEST_CASE("short-only class counts are derived from total products and tail") {
+  using gpucpg::tc_pfxt::derive_short_only_class_counts;
+  using gpucpg::tc_pfxt::valid_short_only_class_counts;
+  const auto mixed = derive_short_only_class_counts(1000, 375);
+  CHECK(mixed.short_count == 375);
+  CHECK(mixed.skip_count == 625);
+  const auto all_short = derive_short_only_class_counts(128, 128);
+  CHECK(all_short.short_count == 128);
+  CHECK(all_short.skip_count == 0);
+  const auto all_skip = derive_short_only_class_counts(128, 0);
+  CHECK(all_skip.short_count == 0);
+  CHECK(all_skip.skip_count == 128);
+  CHECK(valid_short_only_class_counts(1000, 1000));
+  CHECK_FALSE(valid_short_only_class_counts(1000, 1001));
+}
+
 TEST_CASE("topology bound sums the complete successor deviation chain") {
   const int offsets[] {0, 2, 5, 6, 10};
   const int succs[] {1, 2, 3, -1};
@@ -350,6 +417,15 @@ TEST_CASE("topology bound sums the complete successor deviation chain") {
   CHECK(chain_product_upper_bound(1, offsets, succs, next_dev) == 8);
   CHECK(chain_product_upper_bound(2, offsets, succs, next_dev) == 5);
   CHECK(chain_product_upper_bound(3, offsets, succs, next_dev) == 4);
+}
+
+TEST_CASE("warp-aggregated group counting honors threshold and overrides") {
+  using gpucpg::tc_pfxt::should_warp_aggregate_group_count;
+  CHECK_FALSE(should_warp_aggregate_group_count(4095, 4096, false, false));
+  CHECK(should_warp_aggregate_group_count(4096, 4096, false, false));
+  CHECK(should_warp_aggregate_group_count(1, 4096, true, false));
+  CHECK_FALSE(should_warp_aggregate_group_count(1000000, 4096, true, true));
+  CHECK_FALSE(should_warp_aggregate_group_count(1000000, 0, false, false));
 }
 
 TEST_CASE("safe ordinary probe avoids overhead on small frontiers") {
