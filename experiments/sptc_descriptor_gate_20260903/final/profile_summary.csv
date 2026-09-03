@@ -1,0 +1,4 @@
+path,event_time_ms,ncu_time_ms,dram_bytes,active_warps_pct,sm_throughput_pct,memory_throughput_pct,tensor_instructions,sparse_hmma_ops
+cuda_fused_classify_emit,0.223937,0.215648,163579136,92.23,14.50,75.77,0,0
+sptc_sparse_mma,0.176327,0.398944,37823488,8.33,24.76,35.32,4194304,34359738368
+sptc_classify_emit,0.236017,0.237536,179834112,92.30,10.23,82.80,0,0

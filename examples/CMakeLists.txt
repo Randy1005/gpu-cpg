@@ -38,9 +38,22 @@ if(CUSPARSELT_ROOT)
   target_link_libraries(sptc-hardware-gate PRIVATE ${CUSPARSELT_ROOT}/lib/libcusparseLt.so)
   set_target_properties(sptc-hardware-gate PROPERTIES
     BUILD_RPATH "${CUSPARSELT_ROOT}/lib")
+  add_executable(sptc-descriptor-gate ${GPUCPG_EXAMPLE_DIR}/sptc-descriptor-gate.cu)
+  target_include_directories(sptc-descriptor-gate PRIVATE ${CUSPARSELT_ROOT}/include)
+  target_link_libraries(sptc-descriptor-gate PRIVATE ${CUSPARSELT_ROOT}/lib/libcusparseLt.so)
+  set_target_properties(sptc-descriptor-gate PROPERTIES
+    BUILD_RPATH "${CUSPARSELT_ROOT}/lib")
   add_test(NAME sptc_hardware_gate_smoke
     COMMAND sptc-hardware-gate --batches 1 --iterations 2 --warmup 1)
   set_tests_properties(sptc_hardware_gate_smoke PROPERTIES LABELS "gpu;hardware")
+  foreach(pattern IN ITEMS mixed all-short all-long all-skip)
+    string(REPLACE "-" "_" pattern_test_name "${pattern}")
+    add_test(NAME sptc_descriptor_gate_${pattern_test_name}
+      COMMAND sptc-descriptor-gate --pattern ${pattern}
+        --batches 16 --iterations 2 --warmup 1)
+    set_tests_properties(sptc_descriptor_gate_${pattern_test_name}
+      PROPERTIES LABELS "gpu;hardware")
+  endforeach()
 endif()
 add_executable(tc-sfxt-bvss-check ${GPUCPG_EXAMPLE_DIR}/tc-sfxt-bvss-check.cu)
 
