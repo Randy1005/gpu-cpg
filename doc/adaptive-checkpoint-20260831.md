@@ -422,6 +422,12 @@ branch instruction.
 
 ## Evidence and boundaries
 
+- Public benchmark-source dataset:
+  [`10.5281/zenodo.22650001`](https://doi.org/10.5281/zenodo.22650001).
+- Expected SHA-256 hashes for all 43 regenerated CSR binaries:
+  `doc/benchmark-derived-csr-20260907.sha256`.
+- Fresh-clone reproduction timing results:
+  `doc/adaptive-checkpoint-20260907-reproduction-full-suite.csv`.
 - Complete fresh three-way arena-disabled summary:
   `doc/adaptive-checkpoint-20260831-full-suite.csv`.
 - Raw timing, validation, and GPU-guard artifacts:
@@ -438,3 +444,14 @@ branch instruction.
 The stored timing campaign intentionally excludes common graph loading, graph
 construction, and SFXT. It includes all work inside each selected PFXT mode.
 The setup table separately charges adaptive-only static metadata construction.
+
+The tutorial was executed from a fresh GitHub clone on 2026-09-07. The full
+build and all 116 tests passed; all eight public source inputs passed SHA-256;
+all 43 regenerated CSR binaries matched the original campaign byte for byte;
+43 fresh K=1M GPG goldens passed; and all 129 GPG/fixed/adaptive validation and
+timing configurations completed without retry, overflow, fallback, slot-limit,
+timing, or cycle failures. Each timing log contains exactly three measured
+trials. On that reproduction run, adaptive achieved 1.648x reused-setup and
+1.472x cold-first-query geometric-mean speedup over GPG; cold adaptive won
+36/43 cases. Median fresh/stored runtime ratios were within 0.4% of 1.0 for
+every reported column.
