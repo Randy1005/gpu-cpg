@@ -260,9 +260,7 @@ cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.1/bin/nvcc \
   -DCMAKE_CUDA_ARCHITECTURES=120
-cmake --build build -j8 --target \
-  tc-pfxt-inprocess-exactness tc-pfxt-inprocess-timing tc_pfxt_candidates \
-  convert-timing-edges densify dump-csr-bin
+cmake --build build -j8
 ctest --test-dir build --output-on-failure
 ```
 
@@ -272,13 +270,17 @@ baselines.
 ### 2. Acquire and deterministically prepare the benchmark artifact
 
 The 43 campaign inputs are generated data and are intentionally not stored in
-Git. Reproduction nevertheless requires the eight original `.edges` files.
-They total approximately 8.1 GB, so they must be published as a versioned
-release/archival artifact rather than silently assumed to exist on the author's
-filesystem. Until that archive has a stable public URL and redistribution terms,
-an external user cannot reproduce the reported suite from this repository alone.
+Git. The eight original `.edges` inputs and their checksum manifest are
+published in the versioned Zenodo dataset
+[`10.5281/zenodo.22650001`](https://doi.org/10.5281/zenodo.22650001). They total
+approximately 8.1 GB. Download and verify them with:
 
-After downloading the archive, place these files in `benchmark-originals/`:
+```bash
+scripts/download_reproduction_benchmarks.sh \
+  "$PWD" "$PWD/benchmark-originals"
+```
+
+The resulting directory contains:
 
 ```text
 M6.edges               leon2.edges       nlpkkt120.edges
@@ -286,15 +288,26 @@ cage15.edges           leon3mp.edges     vga_lcd.edges
 des_perf.edges         netcard.edges
 ```
 
-The committed `doc/benchmark-originals-20260907.sha256` manifest identifies the
-exact inputs used for the paper. Prepare all 43 derived CSR binaries with:
+The downloaded and committed manifests must be byte-identical and identify the
+exact inputs used for the paper. Confirm that first, then prepare all 43 derived
+CSR binaries:
 
 ```bash
+cmp benchmark-originals/benchmark-originals-20260907.sha256 \
+  doc/benchmark-originals-20260907.sha256
 export GPUCPG_BUILD_DIR=$PWD/build
 scripts/prepare_reproduction_benchmarks.sh \
   "$PWD" "$PWD/benchmark-originals" "$PWD/benchmarks/reproduction"
 export GPUCPG_BENCHMARK_DIR=$PWD/benchmarks/reproduction/csrbin
+cmp benchmarks/reproduction/SHA256SUMS.generated \
+  doc/benchmark-derived-csr-20260907.sha256
 ```
+
+The verified fresh-clone run used approximately 98 GB for generated text and
+CSR data: 83.9 GB of intermediate text and 20.7 GB of CSR binaries, with some
+filesystem block sharing/rounding. Reserve at least 110 GB of free disk and
+12 GB of available host memory. The preparation is deterministic but can take
+tens of minutes because the largest d50 cases and x16 replications are large.
 
 The preparation workflow is deterministic and performs the following steps:
 
@@ -304,7 +317,8 @@ The preparation workflow is deterministic and performs the following steps:
 3. generates degrees 10, 20, 30, 40, and 50 with densification seed `1`;
 4. generates x8/x16 task graphs with seed `289`, weight jitter `0.15`, and
    macro-edge probability `0.35`;
-5. writes source-major `.csrbin` files and a generated SHA-256 manifest.
+5. writes source-major `.csrbin` files and verifies their generated SHA-256
+   manifest against the 43 files used in the reported campaign.
 
 Do not use somebody else's golden costs as the correctness authority. Generate
 fresh GPG K=1M goldens from these verified CSR binaries:
@@ -347,12 +361,15 @@ not required production flags.
 export GPUCPG_BENCHMARK_DIR=$PWD/benchmarks/reproduction/csrbin
 export GPUCPG_GOLDEN_DIR=$PWD/experiments/reproduction-goldens
 
-# Skip golden generation when this exact graph/K golden already exists.
-build/examples/tc-pfxt-inprocess-exactness \
-  --benchmark "$GPUCPG_BENCHMARK_DIR/netcard_d50.csrbin" \
-  --current-gpg-baseline \
-  --baseline-output "$GPUCPG_GOLDEN_DIR/netcard_d50_k1000000.gpg.costs" \
-  --ks 1000000 --mode gpg
+# The full golden-only pass above normally created this file. Generate it only
+# when reproducing this single case independently.
+if [[ ! -s "$GPUCPG_GOLDEN_DIR/netcard_d50_k1000000.gpg.costs" ]]; then
+  build/examples/tc-pfxt-inprocess-exactness \
+    --benchmark "$GPUCPG_BENCHMARK_DIR/netcard_d50.csrbin" \
+    --current-gpg-baseline \
+    --baseline-output "$GPUCPG_GOLDEN_DIR/netcard_d50_k1000000.gpg.costs" \
+    --ks 1000000 --mode gpg
+fi
 
 build/examples/tc-pfxt-inprocess-exactness \
   --benchmark "$GPUCPG_BENCHMARK_DIR/netcard_d50.csrbin" \

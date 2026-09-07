@@ -62,8 +62,11 @@ for graph in "${non_circuits[@]}"; do
     >"$output_dir/logs/${graph}_csrbin.log"
 done
 
-find "$output_dir/csrbin" -maxdepth 1 -type f -name '*.csrbin' -print0 \
-  | sort -z | xargs -0 sha256sum >"$output_dir/SHA256SUMS.generated"
+(
+  cd "$output_dir/csrbin"
+  find . -maxdepth 1 -type f -name '*.csrbin' -printf '%f\0' \
+    | LC_ALL=C sort -z | xargs -0 sha256sum
+) >"$output_dir/SHA256SUMS.generated"
 count=$(find "$output_dir/csrbin" -maxdepth 1 -type f -name '*.csrbin' | wc -l)
 [[ "$count" -eq 43 ]]
 printf 'benchmark_preparation_complete cases=%d benchmark_dir=%s\n' \
