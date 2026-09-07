@@ -8,7 +8,7 @@ out_dir=${2:-$repo_dir/experiments/checkpoint_full_suite_$(date +%Y%m%d_%H%M%S)}
 build_dir=${GPUCPG_BUILD_DIR:-$repo_dir/build-fastlane}
 exact_bin="$build_dir/examples/tc-pfxt-inprocess-exactness"
 timing_bin="$build_dir/examples/tc-pfxt-inprocess-timing"
-golden_dir="$out_dir/golden"
+golden_dir=${GPUCPG_GOLDEN_DIR:-$out_dir/golden}
 arena_slots=${GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA_SLOTS:-500000000}
 arena_short_percent=${GPUCPG_ADAPTIVE_PFXT_CANDIDATE_ARENA_SHORT_PERCENT:-40}
 
@@ -27,6 +27,10 @@ cases=(
 )
 
 benchmark_for() {
+  if [[ -n "${GPUCPG_BENCHMARK_DIR:-}" ]]; then
+    printf '%s/%s.csrbin\n' "$GPUCPG_BENCHMARK_DIR" "$1"
+    return
+  fi
   case "$1" in
     *_base_x8|*_base_x16)
       printf '%s/benchmarks/tc_pfxt_scaled/%s.csrbin\n' "$repo_dir" "$1"

@@ -24,6 +24,10 @@ cases=(
 configs=(gpg_no_arena fixed_defer_no_arena adaptive_production_no_arena)
 
 benchmark_for() {
+  if [[ -n "${GPUCPG_BENCHMARK_DIR:-}" ]]; then
+    printf '%s/%s.csrbin\n' "$GPUCPG_BENCHMARK_DIR" "$1"
+    return
+  fi
   case "$1" in
     *_base_x8|*_base_x16)
       printf '%s/benchmarks/tc_pfxt_scaled/%s.csrbin\n' "$repo_dir" "$1"
@@ -94,8 +98,29 @@ median_pfxt() {
     sort -n | sed -n '2p'
 }
 
-mkdir -p "$out_dir/validation" "$out_dir/timing"
+mkdir -p "$golden_dir" "$out_dir/validation" "$out_dir/timing"
 printf 'timestamp,case,config,state\n' >"$out_dir/gpu_guard.csv"
+
+for case_name in "${cases[@]}"; do
+  benchmark=$(benchmark_for "$case_name")
+  golden="$golden_dir/${case_name}_k1000000.gpg.costs"
+  log="$golden_dir/${case_name}.log"
+  [[ -s "$benchmark" ]]
+  if ! exact_log_complete "$log" || [[ ! -s "$golden" ]]; then
+    wait_for_idle_gpu "$case_name" gpg_golden
+    run_config gpg_no_arena "$exact_bin" --benchmark "$benchmark" \
+      --current-gpg-baseline --baseline-output "$golden" \
+      --ks 1000000 --mode gpg >"$log" 2>&1
+  fi
+  exact_log_complete "$log"
+  [[ -s "$golden" ]]
+  printf 'golden_complete case=%s\n' "$case_name"
+done
+
+if [[ "${GPUCPG_GOLDEN_ONLY:-0}" == 1 ]]; then
+  date --iso-8601=seconds >"$out_dir/GOLDENS_COMPLETE"
+  exit 0
+fi
 
 for case_name in "${cases[@]}"; do
   benchmark=$(benchmark_for "$case_name")

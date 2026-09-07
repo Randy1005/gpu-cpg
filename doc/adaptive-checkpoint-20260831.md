@@ -261,14 +261,61 @@ cmake -S . -B build \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.1/bin/nvcc \
   -DCMAKE_CUDA_ARCHITECTURES=120
 cmake --build build -j8 --target \
-  tc-pfxt-inprocess-exactness tc-pfxt-inprocess-timing tc_pfxt_candidates
+  tc-pfxt-inprocess-exactness tc-pfxt-inprocess-timing tc_pfxt_candidates \
+  convert-timing-edges densify dump-csr-bin
 ctest --test-dir build --output-on-failure
 ```
 
 For another GPU, replace `120` with its compute capability and establish new
 baselines.
 
-### 2. Select the arena-disabled production configuration
+### 2. Acquire and deterministically prepare the benchmark artifact
+
+The 43 campaign inputs are generated data and are intentionally not stored in
+Git. Reproduction nevertheless requires the eight original `.edges` files.
+They total approximately 8.1 GB, so they must be published as a versioned
+release/archival artifact rather than silently assumed to exist on the author's
+filesystem. Until that archive has a stable public URL and redistribution terms,
+an external user cannot reproduce the reported suite from this repository alone.
+
+After downloading the archive, place these files in `benchmark-originals/`:
+
+```text
+M6.edges               leon2.edges       nlpkkt120.edges
+cage15.edges           leon3mp.edges     vga_lcd.edges
+des_perf.edges         netcard.edges
+```
+
+The committed `doc/benchmark-originals-20260907.sha256` manifest identifies the
+exact inputs used for the paper. Prepare all 43 derived CSR binaries with:
+
+```bash
+export GPUCPG_BUILD_DIR=$PWD/build
+scripts/prepare_reproduction_benchmarks.sh \
+  "$PWD" "$PWD/benchmark-originals" "$PWD/benchmarks/reproduction"
+export GPUCPG_BENCHMARK_DIR=$PWD/benchmarks/reproduction/csrbin
+```
+
+The preparation workflow is deterministic and performs the following steps:
+
+1. verifies every original SHA-256 digest;
+2. selects the minimum usable value from each eight-corner timing row and
+   collapses parallel directed edges by their minimum weight;
+3. generates degrees 10, 20, 30, 40, and 50 with densification seed `1`;
+4. generates x8/x16 task graphs with seed `289`, weight jitter `0.15`, and
+   macro-edge probability `0.35`;
+5. writes source-major `.csrbin` files and a generated SHA-256 manifest.
+
+Do not use somebody else's golden costs as the correctness authority. Generate
+fresh GPG K=1M goldens from these verified CSR binaries:
+
+```bash
+export GPUCPG_GOLDEN_DIR=$PWD/experiments/reproduction-goldens
+GPUCPG_GOLDEN_ONLY=1 scripts/run_no_arena_algorithm_suite.sh \
+  "$PWD" "$PWD/experiments/reproduction-golden-generation"
+```
+
+### 3. Select the arena-disabled production configuration
 
 `--mode adaptive` enables the source-local compact-deviation path and
 adaptive deferral. Candidate arenas must be absent:
@@ -294,26 +341,26 @@ The corresponding force variables
 `GPUCPG_ADAPTIVE_PFXT_WARP_AGGREGATE_GROUP_FILL` are diagnostic controls,
 not required production flags.
 
-### 3. Validate before timing
+### 4. Validate before timing
 
 ```bash
-export GPUCPG_GOLDEN_DIR=$PWD/experiments/gpg-goldens
-mkdir -p "$GPUCPG_GOLDEN_DIR"
+export GPUCPG_BENCHMARK_DIR=$PWD/benchmarks/reproduction/csrbin
+export GPUCPG_GOLDEN_DIR=$PWD/experiments/reproduction-goldens
 
 # Skip golden generation when this exact graph/K golden already exists.
 build/examples/tc-pfxt-inprocess-exactness \
-  --benchmark experiments/binary_graph_cache_20260826/netcard_d50.csrbin \
+  --benchmark "$GPUCPG_BENCHMARK_DIR/netcard_d50.csrbin" \
   --current-gpg-baseline \
   --baseline-output "$GPUCPG_GOLDEN_DIR/netcard_d50_k1000000.gpg.costs" \
   --ks 1000000 --mode gpg
 
 build/examples/tc-pfxt-inprocess-exactness \
-  --benchmark experiments/binary_graph_cache_20260826/netcard_d50.csrbin \
+  --benchmark "$GPUCPG_BENCHMARK_DIR/netcard_d50.csrbin" \
   --baseline-file "$GPUCPG_GOLDEN_DIR/netcard_d50_k1000000.gpg.costs" \
   --ks 1000000 --mode gpg-deferred
 
 build/examples/tc-pfxt-inprocess-exactness \
-  --benchmark experiments/binary_graph_cache_20260826/netcard_d50.csrbin \
+  --benchmark "$GPUCPG_BENCHMARK_DIR/netcard_d50.csrbin" \
   --baseline-file "$GPUCPG_GOLDEN_DIR/netcard_d50_k1000000.gpg.costs" \
   --ks 1000000 --mode adaptive
 ```
@@ -322,7 +369,7 @@ Require `INPROCESS EXACTNESS PASS` for both non-baseline modes. Reject output
 containing `capacity_retry`, `overflow`, `fallback`, or a candidate
 slot-limit error before measuring performance.
 
-### 4. Run the complete three-way suite
+### 5. Run the complete three-way suite
 
 ```bash
 export GPUCPG_BUILD_DIR=$PWD/build
@@ -335,7 +382,7 @@ controls, waits for an idle GPU before each standalone process, validates all
 three modes, and then runs one warmup plus three measured trials. It is
 resumable and emits `full_suite.csv` with the three PFXT medians and speedups.
 
-### 5. Reproduce the lightweight breakdown
+### 6. Reproduce the lightweight breakdown
 
 Use the same arena-free adaptive mode, but enable only the lightweight CUDA
 event collector. Do not also set `GPUCPG_ADAPTIVE_PFXT_PROFILE_PHASES`: that
@@ -344,7 +391,7 @@ heavy profiler adds synchronization and disables the light collector.
 ```bash
 GPUCPG_ADAPTIVE_PFXT_LIGHT_STAGE_PROFILE=1 \
 build/examples/tc-pfxt-inprocess-exactness \
-  --benchmark experiments/binary_graph_cache_20260826/leon2_d30.csrbin \
+  --benchmark "$GPUCPG_BENCHMARK_DIR/leon2_d30.csrbin" \
   --baseline-file "$GPUCPG_GOLDEN_DIR/leon2_d30_k1000000.gpg.costs" \
   --ks 1000000 --mode adaptive
 ```
