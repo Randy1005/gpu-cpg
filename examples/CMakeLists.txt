@@ -29,6 +29,7 @@ add_executable(tc-pfxt-gate4-step1 ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-gate4-step1.cu)
 add_executable(tc-pfxt-gate5 ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-gate5.cu)
 add_executable(tc-pfxt-inprocess-timing ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-inprocess-timing.cu)
 add_executable(tc-pfxt-inprocess-exactness ${GPUCPG_EXAMPLE_DIR}/tc-pfxt-inprocess-exactness.cu)
+add_executable(pfxt-level-baseline ${GPUCPG_EXAMPLE_DIR}/pfxt-level-baseline.cu)
 add_executable(sptc-incremental-replay ${GPUCPG_EXAMPLE_DIR}/sptc-incremental-replay.cu)
 
 set(CUSPARSELT_ROOT "" CACHE PATH "Local cuSPARSELt installation")
@@ -76,6 +77,7 @@ list(APPEND GPUCPG_EXAMPLES
   tc-pfxt-gate5
   tc-pfxt-inprocess-timing
   tc-pfxt-inprocess-exactness
+  pfxt-level-baseline
   sptc-incremental-replay
   tc-sfxt-bvss-check)
 
