@@ -28,7 +28,8 @@ is discarded, it already has `K` retained costs no larger than itself. Inserting
 new costs cannot make it relevant to the `K`-th rank later. Thus each update
 sorts the retained `K` values plus only the new append-only SHORT suffix; it
 does not rescan all paths ever generated. The stored logical payload is `4*K`
-bytes: 4 MiB at K=1M.
+bytes: 4 MB (about 3.81 MiB) at K=1,000,000. Update-time storage also includes
+the newly appended costs and temporary sorting/allocation workspace.
 
 Candidate slacks use a cached float recurrence `child = parent + delta`. The
 minimum cached delta `d` is reduced on GPU. For `d >= 0`, `U` itself is safe.

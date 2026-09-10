@@ -4,6 +4,7 @@
 #include <thrust/transform.h>
 #include <thrust/transform_reduce.h>
 #include <cmath>
+#include <cfloat>
 #include <limits>
 #include <stdexcept>
 #include <cstring>
@@ -20,9 +21,7 @@ inline bool enabled(const char* value, bool default_value = true) {
 // Reject the entire numerical domain if any cached delta is non-finite.
 struct CheckedDelta {
   __host__ __device__ float operator()(float value) const {
-    return value <= std::numeric_limits<float>::max()
-        && value >= -std::numeric_limits<float>::max()
-      ? value : -std::numeric_limits<float>::infinity();
+    return value <= FLT_MAX && value >= -FLT_MAX ? value : -INFINITY;
   }
 };
 

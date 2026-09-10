@@ -4,6 +4,7 @@
 #include "tc_pfxt_bvss.cuh"
 #include "tc_pfxt_adaptive.cuh"
 #include "tc_pfxt_candidates.cuh"
+#include "strip24.cuh"
 #include "tc_pfxt_family_capture.cuh"
 #include "tc_pfxt_mma_dispatch.cuh"
 #include <thrust/scan.h>
@@ -8913,6 +8914,7 @@ struct AddTcPfxtInDiscoveryStats {
 };
 
 struct TcPfxtScratch {
+  strip24::Queue strip_queue;
   int source_local_epoch_counter = 0;
   int adaptive_stable_mode_windows = 0;
   int adaptive_fast_lane_windows_since_audit = 0;
@@ -11867,9 +11869,12 @@ static void tc_pfxt_expand_window_single_pass(
       scratch.adaptive_fast_lane_mode = tc_pfxt::AdaptiveMode::UNINITIALIZED;
     }
   }
+  const bool strip_requested = adaptive_defer_requested
+    && get_env_int_or_default("GPUCPG_STRIP24",0)>0;
+  const int strip_minimum = std::clamp(get_env_int_or_default("GPUCPG_STRIP24_MIN_LONG",4),2,32);
   if (adaptive_defer_requested) {
     source_local_stats.resize(1);
-    adaptive_scalar_state.resize(3);
+    adaptive_scalar_state.resize(strip_requested?5:3);
     adaptive_ordinary_safe_state.resize(1);
   }
   bool reached_k_after_window = short_pile_size >= k;
@@ -12122,7 +12127,18 @@ static void tc_pfxt_expand_window_single_pass(
         adaptive_scalar_state.begin(),
         adaptive_scalar_state.end(),
         0);
-      count_tc_pfxt_adaptive_scalar_candidates
+      const bool strip_active=strip_requested && !skip_long_this_substep;
+      auto strip_input=[&](bool skip){
+        return strip24::Input{thrust::raw_pointer_cast(current_v.data()),n_active,
+          d_succs,d_next_dev_vertex,source_local_dev_offsets,source_local_dev_dsts,
+          source_local_dev_deltas,source_local_dev_reachable,
+          thrust::raw_pointer_cast(short_pile.data()),long_pile.empty()?nullptr:thrust::raw_pointer_cast(long_pile.data()),
+          window_start,split,final_split,use_final_split,skip,
+          thrust::raw_pointer_cast(defer_oracle_state.data()),strip_minimum};
+      };
+      if(strip_active)strip24::produce<true><<<std::max(1,ROUNDUPBLOCKS(n_active,256)),256>>>(
+        strip_input(skip_long_this_substep),thrust::raw_pointer_cast(adaptive_scalar_state.data()));
+      else count_tc_pfxt_adaptive_scalar_candidates
         <<<std::max(1, ROUNDUPBLOCKS(n_active, 256)), 256>>>(
           thrust::raw_pointer_cast(current_v.data()),
           n_active,
@@ -12141,11 +12157,11 @@ static void tc_pfxt_expand_window_single_pass(
           thrust::raw_pointer_cast(adaptive_scalar_state.data()));
       cudaCheckErrors("tc pfxt adaptive scalar count failed");
 
-      int h_scalar_state[3] {};
+      int h_scalar_state[5] {};
       cudaMemcpy(
         h_scalar_state,
         thrust::raw_pointer_cast(adaptive_scalar_state.data()),
-        sizeof(h_scalar_state),
+        (strip_requested?5:3)*sizeof(int),
         cudaMemcpyDeviceToHost);
       cudaCheckErrors("tc pfxt adaptive scalar state copy failed");
       adaptive_ordinary_this_substep = h_scalar_state[0] != 0;
@@ -12184,7 +12200,7 @@ static void tc_pfxt_expand_window_single_pass(
             << " selected=" << (final_window_capacity_gate ? 1 : 0)
             << '\n';
         }
-        if (scratch.deferred_lpq_remaining == 0
+        if (scratch.deferred_lpq_remaining == 0 && scratch.strip_queue.remaining==0 && h_scalar_state[3]==0
             && final_window_capacity_gate) {
           const int num_short_paths_needed =
             k - (short_pile_size + h_short_added);
@@ -12240,7 +12256,7 @@ static void tc_pfxt_expand_window_single_pass(
           cudaMemcpy(
             h_scalar_state,
             thrust::raw_pointer_cast(adaptive_scalar_state.data()),
-            sizeof(h_scalar_state),
+            (strip_requested?5:3)*sizeof(int),
             cudaMemcpyDeviceToHost);
           cudaCheckErrors("adaptive final-window recount copy failed");
           if (h_scalar_state[0] == 0) {
@@ -12270,7 +12286,10 @@ static void tc_pfxt_expand_window_single_pass(
         const int base_short = short_pile_size;
         const int base_long = long_pile_size;
         const int short_capacity = base_short + h_short_added;
-        const int long_capacity = base_long + h_long_added;
+        const int packed=strip_active&&fill_longs?h_scalar_state[4]:0;
+        const int pack_count=strip_active&&fill_longs?h_scalar_state[3]:0;
+        const int pack_base=pack_count?scratch.strip_queue.append(pack_count,packed):0;
+        const int long_capacity = base_long + h_long_added-packed;
         short_pile.resize(short_capacity);
         if (fill_longs && h_long_added > 0) {
           long_pile.resize(long_capacity);
@@ -12282,7 +12301,11 @@ static void tc_pfxt_expand_window_single_pass(
           base_long,
           thrust::raw_pointer_cast(overflow.data()));
         cudaCheckErrors("tc pfxt adaptive scalar reset tails failed");
-        fill_tc_pfxt_adaptive_scalar_candidates
+        if(strip_active)strip24::produce<false><<<std::max(1,ROUNDUPBLOCKS(n_active,256)),256>>>(
+          strip_input(!fill_longs),thrust::raw_pointer_cast(adaptive_scalar_state.data()),
+          strip24::Queue::ptr(scratch.strip_queue.records),pack_base,pack_count,
+          d_tail_short,d_tail_long,short_capacity,long_capacity,thrust::raw_pointer_cast(overflow.data()));
+        else fill_tc_pfxt_adaptive_scalar_candidates
           <<<std::max(1, ROUNDUPBLOCKS(n_active, 256)), 256>>>(
             thrust::raw_pointer_cast(current_v.data()),
             n_active,
@@ -16330,6 +16353,7 @@ static void tc_pfxt_expand_window_single_pass(
     long_pile_size = 0;
     scratch.deferred_lpq_tiles.clear();
     scratch.deferred_lpq_remaining = 0;
+    scratch.strip_queue.clear();
     h_num_long_paths = 0;
   }
   else {
@@ -20297,7 +20321,7 @@ void CpGen::report_paths(
         // to expand, we have to update the split value
         // and move paths from the long pile to the short pile
         if ((long_pile_size == 0
-              && tc_pfxt_scratch.deferred_lpq_remaining == 0)
+              && tc_pfxt_scratch.deferred_lpq_remaining == 0 && tc_pfxt_scratch.strip_queue.remaining==0)
             || short_pile_size >= k) {
           break;
         }
@@ -20306,6 +20330,7 @@ void CpGen::report_paths(
         int materialized_promoted_count = 0;
         int compressed_promoted_count = 0;
         int deferred_promoted_count = 0;
+        int strip_promoted_count = 0;
         while (h_num_short_paths == 0) {
           if (short_long_expansion_steps == 1) {
             std::cout << "first split update. use min slack plus some delta from long pile.\n";
@@ -20328,6 +20353,7 @@ void CpGen::report_paths(
             if (enable_tc_pfxt_deferred_tile_lpq) {
               min_slack = std::min(min_slack, deferred_lpq_min_slack_device());
             }
+            min_slack=std::min(min_slack,tc_pfxt_scratch.strip_queue.minimum());
             // h_split = min.slack+8*split_inc_amount;
             h_split = std::max(min_slack+split_inc_amount, h_split+split_inc_amount);
           }
@@ -20360,12 +20386,15 @@ void CpGen::report_paths(
           materialized_promoted_count = materialized_promoted;
           compressed_promoted_count = compressed_promoted;
           deferred_promoted_count = deferred_promoted;
+          strip_promoted_count=tc_pfxt_scratch.strip_queue.count(h_split,
+            thrust::raw_pointer_cast(short_pile.data()),
+            thrust::raw_pointer_cast(tc_pfxt_compact_static_devs.deltas.data()));
           h_num_short_paths =
-            materialized_promoted + compressed_promoted + deferred_promoted;
+            materialized_promoted + compressed_promoted + deferred_promoted + strip_promoted_count;
           h_num_long_paths =
             materialized_long_remaining
             + static_cast<int>(tc_pfxt_scratch.deferred_lpq_remaining)
-            - deferred_promoted;
+            - deferred_promoted + static_cast<int>(tc_pfxt_scratch.strip_queue.remaining)-strip_promoted_count;
         }
 
         // up-size the short pile
@@ -20415,6 +20444,13 @@ void CpGen::report_paths(
         }
         gpucpg_nvtx_pop();
 
+        if(strip_promoted_count){
+          int emitted=tc_pfxt_scratch.strip_queue.fill(h_split,thrust::raw_pointer_cast(short_pile.data()),
+            thrust::raw_pointer_cast(tc_pfxt_compact_static_devs.dsts.data()),
+            thrust::raw_pointer_cast(tc_pfxt_compact_static_devs.deltas.data()),
+            h_window_end+materialized_promoted_count+compressed_promoted_count+deferred_promoted_count);
+          if(emitted!=strip_promoted_count)throw std::runtime_error("strip24 promotion count mismatch");
+        }
         // update the expansion window end (window start stays the same)
         h_window_end += h_num_short_paths;
 
@@ -20429,6 +20465,7 @@ void CpGen::report_paths(
           tc_pfxt_scratch.compressed_lpq_parents.clear();
           tc_pfxt_scratch.deferred_lpq_tiles.clear();
           tc_pfxt_scratch.deferred_lpq_remaining = 0;
+          tc_pfxt_scratch.strip_queue.clear();
           long_pile_size = 0;
         }
         else {
@@ -20762,6 +20799,9 @@ void CpGen::report_paths(
           << '\n';
       }
     }
+    if(get_env_int_or_default("GPUCPG_STRIP24",0)>0)std::cout<<"strip24_summary created="
+      <<tc_pfxt_scratch.strip_queue.created<<" represented="<<tc_pfxt_scratch.strip_queue.represented
+      <<" promoted="<<tc_pfxt_scratch.strip_queue.promoted_total<<'\n';
     std::cout << "pfxt expansion completed in " << timer.get_elapsed_time()/1ms << " ms.\n";
 
     if (std::getenv("GPUCPG_ADAPTIVE_PFXT_ADAPTIVE_DEFER") != nullptr

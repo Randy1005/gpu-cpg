@@ -146,6 +146,7 @@ int main(int argc, char* argv[]) {
         << " pfxt_ms=" << run.pfxt_ms
         << " query_ms=" << run.query_ms
         << " pass=" << (cmp.pass ? 1 : 0)
+        << " generated_paths=" << cpgen.total_gen_paths
         << '\n';
       all_pass = all_pass && cmp.pass;
       gpucpg::tc_pfxt_inprocess::cleanup_cuda_between_runs(
