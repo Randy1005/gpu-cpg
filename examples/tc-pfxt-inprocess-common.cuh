@@ -47,6 +47,7 @@ inline RunMode parse_run_mode(const std::string& mode) {
 struct RunResult {
   std::vector<float> costs;
   double pfxt_ms = 0.0;
+  double query_ms = 0.0;
 };
 
 struct CompareResult {
@@ -191,6 +192,7 @@ inline RunResult run_paths(CpGen& cpgen, const int k, const RunMode mode) {
   configure_run_mode(mode);
 
   cpgen.reset();
+  const auto query_start = std::chrono::steady_clock::now();
   cpgen.report_paths(
     k,
     10,
@@ -209,6 +211,8 @@ inline RunResult run_paths(CpGen& cpgen, const int k, const RunMode mode) {
     false);
 
   RunResult result;
+  result.query_ms = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - query_start).count();
   result.pfxt_ms = short_long_pfxt_ms(cpgen);
   result.costs = cpgen.get_slacks(k);
   configure_run_mode(RunMode::GPG);

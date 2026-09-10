@@ -1,4 +1,5 @@
 #include "gpucpg.cuh"
+#include "adaptive_path_bound.cuh"
 #include "sptc_gate_metrics.cuh"
 #include "tc_pfxt_bvss.cuh"
 #include "tc_pfxt_adaptive.cuh"
@@ -18591,9 +18592,24 @@ void CpGen::report_paths(
     // determine the initial split by picking the slack at the top N percentile
     // (default=0.005 --> top 0.5%)
     auto h_split = tmp_paths[init_split_perc*short_pile_size].slack;
+    const bool bound_requested = adaptive_bound::enabled(std::getenv("GPUCPG_ADAPTIVE_PFXT_BOUND"))
+      && enable_tc_pfxt && enable_tc_pfxt_single_pass
+      && enable_tc_pfxt_source_local_candidate && enable_tc_pfxt_compact_static_devs
+      && std::getenv("GPUCPG_ADAPTIVE_PFXT_ADAPTIVE_DEFER") != nullptr;
+    const bool bound_profile = adaptive_bound::enabled(
+      std::getenv("GPUCPG_ADAPTIVE_PFXT_BOUND_PROFILE"), false);
+    adaptive_bound::Reservoir path_bound;
+    bool bound_disabled = false, bound_domain_checked = false;
+    const char* bound_reason = "none";
+    float bound_minimum = 0, bound_first = 0, bound_last = 0, bound_guard = 0;
+    int bound_updates = 0;
+    double bound_maintenance_ms = 0;
     std::cout << "init_split=" << h_split << '\n';
 
-    int h_num_short_paths = init_split_perc*short_pile_size+1;
+    // Inclusive partition count must include ALL roots tied at the split.
+    // A percentile index truncates valid roots and leaves default LONG nodes.
+    int h_num_short_paths = std::upper_bound(tmp_paths.begin(), tmp_paths.end(), h_split,
+      [](float cutoff, const PfxtNode& node) { return cutoff < node.slack; }) - tmp_paths.begin();
     int h_num_long_paths = short_pile_size-h_num_short_paths;
 
     long_pile_size = h_num_long_paths;
@@ -19375,6 +19391,54 @@ void CpGen::report_paths(
 	        cudaDeviceSynchronize();
 	        Timer step_timer;
 	        step_timer.start();
+            if (bound_requested && !bound_disabled && short_pile_size >= k) {
+              Timer maintenance;
+              maintenance.start();
+              if (!bound_domain_checked) {
+                const auto& deltas = tc_pfxt_compact_static_devs.deltas;
+                if (deltas.empty()) {
+                  bound_disabled = true;
+                  bound_reason = "no_cached_deviations";
+                } else {
+                  bound_minimum = adaptive_bound::minimum_delta(deltas);
+                  if (!std::isfinite(bound_minimum)) {
+                    bound_disabled = true;
+                    bound_reason = "nonfinite_deviation";
+                  }
+                }
+                bound_domain_checked = true;
+              }
+              if (!bound_disabled) {
+                try {
+                  bound_last = path_bound.update(thrust::raw_pointer_cast(short_pile.data()), short_pile_size, k);
+                  bound_guard = adaptive_bound::safe_cutoff(bound_last, bound_minimum, graph_diameter);
+                  if (bound_updates++ == 0) bound_first = bound_last;
+                  if (!std::isfinite(bound_guard)) {
+                    bound_disabled = true;
+                    bound_reason = "unsupported_cost_domain";
+                    path_bound.release();
+                  } else if (bound_guard < h_split) {
+                    h_split = bound_guard;
+                    final_split = h_split;
+                    final_window_size = 0;
+                  }
+                } catch (const std::bad_alloc&) {
+                  // This optional optimization must not turn a feasible query
+                  // into OOM or restart it. The previous cutoff stays valid.
+                  cudaGetLastError();
+                  path_bound.release();
+                  bound_disabled = true;
+                  bound_reason = "allocation_failed";
+                }
+              }
+              cudaDeviceSynchronize();
+              maintenance.stop();
+              bound_maintenance_ms += maintenance.get_elapsed_time().count() / 1000.0;
+              if (bound_profile) std::cout << std::setprecision(9)
+                << "adaptive_bound_update outer_step=" << curr_step
+                << " materialized=" << short_pile_size << " upper=" << bound_last
+                << " guarded=" << bound_guard << " split=" << h_split << '\n';
+            }
 	        int num_blks = ROUNDUPBLOCKS(curr_expansion_window_size, BLOCKSIZE);
 	        if (enable_tc_pfxt) {
 	          const bool skip_long_paths = short_pile_size >= k;
@@ -19795,6 +19859,19 @@ void CpGen::report_paths(
       }
       else {
 	        // record the paths generated per step
+            if (bound_requested && short_pile_size >= k) {
+              Timer release;
+              release.start();
+              path_bound.release();
+              cudaDeviceSynchronize();
+              release.stop();
+              curr_step_cuda_time += release.get_elapsed_time();
+              bound_maintenance_ms += release.get_elapsed_time().count() / 1000.0;
+              std::cout << std::setprecision(9) << "adaptive_bound_summary updates=" << bound_updates
+                << " first_upper=" << bound_first << " last_upper=" << bound_last
+                << " last_guard=" << bound_guard << " maintenance_ms=" << bound_maintenance_ms
+                << " disabled_reason=" << bound_reason << '\n';
+            }
 	        const auto curr_step = short_long_expansion_steps + 1;
 	        const auto curr_step_paths = short_pile_size-prev_step_short_pile_size;
 	        const auto curr_step_breakdown =

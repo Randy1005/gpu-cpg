@@ -144,6 +144,7 @@ int main(int argc, char* argv[]) {
         << " max_diff_rank=" << cmp.max_diff_rank
         << " first_mismatch_rank=" << cmp.first_mismatch_rank
         << " pfxt_ms=" << run.pfxt_ms
+        << " query_ms=" << run.query_ms
         << " pass=" << (cmp.pass ? 1 : 0)
         << '\n';
       all_pass = all_pass && cmp.pass;
