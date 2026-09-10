@@ -38,4 +38,4 @@ for case in cases:
     for key in ('pfxt_ms','cold_setup_pfxt_ms','query_ms'):
         out[f'{key}_speedup']=out[f'{key}_0']/out[f'{key}_1']
     summary.append(out)
-writer=csv.DictWriter(sys.stdout,fieldnames=list(summary[0]));writer.writeheader();writer.writerows(summary)
+writer=csv.DictWriter(sys.stdout,fieldnames=list(summary[0]),lineterminator='\n');writer.writeheader();writer.writerows(summary)
