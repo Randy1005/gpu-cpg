@@ -1,14 +1,22 @@
-# Strip24 + tight-bound: less storage, less unnecessary path generation
+# Adaptive deferral, Strip24 and tight-bound: isolating where the gains come from
 
-**Review draft — published for review, not finalized.** The code checkpoint
-is pushed on `strip24-production` at `156fe0f`. This document uses the completed
-43-case four-way run: all 688 correctness/timing checks passed. Its tables
-include cold setup + PFXT and are not assembled from older, unmatched studies.
+**Updated review draft — RTX 5090, K=1,000,000.** The primary evidence is now
+the completed controlled study: **1,032 timed queries and 32 traffic profiles,
+all passing correctness and workload checks**. Every runtime includes cold
+static setup + PFXT; graph-file loading and SFXT are excluded. Candidate arenas
+are disabled throughout.
 
-The main story is complementary: **Strip24 avoids writing many not-yet-needed
-LONG nodes; tight-bound reduces further generation once K valid cost witnesses
-exist.** Neither promises a win on every graph. Across this suite, the successive
-geometric-mean speedups over GPG are 1.465x, 1.975x and 2.406x.
+The presentation story is: **bundle waiting paths across parents (204 bytes),
+cover the ordinary branch's waiting children too (Strip24), then avoid
+unnecessary later generation (tight-bound).** The first two save storage and
+traffic; the last reduces work. Their contributions are measured separately,
+not inferred from the total speedup over GPG.
+
+Across all 43 graphs, the sequential geometric-mean speedups are **1.044x
+for adding 204-byte deferral, 1.313x for adding Strip24, and 1.208x for enabling
+tight-bound**. Combined: **1.657x over the same optimized pipeline with neither
+format and no tight-bound**. This is **not a 1.657x comparison against GPG**,
+and it includes regressions and cases with little packing opportunity.
 
 ## 1. Why another descriptor?
 
@@ -113,6 +121,14 @@ record sets only those four bits. SHORT positions are emitted immediately;
 SKIP positions are not stored. A source with more than 32 deviations is covered
 by multiple slices. Each slice must independently meet the packing threshold.
 
+The range is contiguous in the **deviation CSR**, not necessarily in its LONG
+subset. For example, `begin=200, length=8` plus bits 1, 3, 4 and 6 represents
+children using CSR entries 201, 203, 204 and 206. No reordering is required.
+The `minimum` is the cheapest still-waiting child: if it exceeds the working
+cutoff, the consumer need not inspect the strip's individual children. It is
+updated after promotion. The 32-position limit permits one 32-bit bitmap;
+it is a practical design choice, not a demonstrated optimum over 64/128.
+
 ### Recovering exact paths later
 
 If the cutoff rises from 1.5 to 3.2, the LONG children with costs 2.1 and 3.1
@@ -156,8 +172,10 @@ At a later split update, the consumer:
 These operations do introduce consumer kernels and scratch storage. They are
 included in the measured PFXT time. A strip is worthwhile when avoided node
 writes and LONG-queue handling repay its construction and replay costs.
-The implementation also changes producer count aggregation; the measured win
-is the combined pipeline change, not a pure byte-count-only experiment.
+The original production integration also changed producer count aggregation.
+The new controlled study below holds that producer and aggregation fixed in
+all variants, so toggling a format measures its net storage/consumer benefit,
+including its allocation, replay and bookkeeping costs.
 
 ## 4. Tight-bound: stop exploring paths we can already prove are too expensive
 
@@ -218,204 +236,401 @@ produced at least K valid witnesses, possibly overshooting K substantially.
 This is why the final stored-candidate count need not approach exactly K even
 when later pruning is effective.
 
-## 5. Four-way performance
+## 5. Controlled progression: which addition bought the speedup?
 
-All times are **cold static setup + PFXT**, in milliseconds; RTX 5090, K=1,000,000, candidate arena disabled. Each entry is the median of three standalone runs. Parentheses show speedup over GPG in the same row. Graph-file loading and SFXT are excluded from every column.
+### Four stages of the same pipeline
 
-The two intermediate adaptive columns have tight-bound explicitly **disabled**. Only the final column enables both Strip24 and tight-bound. Each variant uses the same current graph and GPG golden.
+| Stage | Name used below | What changes from the previous stage? |
+|---|---|---|
+| A | No descriptors | Shared optimized adaptive machinery, but LONG outputs become individual nodes; bound off |
+| B | Adaptive-defer (204) | Enable multi-parent 204-byte descriptors |
+| C | +Strip24 | Also pack selected LONG children in the ordinary branch |
+| D | +Tight-bound | Keep both formats and enable certified bound tightening |
 
-### Original circuits
+The A→B comparison isolates the **net benefit of the 204-byte representation**
+within this framework; it does not claim to isolate the invention of adaptive
+grouping itself. Source-local layout, grouping machinery, adaptive decisions,
+ordinary producer/count aggregation and warp aggregation are held fixed.
+Rejected packs become individual LONG nodes. B→C isolates Strip24, and C→D
+isolates tightening with representation held fixed.
 
-| Benchmark | GPG | Adaptive 204 | Adaptive 204 + Strip24 | Adaptive 204 + Strip24 + bound |
+Two controls are essential. The experiment disables the materialized-LONG-only
+final-window shortcut in **every** variant, so toggling packing does not change
+its search policy. It also forces full adaptive statistics in every variant.
+The production safe-ordinary precheck uses a capped grid without a grid-stride
+loop; its queue-order-dependent prefix inspection changed whether stats were
+skipped on leon2 x8. The first attempt stopped at that comparison gate. The
+corrected study bypasses the shortcut uniformly rather than changing production
+defaults. Both generation branches still use exact candidate predicates.
+
+Consequently these are **controlled diagnostic timings, not replacement
+production-default headlines**. All four packing configurations, including
+Strip24-only, were tested with bound off/on. Within each bound setting, every
+window's split/output counts, recorded adaptive decisions, final candidate
+count and total initial LONG storage agree. Bound off/on intentionally allows
+different work: pruning is the intended benefit.
+
+### Full-suite progression
+
+Times are median **cold setup + PFXT in ms** over three standalone trials.
+**Each parenthesized speedup compares with the immediately preceding column**,
+not with GPG or stage A. Below 1 means a slowdown. Counts and unrounded times,
+including trial ranges, are retained in the [full ablation CSV](descriptor-ablation-20260910.csv).
+The [presentation progression CSV](descriptor-progression-20260910.csv)
+contains these four stages and their incremental/cumulative speedups.
+
+#### Original circuits
+
+| Benchmark | A: No descriptors | B: Adaptive-defer (204) | C: +Strip24 | D: +Tight-bound |
 |---|---:|---:|---:|---:|
-| netcard | 7.523 | 7.674 (0.98x) | 6.982 (1.08x) | 7.409 (1.02x) |
-| leon2 | 12.149 | 10.254 (1.18x) | 9.940 (1.22x) | 9.561 (1.27x) |
-| leon3mp | 14.160 | 12.596 (1.12x) | 11.872 (1.19x) | 11.384 (1.24x) |
-| des_perf | 25.024 | 26.155 (0.96x) | 27.365 (0.91x) | 28.330 (0.88x) |
-| vga_lcd | 7.770 | 8.442 (0.92x) | 8.492 (0.91x) | 9.477 (0.82x) |
+| netcard | 6.981 | 6.971 (1.001x) | 6.513 (1.070x) | 7.059 (0.923x) |
+| leon2 | 9.573 | 9.508 (1.007x) | 9.106 (1.044x) | 9.177 (0.992x) |
+| leon3mp | 11.727 | 11.714 (1.001x) | 11.184 (1.047x) | 10.979 (1.019x) |
+| des_perf | 26.866 | 26.745 (1.004x) | 27.503 (0.972x) | 29.022 (0.948x) |
+| vga_lcd | 7.946 | 7.994 (0.994x) | 8.395 (0.952x) | 9.360 (0.897x) |
 
-### Densified circuits
+#### Densified circuits
 
-| Benchmark | GPG | Adaptive 204 | Adaptive 204 + Strip24 | Adaptive 204 + Strip24 + bound |
+| Benchmark | A: No descriptors | B: Adaptive-defer (204) | C: +Strip24 | D: +Tight-bound |
 |---|---:|---:|---:|---:|
-| netcard d10 | 39.969 | 34.648 (1.15x) | 17.677 (2.26x) | 16.199 (2.47x) |
-| netcard d20 | 88.660 | 72.545 (1.22x) | 26.672 (3.32x) | 25.001 (3.55x) |
-| netcard d30 | 113.032 | 96.738 (1.17x) | 93.451 (1.21x) | 93.826 (1.20x) |
-| netcard d40 | 161.380 | 109.471 (1.47x) | 109.296 (1.48x) | 98.885 (1.63x) |
-| netcard d50 | 378.871 | 116.351 (3.26x) | 116.585 (3.25x) | 108.354 (3.50x) |
-| leon2 d10 | 55.567 | 43.664 (1.27x) | 38.659 (1.44x) | 37.941 (1.46x) |
-| leon2 d20 | 261.080 | 64.507 (4.05x) | 55.721 (4.69x) | 56.281 (4.64x) |
-| leon2 d30 | 4795.310 | 885.785 (5.41x) | 867.227 (5.53x) | 111.302 (43.08x) |
-| leon2 d40 | 134.679 | 85.578 (1.57x) | 56.944 (2.37x) | 51.806 (2.60x) |
-| leon2 d50 | 149.453 | 122.136 (1.22x) | 119.509 (1.25x) | 112.116 (1.33x) |
-| leon3mp d10 | 84.086 | 77.942 (1.08x) | 36.717 (2.29x) | 24.550 (3.43x) |
-| leon3mp d20 | 91.748 | 66.567 (1.38x) | 34.550 (2.66x) | 27.978 (3.28x) |
-| leon3mp d30 | 125.008 | 91.476 (1.37x) | 33.214 (3.76x) | 29.478 (4.24x) |
-| leon3mp d40 | 214.129 | 80.523 (2.66x) | 63.803 (3.36x) | 61.001 (3.51x) |
-| leon3mp d50 | 153.543 | 84.928 (1.81x) | 84.468 (1.82x) | 85.678 (1.79x) |
-| des_perf d10 | 78.621 | 42.799 (1.84x) | 28.500 (2.76x) | 15.296 (5.14x) |
-| des_perf d20 | 31.481 | 22.660 (1.39x) | 12.689 (2.48x) | 13.692 (2.30x) |
-| des_perf d30 | 74.017 | 53.115 (1.39x) | 14.767 (5.01x) | 15.550 (4.76x) |
-| des_perf d40 | 94.910 | 72.040 (1.32x) | 71.520 (1.33x) | 72.250 (1.31x) |
-| des_perf d50 | 90.485 | 69.689 (1.30x) | 68.602 (1.32x) | 64.581 (1.40x) |
-| vga_lcd d10 | 48.953 | 38.920 (1.26x) | 17.512 (2.80x) | 16.026 (3.05x) |
-| vga_lcd d20 | 110.221 | 75.962 (1.45x) | 36.446 (3.02x) | 24.284 (4.54x) |
-| vga_lcd d30 | 76.536 | 47.618 (1.61x) | 21.687 (3.53x) | 21.226 (3.61x) |
-| vga_lcd d40 | 99.510 | 94.824 (1.05x) | 37.420 (2.66x) | 26.411 (3.77x) |
-| vga_lcd d50 | 126.615 | 60.966 (2.08x) | 25.470 (4.97x) | 24.724 (5.12x) |
+| netcard d10 | 33.123 | 33.405 (0.992x) | 16.773 (1.992x) | 15.786 (1.063x) |
+| netcard d20 | 70.356 | 70.292 (1.001x) | 25.648 (2.741x) | 24.550 (1.045x) |
+| netcard d30 | 118.362 | 96.048 (1.232x) | 93.382 (1.029x) | 94.053 (0.993x) |
+| netcard d40 | 157.733 | 109.404 (1.442x) | 109.374 (1.000x) | 98.925 (1.106x) |
+| netcard d50 | 142.471 | 116.298 (1.225x) | 116.689 (0.997x) | 109.193 (1.069x) |
+| leon2 d10 | 42.534 | 39.646 (1.073x) | 34.951 (1.134x) | 34.803 (1.004x) |
+| leon2 d20 | 86.802 | 60.415 (1.437x) | 52.341 (1.154x) | 53.358 (0.981x) |
+| leon2 d30 | 874.791 | 871.372 (1.004x) | 856.568 (1.017x) | 103.129 (8.306x) |
+| leon2 d40 | 77.326 | 76.463 (1.011x) | 51.617 (1.481x) | 48.219 (1.070x) |
+| leon2 d50 | 126.538 | 121.358 (1.043x) | 119.178 (1.018x) | 112.010 (1.064x) |
+| leon3mp d10 | 72.093 | 72.107 (1.000x) | 35.208 (2.048x) | 23.748 (1.483x) |
+| leon3mp d20 | 88.335 | 88.138 (1.002x) | 32.990 (2.672x) | 27.469 (1.201x) |
+| leon3mp d30 | 59.405 | 59.509 (0.998x) | 32.071 (1.856x) | 28.948 (1.108x) |
+| leon3mp d40 | 86.315 | 72.871 (1.184x) | 58.580 (1.244x) | 57.894 (1.012x) |
+| leon3mp d50 | 96.094 | 85.099 (1.129x) | 84.253 (1.010x) | 86.149 (0.978x) |
+| des_perf d10 | 40.549 | 40.230 (1.008x) | 27.670 (1.454x) | 14.992 (1.846x) |
+| des_perf d20 | 20.363 | 20.255 (1.005x) | 11.941 (1.696x) | 13.271 (0.900x) |
+| des_perf d30 | 48.564 | 48.525 (1.001x) | 14.262 (3.402x) | 15.128 (0.943x) |
+| des_perf d40 | 96.098 | 71.839 (1.338x) | 71.802 (1.001x) | 71.899 (0.999x) |
+| des_perf d50 | 74.363 | 69.293 (1.073x) | 69.082 (1.003x) | 64.525 (1.071x) |
+| vga_lcd d10 | 30.916 | 30.995 (0.997x) | 16.684 (1.858x) | 15.476 (1.078x) |
+| vga_lcd d20 | 63.374 | 63.094 (1.004x) | 35.144 (1.795x) | 23.440 (1.499x) |
+| vga_lcd d30 | 38.335 | 38.356 (0.999x) | 20.931 (1.833x) | 20.560 (1.018x) |
+| vga_lcd d40 | 81.290 | 81.031 (1.003x) | 35.640 (2.274x) | 25.867 (1.378x) |
+| vga_lcd d50 | 52.536 | 52.654 (0.998x) | 24.687 (2.133x) | 24.132 (1.023x) |
 
-### Scaled circuits
+#### Scaled circuits
 
-| Benchmark | GPG | Adaptive 204 | Adaptive 204 + Strip24 | Adaptive 204 + Strip24 + bound |
+| Benchmark | A: No descriptors | B: Adaptive-defer (204) | C: +Strip24 | D: +Tight-bound |
 |---|---:|---:|---:|---:|
-| netcard x8 | 8.750 | 10.470 (0.84x) | 10.721 (0.82x) | 11.958 (0.73x) |
-| netcard x16 | 33.735 | 22.712 (1.49x) | 22.972 (1.47x) | 18.732 (1.80x) |
-| leon2 x8 | 22.950 | 17.385 (1.32x) | 17.682 (1.30x) | 13.729 (1.67x) |
-| leon2 x16 | 8.568 | 16.433 (0.52x) | 16.769 (0.51x) | 18.399 (0.47x) |
-| leon3mp x8 | 10.247 | 11.601 (0.88x) | 11.960 (0.86x) | 12.227 (0.84x) |
-| leon3mp x16 | 56.488 | 28.028 (2.02x) | 28.264 (2.00x) | 17.793 (3.17x) |
-| des_perf x8 | 12.025 | 8.377 (1.44x) | 8.497 (1.42x) | 8.737 (1.38x) |
-| des_perf x16 | 245.742 | 50.718 (4.85x) | 50.751 (4.84x) | 10.231 (24.02x) |
-| vga_lcd x8 | 28.612 | 18.313 (1.56x) | 14.437 (1.98x) | 11.034 (2.59x) |
-| vga_lcd x16 | 28.295 | 17.918 (1.58x) | 13.479 (2.10x) | 11.079 (2.55x) |
+| netcard x8 | 10.168 | 10.136 (1.003x) | 10.098 (1.004x) | 11.395 (0.886x) |
+| netcard x16 | 21.914 | 22.071 (0.993x) | 22.223 (0.993x) | 18.349 (1.211x) |
+| leon2 x8 | 16.281 | 16.610 (0.980x) | 16.624 (0.999x) | 13.409 (1.240x) |
+| leon2 x16 | 15.956 | 16.219 (0.984x) | 16.385 (0.990x) | 17.832 (0.919x) |
+| leon3mp x8 | 11.025 | 11.159 (0.988x) | 11.431 (0.976x) | 11.887 (0.962x) |
+| leon3mp x16 | 26.858 | 27.278 (0.985x) | 27.326 (0.998x) | 17.338 (1.576x) |
+| des_perf x8 | 7.653 | 7.576 (1.010x) | 7.540 (1.005x) | 8.064 (0.935x) |
+| des_perf x16 | 51.592 | 51.701 (0.998x) | 51.452 (1.005x) | 9.625 (5.346x) |
+| vga_lcd x8 | 14.460 | 14.528 (0.995x) | 13.170 (1.103x) | 10.205 (1.291x) |
+| vga_lcd x16 | 14.690 | 14.861 (0.988x) | 12.434 (1.195x) | 10.389 (1.197x) |
 
-### Non-circuit graphs
+#### Non-circuit graphs
 
-| Benchmark | GPG | Adaptive 204 | Adaptive 204 + Strip24 | Adaptive 204 + Strip24 + bound |
+| Benchmark | A: No descriptors | B: Adaptive-defer (204) | C: +Strip24 | D: +Tight-bound |
 |---|---:|---:|---:|---:|
-| cage15 | 22.814 | 21.597 (1.06x) | 13.711 (1.66x) | 14.535 (1.57x) |
-| M6 | 68.023 | 19.089 (3.56x) | 19.108 (3.56x) | 5.238 (12.99x) |
-| nlpkkt120 | 6.065 | 8.168 (0.74x) | 5.689 (1.07x) | 6.249 (0.97x) |
+| cage15 | 22.554 | 22.510 (1.002x) | 13.406 (1.679x) | 14.255 (0.940x) |
+| M6 | 18.708 | 18.632 (1.004x) | 18.591 (1.002x) | 4.852 (3.832x) |
+| nlpkkt120 | 8.084 | 8.094 (0.999x) | 5.465 (1.481x) | 6.102 (0.896x) |
 
-Geometric-mean speedup over GPG, across all 43 cases: adaptive: 1.465x, strip24: 1.975x, bound: 2.406x.
+### What to emphasize to the audience
 
-### Reading the progression honestly
+- **204-byte win:** netcard d40 improves 157.733→109.404 ms (1.442x).
+  On netcard d50 it improves 142.471→116.298 ms (1.225x); adding Strip24
+  afterward changes little, because almost all stored LONG paths already use 204.
+- **Strip24 win:** netcard d20 improves 70.292→25.648 ms (2.741x);
+  des_perf d30 improves 48.525→14.262 ms (3.402x). These are B→C
+  comparisons with identical expansion workloads, not gains from a changed cutoff.
+- **Both formats help:** leon2 d20 progresses 86.802→60.415→52.341 ms.
+  Neither representation alone captures every useful packing opportunity.
+- **Tight-bound win:** leon2 d30 improves 856.568→103.129 ms (8.306x),
+  des_perf x16 51.452→9.625 ms (5.346x), and M6 18.591→4.852 ms
+  (3.832x), with both descriptor formats held fixed.
+- **Do not hide losses:** original des_perf slows 26.745→27.503 ms when
+  adding Strip24. Tight-bound slows netcard x8 10.098→11.395 ms and
+  nlpkkt120 5.465→6.102 ms. Saved work can be too small to repay maintenance.
+  Tiny changes near 1x are not convincing wins; inspect the CSV's trial ranges.
 
-* Strip24 alone makes netcard d20 fall from 72.545 to 26.672 ms and leon3mp
-  d30 from 91.476 to 33.214 ms. Those intermediate columns both have bound off.
-* Tight-bound then makes leon2 d30 fall from 867.227 to 111.302 ms, des_perf
-  x16 from 50.751 to 10.231 ms, and M6 from 19.108 to 5.238 ms.
-* Fewer candidates are not automatically faster. On des_perf d30, tightening
-  removes only 1,492 additional stored candidates and increases time from
-  14.767 to 15.550 ms. Original vga_lcd also gains little pruning and pays
-  extra maintenance. These regressions remain visible.
-* The complete method is not universally faster than GPG: for example,
-  leon2 x16 is 18.399 versus 8.568 ms, including cold setup. This is separate
-  from the much smaller incremental overhead of adding Strip24 to that case.
+The incremental attribution depends on the chosen order. As a cross-check,
+the full 2×2 experiment also tests Strip24 without 204: with bound off,
+Strip24 alone gives a 1.316x geomean, versus 1.313x when added to 204;
+adding 204 on top of Strip24 gives 1.042x, versus 1.044x without Strip24.
+With bound on, adding Strip24 to 204 gives 1.357x. Do not add percentage
+improvements together or assume every graph benefits equally.
 
-## 6. How close do we get to K?
+### Where the older GPG comparison belongs
 
-Every correct variant returns exactly K results. The counts below are instead the final materialized SHORT-pile candidates **before** final top-K extraction. They are not all symbolic LONG products ever represented. The CSV also records min/max counts across repetitions.
+The earlier production-style four-way study remains available in
+[its original CSV](strip24-fourway-20260910.csv): geomean speedups over GPG
+were 1.465x (adaptive 204), 1.975x (+Strip24), and 2.406x (+bound).
+Those are whole-pipeline comparisons, not pure descriptor attribution.
+The original integration also changed count aggregation and guarded a
+queue-only final-window shortcut; four unbounded cases changed final
+candidate counts (netcard d20 and leon3mp d10/d20/d30).
 
-To isolate tightening, compare the Strip24 column with the Strip24 + bound column: the representation is held fixed. The 204-only count provides additional context.
+The old tables are therefore replaced here by the controlled progression.
+Do not splice old GPG times into the new A→B→C→D chain or attribute the whole
+GPG-to-adaptive gain to descriptors. On des_perf x16, for example, historical
+GPG was 245.742 ms and adaptive 204 was 50.718 ms, but the controlled experiment
+below shows almost no incremental packing benefit. Other pipeline changes
+account for that historical gap; this study does not isolate which ones.
 
-```text
-excess_before = count_with_Strip24 - K
-excess_after  = count_with_Strip24_and_bound - K
-excess reduction = 100% * (1 - excess_after / excess_before)
+## 6. Traffic evidence: does compression actually save memory movement?
+
+These are separate Nsight Compute measurements of **PFXT kernel DRAM reads +
+writes**, in decimal GB. They follow the same A→B→C→D stages as the runtime
+table. They exclude static setup and copy-engine traffic; they are not peak
+memory, allocation capacity, or theoretical record bytes. Each cell is one
+profiled query; standalone timings above are not taken from the profiler.
+
+| Benchmark | A: No descriptors | B: 204 | C: +Strip24 | D: +Tight-bound |
+|---|---:|---:|---:|---:|
+| netcard d10 | 8.580 | 8.578 | 0.894 | 0.920 |
+| netcard d50 | 30.086 | 3.003 | 3.010 | 3.627 |
+| leon2 d30 | 76.701 | 74.862 | 72.034 | 4.619 |
+| des_perf x16 | 27.338 | 27.323 | 27.262 | 0.478 |
+
+**Three useful studies for slides:**
+
+1. **Compression works, but traffic is not runtime.** On netcard d10, B→C
+   cuts traffic 89.58% and improves runtime 1.992x. On netcard d50, A→B
+   cuts traffic 90.02%, yet improves runtime only 1.225x. The latter still
+   executes substantial other work: profiled kernel count rises from 9,769
+   to 10,405. We have established traffic savings, not a proportional
+   bandwidth-bound runtime model or the exact cause of every remaining stall.
+2. **Tightening exposes packing's contribution.** On leon2 d30, C→D cuts
+   traffic 93.59% and improves runtime 8.306x. Separately, with bound already
+   on, adding Strip24 to 204 cuts traffic 7.332→4.619 GB (37.01%) and
+   time 118.664→103.129 ms (1.151x). Without bound, the same addition
+   is only 1.017x: much larger later work hides the packing benefit.
+3. **A negative control prevents a misleading story.** On des_perf x16,
+   A→C reduces traffic only 0.28% and time is effectively unchanged
+   (51.592→51.452 ms). C→D reduces traffic 98.25% and time by 5.346x.
+   Its big incremental win is work elimination, not descriptor compression.
+
+Even traffic does not always fall with tighter bounds: netcard d10 rises
+0.894→0.920 GB from C→D despite fewer final SHORT candidates. Bound
+maintenance adds accesses too. Aggregate counters establish the net effect;
+they do not alone assign every byte to a particular cause.
+
+[All 32 traffic measurements, separate reads/writes and kernel counts](descriptor-ablation-traffic-20260910.csv)
+and [the complete controlled analysis](descriptor-ablation-20260910.md)
+include the omitted Strip24-only and bound-on marginal comparisons.
+
+## 7. Candidate counts: tightening removes work, not just records
+
+Every correct query returns K=1M costs. The following counts are **final
+materialized SHORT-pile candidates before top-K extraction**, not all products
+examined, LONG paths stored, or descriptor records. In this controlled campaign,
+A, B and C have the same count in every case; only D changes the pruning policy.
+
+| Benchmark | A/B/C: bound off | D: bound on | Reduction in excess above K |
+|---|---:|---:|---:|
+| netcard d10 | 4,353,439 | 2,396,640 | 58.35% |
+| netcard d50 | 2,864,158 | 1,906,498 | 51.37% |
+| leon2 d30 | 81,543,398 | 5,765,395 | 94.08% |
+| des_perf x16 | 175,649,447 | 5,503,945 | 97.42% |
+| M6 | 44,347,948 | 2,438,158 | 96.68% |
+| des_perf d30 | 1,034,196 | 1,032,704 | 4.36% |
+| nlpkkt120 | 1,039,987 | 1,038,691 | 3.24% |
+
+The last column is `1 - (count_after-K)/(count_before-K)`, not the percentage
+reduction in all generated candidates. All 43 counts remain in the full CSV.
+For leon2 d30, 81.54M→5.77M and the matching large traffic reduction support
+the pruning explanation. For des_perf d30, tightening removes only 1,492
+final candidates and slows C→D from 14.262 to 15.128 ms. Fewer candidates
+are not automatically faster, nor do these counts capture all traffic saved
+by not writing LONG nodes.
+
+## 8. Descriptor distribution: where each format applies
+
+A 204-byte descriptor and a 24-byte strip are not two sizes of the same
+object being converted back and forth. The 204 format shares multiple parents
+in the deferred branch; Strip24 packs selected LONG children of one active
+SHORT parent in the ordinary branch. Some children still become individual
+24-byte PfxtNodes. Later promotion materializes a node, not the other format.
+
+### Count represented candidates, not just descriptor records
+
+For each query, count each LONG candidate-generation event once, at its
+initial storage decision: in Strip24, in a 204-byte descriptor, or individually.
+Divide by the sum of those three counts. Later replay/promotion is not counted
+again. SHORT/SKIP outputs and LONG outputs suppressed after K are outside
+this denominator. These are cumulative storage events, not simultaneous live
+occupancy, distinct costs, or a percentage of all path-generation work.
+
+The following counts now come from **stage D, repetition 1 of the same new
+controlled timing campaign**. They replace the older standalone coverage
+table. [Exact counts and packing metrics](descriptor-ablation-coverage-20260910.csv)
+are saved separately. A single real run is used so counts remain integers and conserve the
+total; independently taking medians of categories could hide small packing
+differences. Three timing repetitions and all other variants remain in raw logs.
+Physical grouping can vary slightly while all audited workload totals agree.
+
+| Benchmark | LONG paths in Strip24 | LONG paths in 204 | Individual LONG paths |
+|---|---:|---:|---:|
+| netcard | 1,216,011 (96.118%) | 0 (0.000%) | 49,109 (3.882%) |
+| netcard d10 | 72,062,747 (99.963%) | 0 (0.000%) | 27,013 (0.037%) |
+| netcard d20 | 187,069,083 (99.714%) | 0 (0.000%) | 537,311 (0.286%) |
+| netcard d30 | 86,938 (0.025%) | 336,585,456 (97.598%) | 8,195,197 (2.376%) |
+| netcard d40 | 1,036 (<0.001%) | 306,986,244 (98.223%) | 5,553,899 (1.777%) |
+| netcard d50 | 1,232 (<0.001%) | 248,783,510 (98.638%) | 3,432,709 (1.361%) |
+| netcard x8 | 8,871 (0.981%) | 1,835 (0.203%) | 893,358 (98.816%) |
+| netcard x16 | 3,850 (0.141%) | 1,835 (0.067%) | 2,731,356 (99.792%) |
+| leon2 | 757,478 (94.884%) | 0 (0.000%) | 40,840 (5.116%) |
+| leon2 d10 | 9,460,390 (12.157%) | 53,247,896 (68.426%) | 15,109,738 (19.417%) |
+| leon2 d20 | 20,397,316 (9.434%) | 177,580,273 (82.129%) | 18,244,229 (8.438%) |
+| leon2 d30 | 18,221,529 (21.208%) | 47,091,951 (54.811%) | 20,603,829 (23.981%) |
+| leon2 d40 | 64,181,509 (63.527%) | 30,253,881 (29.945%) | 6,594,984 (6.528%) |
+| leon2 d50 | 13,803 (0.008%) | 149,329,095 (89.080%) | 18,292,218 (10.912%) |
+| leon2 x8 | 268,366 (25.372%) | 614 (0.058%) | 788,746 (74.570%) |
+| leon2 x16 | 376,077 (26.193%) | 614 (0.043%) | 1,059,118 (73.765%) |
+| leon3mp | 671,465 (89.363%) | 0 (0.000%) | 79,927 (10.637%) |
+| leon3mp d10 | 157,973,388 (99.751%) | 0 (0.000%) | 393,704 (0.249%) |
+| leon3mp d20 | 268,800,102 (99.320%) | 0 (0.000%) | 1,839,642 (0.680%) |
+| leon3mp d30 | 100,302,593 (99.247%) | 0 (0.000%) | 761,499 (0.753%) |
+| leon3mp d40 | 12,569,594 (8.084%) | 130,862,723 (84.167%) | 12,047,981 (7.749%) |
+| leon3mp d50 | 2,283 (0.001%) | 181,779,602 (95.306%) | 8,950,214 (4.693%) |
+| leon3mp x8 | 48,039 (8.450%) | 253 (0.045%) | 520,246 (91.506%) |
+| leon3mp x16 | 607,407 (12.381%) | 253 (0.005%) | 4,298,172 (87.614%) |
+| des_perf | 25,890 (23.607%) | 0 (0.000%) | 83,779 (76.393%) |
+| des_perf d10 | 51,625,075 (99.927%) | 345 (<0.001%) | 37,448 (0.072%) |
+| des_perf d20 | 26,736,993 (99.420%) | 349 (0.001%) | 155,700 (0.579%) |
+| des_perf d30 | 242,565,066 (99.811%) | 443 (<0.001%) | 459,881 (0.189%) |
+| des_perf d40 | 3,313 (0.001%) | 316,478,772 (95.945%) | 13,373,766 (4.054%) |
+| des_perf d50 | 4,672 (0.006%) | 69,830,995 (96.768%) | 2,327,601 (3.225%) |
+| des_perf x8 | 21,396 (3.048%) | 234 (0.033%) | 680,413 (96.919%) |
+| des_perf x16 | 12,176 (4.196%) | 234 (0.081%) | 277,784 (95.724%) |
+| vga_lcd | 20,851 (76.004%) | 328 (1.196%) | 6,255 (22.800%) |
+| vga_lcd d10 | 52,957,717 (99.422%) | 0 (0.000%) | 307,925 (0.578%) |
+| vga_lcd d20 | 132,322,277 (99.488%) | 78 (<0.001%) | 681,242 (0.512%) |
+| vga_lcd d30 | 52,603,442 (99.786%) | 77 (<0.001%) | 112,749 (0.214%) |
+| vga_lcd d40 | 206,781,706 (99.639%) | 77 (<0.001%) | 748,212 (0.361%) |
+| vga_lcd d50 | 106,059,287 (99.538%) | 1,482 (0.001%) | 491,235 (0.461%) |
+| vga_lcd x8 | 1,324,736 (92.117%) | 86 (0.006%) | 113,273 (7.877%) |
+| vga_lcd x16 | 2,181,833 (92.123%) | 414 (0.017%) | 186,148 (7.860%) |
+| cage15 | 19,744,042 (97.449%) | 0 (0.000%) | 516,817 (2.551%) |
+| M6 | 7,559 (99.802%) | 0 (0.000%) | 15 (0.198%) |
+| nlpkkt120 | 18,227,437 (100.000%) | 0 (0.000%) | 12 (<0.001%) |
+
+### How full is each recipe?
+
+Coverage tells us how many waiting paths use a format. **Paths per descriptor**
+tells us how efficiently it is packed. Neither quantity alone proves a runtime
+gain: the consumer must avoid enough work to repay its bookkeeping.
+
+| Benchmark | Strip24 records | Paths/strip | 204-byte records | Paths/204 |
+|---|---:|---:|---:|---:|
+| netcard | 70,573 | 17.23 | 0 | — |
+| netcard d10 | 3,478,895 | 20.71 | 0 | — |
+| netcard d50 | 46 | 26.78 | 1,987,153 | 125.20 |
+| leon2 d30 | 720,304 | 25.30 | 524,493 | 89.79 |
+| des_perf x16 | 3,044 | 4.00 | 15 | 15.60 |
+| M6 | 1,399 | 5.40 | 0 | — |
+
+The logical initial record bytes per represented LONG candidate are
+`(24*strips + 204*tiles + 24*individual_nodes)/total_LONG`.
+This excludes scratch, allocation capacity, shared arrays, replay reads and
+later materialization writes. Use measured traffic in section 6 for bandwidth
+claims, not this theoretical output-record ratio.
+
+### Distribution + traffic + timing: the explanation
+
+- **netcard d10:** 99.963% of stored LONG paths use Strip24, with 20.71
+  paths per strip on average. This matches the large B→C traffic/time benefit.
+- **netcard d50:** 98.639% use 204-byte descriptors; Strip24 covers less
+  than 0.001%. This matches the large A→B traffic reduction and negligible B→C gain.
+- **leon2 d30:** both formats cover substantial fractions. Their savings
+  remain useful after tight-bound removes much of the later work.
+- **des_perf x16:** 95.724% stay individual, so neither format covers much
+  of its stored LONG population. Its 0.081% 204 coverage cannot explain
+  the historical GPG-to-adaptive gap; the controlled timing/traffic comparison
+  confirms negligible packing gain and a large tightening gain.
+- **M6 is a denominator caution:** Strip24 covers 99.802%, but that means
+  only 7,559 LONG paths packed out of 7,574 stored. Adding Strip24 is essentially
+  neutral; tightening is the big gain. A high percentage over a tiny population
+  is not a large optimization opportunity.
+
+### Accounting overhead
+
+Counters reuse producer totals already available to the host for queue sizing:
+no new GPU scan, kernel launch or device-to-host transfer is added. Host-side
+accumulation/checking and diagnostic traces are enabled for every timed variant.
+Each window enforces conservation of LONG storage; independent strip telemetry
+also agrees. This is common instrumentation overhead, not proof of zero cost.
+
+The earlier three-pair counter-off/on check observed -1.48%, -0.86% and +1.18%
+cold-time changes on netcard d50, leon3mp d10 and des_perf respectively.
+These include noise and do not prove exact zero overhead. Its
+[instrumentation CSV](descriptor-coverage-overhead-20260910.csv) and
+[old coverage CSV](descriptor-coverage-20260910.csv) remain historical artifacts;
+they are not mixed into the new timing or distribution tables.
+
+## 9. Measurement audit and reproduction
+
+The new timing study is 43 graphs × 4 packing configurations × 2 bound
+settings × 3 repetitions = **1,032 queries**. Correctness is checked during
+timing, without an additional full validation pass. Every query returns
+K=1M costs matching the corrected GPG golden within the existing absolute
+1e-3 plus relative 1e-6 tolerance. This is cost validation, not bitwise
+path-identity equality. No retries, overflow or conservation failures were
+accepted. Raw-log audit verifies workload signatures, output counts, setup
+timers, bound updates without fallback, and saved executable/source checksums.
+
+All allocation/growth, descriptor production, replay, promotion, bookkeeping,
+bound cost gathering/sorting, scalar readback and synchronization are charged.
+Cold static setup is added **per trial before taking the median**. No graph-file
+loading or SFXT time is included. Unit tests cover Strip24 layout/packing,
+holes and bit 31, exact promotion, cutoff suppression, queue invalidation,
+parent-storage movement, coverage conservation and tight-bound numerical guards.
+The existing unit tests passed with assertions enabled.
+
+The 32 separate profiles cover four representative cases × eight settings.
+Raw metric totals and exactness/window/decision signatures were independently
+checked against timing logs. Nsight Compute uses application replay and the
+`descriptor_ablation_pfxt` NVTX range, without cache flushing or clock locking.
+Its runtime is not used in the progression table. Pre-query GPU-idle checks
+are not continuous proof of no interference; the GPU was idle after completion.
+
+From the `strip24-production` checkout with the current ablation-capable
+`build-strip/examples/tc-pfxt-inprocess-exactness` binary:
+
+```bash
+python3 scripts/run-descriptor-ablation.py --timing-only \
+  --data <corrected-csrbin-directory> \
+  --reference <fourway-results-directory> \
+  --out <new-timing-directory>
+python3 scripts/audit-descriptor-ablation.py <new-timing-directory>
+python3 scripts/report-descriptor-ablation.py <new-timing-directory> \
+  --csv <new-summary.csv>
+python3 scripts/profile-descriptor-ablation.py \
+  --data <corrected-csrbin-directory> \
+  --reference <fourway-results-directory> \
+  --ablation <new-timing-directory> \
+  --out <new-profile-directory>
 ```
 
-For example, 5,000,000 → 1,400,000 candidates at K=1,000,000 is 4,000,000 → 400,000 excess candidates: **90% fewer excess candidates**. This measures how much closer the stored candidate count is to K, not distance between cost thresholds. K is a reference point, not a proven attainable minimum for internal search work.
+Replace angle-bracket placeholders before running. The reference directory
+contains `cases.txt` and corrected `goldens/*_k1000000.gpg.costs`; reuse existing
+inputs rather than regenerate them. Output directories must be new. The
+runner clears inherited GPUCPG environment overrides, maps ablation modes
+1/2/3/4 to neither/204/24/both, and applies the uniform controls described in
+section 5. The profile helper defaults to Nsight Compute 2025.4.0 installed
+with CUDA 13.1 on this machine; override `--ncu` if necessary.
 
-| Benchmark | Adaptive 204 count | +Strip24 count | +Strip24 + bound count | Excess reduction: Strip24 → +bound |
-|---|---:|---:|---:|---:|
-| netcard | 1,257,046 | 1,257,046 | 1,225,474 | 12.28% |
-| netcard d10 | 4,353,439 | 4,353,439 | 2,396,640 | 58.35% |
-| netcard d20 | 2,084,474 | 3,757,593 | 2,470,661 | 46.67% |
-| netcard d30 | 1,120,011 | 1,120,011 | 1,115,803 | 3.51% |
-| netcard d40 | 3,672,596 | 3,672,596 | 2,471,298 | 44.95% |
-| netcard d50 | 2,864,158 | 2,864,158 | 1,906,498 | 51.37% |
-| netcard x8 | 2,235,631 | 2,235,631 | 1,685,484 | 44.52% |
-| netcard x16 | 17,632,314 | 17,632,314 | 3,586,124 | 84.45% |
-| leon2 | 3,897,584 | 3,897,584 | 1,852,937 | 70.56% |
-| leon2 d10 | 1,995,500 | 1,995,500 | 1,670,325 | 32.66% |
-| leon2 d20 | 1,551,252 | 1,551,252 | 1,460,343 | 16.49% |
-| leon2 d30 | 81,543,398 | 81,543,398 | 5,765,395 | 94.08% |
-| leon2 d40 | 2,029,631 | 2,029,631 | 1,583,854 | 43.29% |
-| leon2 d50 | 2,787,358 | 2,787,358 | 2,045,352 | 41.51% |
-| leon2 x8 | 10,808,122 | 10,808,122 | 1,771,342 | 92.14% |
-| leon2 x16 | 1,182,354 | 1,182,354 | 1,178,994 | 1.84% |
-| leon3mp | 3,898,207 | 3,898,207 | 1,946,414 | 67.34% |
-| leon3mp d10 | 1,100,733 | 18,335,880 | 6,503,347 | 68.25% |
-| leon3mp d20 | 2,413,444 | 9,073,472 | 4,262,236 | 59.59% |
-| leon3mp d30 | 2,497,881 | 3,491,491 | 1,950,593 | 61.85% |
-| leon3mp d40 | 1,913,577 | 1,913,577 | 1,663,113 | 27.42% |
-| leon3mp d50 | 1,078,487 | 1,078,487 | 1,078,031 | 0.58% |
-| leon3mp x8 | 3,416,102 | 3,416,102 | 2,108,690 | 54.11% |
-| leon3mp x16 | 32,215,553 | 32,215,553 | 3,397,905 | 92.32% |
-| des_perf | 1,045,966 | 1,045,966 | 1,016,087 | 65.00% |
-| des_perf d10 | 13,820,327 | 13,820,327 | 3,780,932 | 78.31% |
-| des_perf d20 | 1,222,410 | 1,222,410 | 1,193,177 | 13.14% |
-| des_perf d30 | 1,034,196 | 1,034,196 | 1,032,704 | 4.36% |
-| des_perf d40 | 1,092,966 | 1,092,966 | 1,088,998 | 4.27% |
-| des_perf d50 | 2,995,248 | 2,995,248 | 2,107,297 | 44.50% |
-| des_perf x8 | 7,159,537 | 7,159,537 | 2,893,668 | 69.26% |
-| des_perf x16 | 175,649,447 | 175,649,447 | 5,503,945 | 97.42% |
-| vga_lcd | 1,058,527 | 1,058,527 | 1,057,393 | 1.94% |
-| vga_lcd d10 | 3,128,204 | 3,128,204 | 1,974,273 | 54.22% |
-| vga_lcd d20 | 9,462,409 | 9,462,409 | 3,998,621 | 64.57% |
-| vga_lcd d30 | 2,313,101 | 2,313,101 | 1,921,794 | 29.80% |
-| vga_lcd d40 | 6,873,063 | 6,873,063 | 3,393,669 | 59.24% |
-| vga_lcd d50 | 2,272,742 | 2,272,742 | 1,726,141 | 42.95% |
-| vga_lcd x8 | 11,329,564 | 11,329,564 | 3,195,669 | 78.74% |
-| vga_lcd x16 | 9,226,121 | 9,226,121 | 2,923,658 | 76.62% |
-| cage15 | 1,546,814 | 1,546,814 | 1,377,707 | 30.93% |
-| M6 | 44,347,948 | 44,347,948 | 2,438,158 | 96.68% |
-| nlpkkt120 | 1,039,987 | 1,039,987 | 1,038,691 | 3.24% |
-
-N/A means the unbounded Strip24 run already had no excess candidates. Negative values mean the bounded run had more final stored candidates; they must not be hidden or interpreted as a pruning benefit.
-
-### Why some Strip24 counts differ from the 204-only counts
-
-The original ordinary path can sort its materialized LONG pile to choose a
-tighter final-window cutoff when a capacity threshold is reached. That shortcut
-cannot simply sort the remaining materialized nodes when some other candidates
-live inside strips: it would ignore those candidates. The Strip24 integration
-therefore guards that queue-only shortcut while strips are present or being
-created, and continues the ordinary split-growth flow instead.
-
-This is a search-policy difference as well as a representation change. The
-logs show the old final-window shortcut on leon3mp d10 only in the 204-only
-variant. Four unbounded cases have different final counts: netcard d20 and
-leon3mp d10/d20/d30. On leon3mp d10, 204-only stores 1.10M final candidates,
-Strip24 alone stores 18.34M, and Strip24 + bound stores 6.50M. The 68.25% entry
-means tightening removes excess relative to **18.34M**, not relative to 1.10M.
-Similarly, combined counts remain above the 204-only counts on netcard d20
-and leon3mp d20. All variants nevertheless pass the same top-K cost checks.
-
-Thus the table does not claim that the combined method always stores fewer
-final nodes than 204-only. Nor are final SHORT counts a complete memory-traffic
-measure: they omit the often much larger population of individually stored
-LONG nodes that Strip24 avoids. Candidate counts were identical across the
-three repetitions of each case/variant in this run.
-
-The large same-representation tightening examples are less ambiguous:
-leon2 d30 eliminates 94.08% of excess candidates, des_perf x16 97.42%, and
-M6 96.68%. On these cases, the final runtime also falls substantially.
-
-## Measurement audit
-
-All 172 initial correctness checks and 516 timed checks passed (43 cases × four
-variants × three repetitions for timing). The summarizer rejects missing/failed
-runs, count/overflow/retry errors, missing setup timers or candidate counts,
-and bound runs that did not update successfully without fallback. Cost
-comparison uses the existing 1e-3 absolute + 1e-6 relative tolerance, not bitwise
-equality. The runner exited successfully with `FULL SUITE COMPLETE`.
-
-Descriptor creation, allocation/growth, replay, materialization and bookkeeping are charged. Tight-bound cost gathering/sorting, safety checks and scalar synchronization are also charged. One-time static setup is added per trial before computing medians.
-
-[Full numerical data](strip24-fourway-20260910.csv). The CSV retains separate setup/PFXT/full-query diagnostics, descriptor usage and candidate-count ranges. The headline tables above do not omit cold setup.
-
-The GPU unit tests cover layout, packing/fallback, exact promotion, bit 31,
-K/final-cutoff suppression, appended-strip cache invalidation, parent-storage
-reallocation, incremental K-cost retention and floating-point guards. Both
-passed with assertions enabled. Checksums taken during the suite still match
-the benchmark binary and descriptor/bound implementation at completion. The
-GPU was idle afterward; pre-query checks found no competing process requiring
-a wait, but these checks are not continuous utilization monitoring.
-
-Reproduction helpers are `scripts/run-strip24-full.py --four-way`,
-`scripts/summarize-strip24-fourway.py` and `scripts/render-strip24-fourway.py`.
-The run uses existing corrected CSR binaries and goldens; it does not regenerate
-available inputs. Raw logs remain local under
-`experiments/strip24-fourway-20260910/`.
+This study's local raw logs are in
+`experiments/descriptor-ablation-timing-20260910/` and
+`experiments/descriptor-ablation-timing-traffic-20260910/`.
+See [the detailed ablation report](descriptor-ablation-20260910.md) for exact
+controls and machine-specific reproduction paths. The earlier production
+study's 688 passed checks and GPG runtime CSV are preserved separately; they
+are no longer used to claim an isolated descriptor benefit here.

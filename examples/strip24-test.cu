@@ -2,6 +2,7 @@
 #include "tc_pfxt_adaptive.cuh"
 #include "tc_pfxt_candidates.cuh"
 #include "strip24.cuh"
+#include "descriptor_coverage.hpp"
 #include <thrust/host_vector.h>
 #include <cassert>
 using namespace gpucpg;
@@ -9,6 +10,7 @@ template<class V>auto ptr(V& v){return thrust::raw_pointer_cast(v.data());}
 void test_producer_and_promotion(){
   static_assert(sizeof(strip24::Record)==24);
   assert(!strip24::pack(3,4));assert(strip24::pack(4,4));
+  for (int n = 0; n <= 32; ++n) assert(!strip24::pack(n,33));
   thrust::device_vector<PfxtNode> nodes(1000),longs(1000);
   nodes[0]=PfxtNode(0,-1,0,-1,0,0);nodes[1]=PfxtNode(0,-1,0,-1,0,10);nodes[2]=PfxtNode(0,-1,0,-1,0,20);
   thrust::device_vector<int> current(3,0),succ(1,-1),next(1,-1),offsets(std::vector<int>{0,16}),dsts(32,7);
@@ -94,6 +96,25 @@ void test_append_and_parent_reallocation() {
 }
 
 int main() {
+  DescriptorCoverage coverage;
+  coverage.ordinary(100, 3, 80);
+  coverage.grouped(7, 2, 600);
+  coverage.check_window(0, 707);
+  assert(coverage.strips == 3 && coverage.strip_paths == 80);
+  assert(coverage.tiles == 2 && coverage.tile_paths == 600 && coverage.individual == 27);
+  auto before = coverage.total();
+  coverage.ordinary(0, 0, 0); // K suppression emits nothing.
+  coverage.grouped(0, 0, 0);
+  coverage.check_window(before, 0);
+  coverage.ordinary(9, 0, 0); // Rejected packs remain individual.
+  coverage.check_window(before, 9);
+  bool rejected = false;
+  try { coverage.ordinary(3, 1, 4); } catch (const std::runtime_error&) { rejected = true; }
+  assert(rejected); rejected = false;
+  try { coverage.grouped(0, 1, 513); } catch (const std::runtime_error&) { rejected = true; }
+  assert(rejected); rejected = false;
+  try { coverage.check_window(before, 10); } catch (const std::runtime_error&) { rejected = true; }
+  assert(rejected);
   test_producer_and_promotion();
   test_append_and_parent_reallocation();
   std::cout << "STRIP24 UNIT PASS\n";

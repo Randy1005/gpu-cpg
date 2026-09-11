@@ -5,6 +5,7 @@
 #include "tc_pfxt_adaptive.cuh"
 #include "tc_pfxt_candidates.cuh"
 #include "strip24.cuh"
+#include "descriptor_coverage.hpp"
 #include "tc_pfxt_family_capture.cuh"
 #include "tc_pfxt_mma_dispatch.cuh"
 #include <thrust/scan.h>
@@ -8914,6 +8915,11 @@ struct AddTcPfxtInDiscoveryStats {
 };
 
 struct TcPfxtScratch {
+  // Environment 1..4 maps to mask 0..3; absent/zero means production.
+  // Mask bit 0 = 204, bit 1 = 24. The shared parser accepts positive values.
+  int descriptor_ablation = get_env_int_or_default("GPUCPG_DESCRIPTOR_ABLATION", 0) - 1;
+  bool measure_descriptor_coverage = get_env_int_or_default("GPUCPG_DESCRIPTOR_COVERAGE", 0) > 0;
+  DescriptorCoverage descriptor_coverage;
   strip24::Queue strip_queue;
   int source_local_epoch_counter = 0;
   int adaptive_stable_mode_windows = 0;
@@ -11824,6 +11830,7 @@ static void tc_pfxt_expand_window_single_pass(
   int chain_substep = 0;
   int total_short = 0;
   int total_long = 0;
+  const auto coverage_before = scratch.descriptor_coverage.total();
   std::uint64_t defer_oracle_paths = 0;
   std::uint64_t defer_oracle_products = 0;
   std::uint64_t defer_oracle_gpg_paths = 0;
@@ -11870,8 +11877,11 @@ static void tc_pfxt_expand_window_single_pass(
     }
   }
   const bool strip_requested = adaptive_defer_requested
-    && get_env_int_or_default("GPUCPG_STRIP24",0)>0;
-  const int strip_minimum = std::clamp(get_env_int_or_default("GPUCPG_STRIP24_MIN_LONG",4),2,32);
+    && (scratch.descriptor_ablation >= 0 || get_env_int_or_default("GPUCPG_STRIP24",0)>0);
+  // Keep the identical ordinary producer/count aggregation even with packing off.
+  const int strip_minimum = scratch.descriptor_ablation >= 0
+      && !(scratch.descriptor_ablation & 2) ? 33
+      : std::clamp(get_env_int_or_default("GPUCPG_STRIP24_MIN_LONG",4),2,32);
   if (adaptive_defer_requested) {
     source_local_stats.resize(1);
     adaptive_scalar_state.resize(strip_requested?5:3);
@@ -12200,7 +12210,8 @@ static void tc_pfxt_expand_window_single_pass(
             << " selected=" << (final_window_capacity_gate ? 1 : 0)
             << '\n';
         }
-        if (scratch.deferred_lpq_remaining == 0 && scratch.strip_queue.remaining==0 && h_scalar_state[3]==0
+        if (scratch.descriptor_ablation < 0
+            && scratch.deferred_lpq_remaining == 0 && scratch.strip_queue.remaining==0 && h_scalar_state[3]==0
             && final_window_capacity_gate) {
           const int num_short_paths_needed =
             k - (short_pile_size + h_short_added);
@@ -12339,6 +12350,8 @@ static void tc_pfxt_expand_window_single_pass(
         long_pile_size = long_capacity;
         total_short += h_short_added;
         total_long += h_long_added;
+        if (scratch.measure_descriptor_coverage)
+          scratch.descriptor_coverage.ordinary(h_long_added, pack_count, packed);
         step_timing.candidate_short_outputs += h_short_added;
         step_timing.candidate_long_outputs += h_long_added;
         if (substep_reaches_k) {
@@ -14034,7 +14047,8 @@ static void tc_pfxt_expand_window_single_pass(
           !use_tile_native_short_only
           && (source_local_tile_class_fastpath || use_tile_bound_fastpath);
         const bool use_deferred_lpq =
-          (deferred_lpq_requested || adaptive_defer_requested)
+          (scratch.descriptor_ablation < 0 || (scratch.descriptor_ablation & 1))
+          && (deferred_lpq_requested || adaptive_defer_requested)
           && use_compact_static_devs
           && fill_longs
           && !use_tile_native_short_only
@@ -14984,6 +14998,10 @@ static void tc_pfxt_expand_window_single_pass(
 	        step_timing.source_local_class_skip += h_source_local_class_counts_raw[2];
         total_short += substep_short;
         total_long += substep_long;
+        if (scratch.measure_descriptor_coverage)
+          scratch.descriptor_coverage.grouped(
+            fill_longs ? h_tail_long - base_long : 0,
+            h_deferred_tile_count - deferred_tile_base, h_deferred_products);
         if (substep_reaches_k) {
           reached_k_after_window = true;
         }
@@ -16347,6 +16365,14 @@ static void tc_pfxt_expand_window_single_pass(
   }
 
   h_num_short_paths = total_short;
+  if (scratch.descriptor_ablation >= 0) {
+    std::cout << "descriptor_ablation_window outer=" << outer_step
+      << " begin=" << window_start << " split=" << std::setprecision(9) << split
+      << " short=" << total_short << " long=" << total_long
+      << " chain_steps=" << sfx_chain_walk_steps << '\n';
+  }
+  if (scratch.measure_descriptor_coverage)
+    scratch.descriptor_coverage.check_window(coverage_before, total_long);
   if (reached_k_after_window) {
     long_pile.clear();
     long_pile.release();
@@ -19377,6 +19403,8 @@ void CpGen::report_paths(
           return promoted;
         };
 	    Timer timer;
+        if (tc_pfxt_scratch.descriptor_ablation >= 0)
+          gpucpg_nvtx_push("descriptor_ablation_pfxt");
 	    timer.start();
 	    while (true) {
       // get current expansion window size
@@ -20511,6 +20539,7 @@ void CpGen::report_paths(
     }
     total_gen_paths = short_pile_size;
     timer.stop();
+    if (tc_pfxt_scratch.descriptor_ablation >= 0) gpucpg_nvtx_pop();
     if (enable_tc_pfxt) {
       std::cout << "adaptive_pfxt_total_pairs=" << total_tc_pfxt_pairs << '\n';
     }
@@ -20798,6 +20827,16 @@ void CpGen::report_paths(
           << " parents=" << tc_pfxt_scratch.compressed_lpq_parents.size()
           << '\n';
       }
+    }
+    if (tc_pfxt_scratch.measure_descriptor_coverage) {
+      const auto& c = tc_pfxt_scratch.descriptor_coverage;
+      if (c.strips != tc_pfxt_scratch.strip_queue.created
+          || c.strip_paths != tc_pfxt_scratch.strip_queue.represented)
+        throw std::runtime_error("descriptor coverage strip telemetry mismatch");
+      std::cout << "descriptor_coverage strips=" << c.strips
+        << " strip_paths=" << c.strip_paths << " tiles=" << c.tiles
+        << " tile_paths=" << c.tile_paths << " individual=" << c.individual
+        << " total=" << c.total() << '\n';
     }
     if(get_env_int_or_default("GPUCPG_STRIP24",0)>0)std::cout<<"strip24_summary created="
       <<tc_pfxt_scratch.strip_queue.created<<" represented="<<tc_pfxt_scratch.strip_queue.represented
