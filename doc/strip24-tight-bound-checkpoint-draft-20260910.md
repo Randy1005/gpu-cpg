@@ -273,8 +273,9 @@ different work: pruning is the intended benefit.
 ### Full-suite progression
 
 Times are median **cold setup + PFXT in ms** over three standalone trials.
-**Each parenthesized speedup compares with the immediately preceding column**,
-not with GPG or stage A. Below 1 means a slowdown. Counts and unrounded times,
+**Each parenthesized speedup is cumulative relative to Adaptive-defer**, the
+first column: Adaptive-defer / current runtime. Below 1 means a slowdown.
+Counts and unrounded times,
 including trial ranges, are retained in the [full ablation CSV](descriptor-ablation-20260910.csv).
 The [presentation progression CSV](descriptor-progression-20260910.csv)
 contains these four stages and their incremental/cumulative speedups.
@@ -283,64 +284,64 @@ contains these four stages and their incremental/cumulative speedups.
 
 | Benchmark | A: No descriptors | B: Adaptive-defer (204) | C: +Strip24 | D: +Tight-bound |
 |---|---:|---:|---:|---:|
-| netcard | 6.981 | 6.971 (1.001x) | 6.513 (1.070x) | 7.059 (0.923x) |
-| leon2 | 9.573 | 9.508 (1.007x) | 9.106 (1.044x) | 9.177 (0.992x) |
-| leon3mp | 11.727 | 11.714 (1.001x) | 11.184 (1.047x) | 10.979 (1.019x) |
-| des_perf | 26.866 | 26.745 (1.004x) | 27.503 (0.972x) | 29.022 (0.948x) |
-| vga_lcd | 7.946 | 7.994 (0.994x) | 8.395 (0.952x) | 9.360 (0.897x) |
+| netcard | 6.981 | 6.971 (1.000x) | 6.513 (1.070x) | 7.059 (0.988x) |
+| leon2 | 9.573 | 9.508 (1.000x) | 9.106 (1.044x) | 9.177 (1.036x) |
+| leon3mp | 11.727 | 11.714 (1.000x) | 11.184 (1.047x) | 10.979 (1.067x) |
+| des_perf | 26.866 | 26.745 (1.000x) | 27.503 (0.972x) | 29.022 (0.922x) |
+| vga_lcd | 7.946 | 7.994 (1.000x) | 8.395 (0.952x) | 9.360 (0.854x) |
 
 #### Densified circuits
 
 | Benchmark | A: No descriptors | B: Adaptive-defer (204) | C: +Strip24 | D: +Tight-bound |
 |---|---:|---:|---:|---:|
-| netcard d10 | 33.123 | 33.405 (0.992x) | 16.773 (1.992x) | 15.786 (1.063x) |
-| netcard d20 | 70.356 | 70.292 (1.001x) | 25.648 (2.741x) | 24.550 (1.045x) |
-| netcard d30 | 118.362 | 96.048 (1.232x) | 93.382 (1.029x) | 94.053 (0.993x) |
-| netcard d40 | 157.733 | 109.404 (1.442x) | 109.374 (1.000x) | 98.925 (1.106x) |
-| netcard d50 | 142.471 | 116.298 (1.225x) | 116.689 (0.997x) | 109.193 (1.069x) |
-| leon2 d10 | 42.534 | 39.646 (1.073x) | 34.951 (1.134x) | 34.803 (1.004x) |
-| leon2 d20 | 86.802 | 60.415 (1.437x) | 52.341 (1.154x) | 53.358 (0.981x) |
-| leon2 d30 | 874.791 | 871.372 (1.004x) | 856.568 (1.017x) | 103.129 (8.306x) |
-| leon2 d40 | 77.326 | 76.463 (1.011x) | 51.617 (1.481x) | 48.219 (1.070x) |
-| leon2 d50 | 126.538 | 121.358 (1.043x) | 119.178 (1.018x) | 112.010 (1.064x) |
-| leon3mp d10 | 72.093 | 72.107 (1.000x) | 35.208 (2.048x) | 23.748 (1.483x) |
-| leon3mp d20 | 88.335 | 88.138 (1.002x) | 32.990 (2.672x) | 27.469 (1.201x) |
-| leon3mp d30 | 59.405 | 59.509 (0.998x) | 32.071 (1.856x) | 28.948 (1.108x) |
-| leon3mp d40 | 86.315 | 72.871 (1.184x) | 58.580 (1.244x) | 57.894 (1.012x) |
-| leon3mp d50 | 96.094 | 85.099 (1.129x) | 84.253 (1.010x) | 86.149 (0.978x) |
-| des_perf d10 | 40.549 | 40.230 (1.008x) | 27.670 (1.454x) | 14.992 (1.846x) |
-| des_perf d20 | 20.363 | 20.255 (1.005x) | 11.941 (1.696x) | 13.271 (0.900x) |
-| des_perf d30 | 48.564 | 48.525 (1.001x) | 14.262 (3.402x) | 15.128 (0.943x) |
-| des_perf d40 | 96.098 | 71.839 (1.338x) | 71.802 (1.001x) | 71.899 (0.999x) |
-| des_perf d50 | 74.363 | 69.293 (1.073x) | 69.082 (1.003x) | 64.525 (1.071x) |
-| vga_lcd d10 | 30.916 | 30.995 (0.997x) | 16.684 (1.858x) | 15.476 (1.078x) |
-| vga_lcd d20 | 63.374 | 63.094 (1.004x) | 35.144 (1.795x) | 23.440 (1.499x) |
-| vga_lcd d30 | 38.335 | 38.356 (0.999x) | 20.931 (1.833x) | 20.560 (1.018x) |
-| vga_lcd d40 | 81.290 | 81.031 (1.003x) | 35.640 (2.274x) | 25.867 (1.378x) |
-| vga_lcd d50 | 52.536 | 52.654 (0.998x) | 24.687 (2.133x) | 24.132 (1.023x) |
+| netcard d10 | 33.123 | 33.405 (1.000x) | 16.773 (1.992x) | 15.786 (2.116x) |
+| netcard d20 | 70.356 | 70.292 (1.000x) | 25.648 (2.741x) | 24.550 (2.863x) |
+| netcard d30 | 118.362 | 96.048 (1.000x) | 93.382 (1.029x) | 94.053 (1.021x) |
+| netcard d40 | 157.733 | 109.404 (1.000x) | 109.374 (1.000x) | 98.925 (1.106x) |
+| netcard d50 | 142.471 | 116.298 (1.000x) | 116.689 (0.997x) | 109.193 (1.065x) |
+| leon2 d10 | 42.534 | 39.646 (1.000x) | 34.951 (1.134x) | 34.803 (1.139x) |
+| leon2 d20 | 86.802 | 60.415 (1.000x) | 52.341 (1.154x) | 53.358 (1.132x) |
+| leon2 d30 | 874.791 | 871.372 (1.000x) | 856.568 (1.017x) | 103.129 (8.449x) |
+| leon2 d40 | 77.326 | 76.463 (1.000x) | 51.617 (1.481x) | 48.219 (1.586x) |
+| leon2 d50 | 126.538 | 121.358 (1.000x) | 119.178 (1.018x) | 112.010 (1.083x) |
+| leon3mp d10 | 72.093 | 72.107 (1.000x) | 35.208 (2.048x) | 23.748 (3.036x) |
+| leon3mp d20 | 88.335 | 88.138 (1.000x) | 32.990 (2.672x) | 27.469 (3.209x) |
+| leon3mp d30 | 59.405 | 59.509 (1.000x) | 32.071 (1.856x) | 28.948 (2.056x) |
+| leon3mp d40 | 86.315 | 72.871 (1.000x) | 58.580 (1.244x) | 57.894 (1.259x) |
+| leon3mp d50 | 96.094 | 85.099 (1.000x) | 84.253 (1.010x) | 86.149 (0.988x) |
+| des_perf d10 | 40.549 | 40.230 (1.000x) | 27.670 (1.454x) | 14.992 (2.683x) |
+| des_perf d20 | 20.363 | 20.255 (1.000x) | 11.941 (1.696x) | 13.271 (1.526x) |
+| des_perf d30 | 48.564 | 48.525 (1.000x) | 14.262 (3.402x) | 15.128 (3.208x) |
+| des_perf d40 | 96.098 | 71.839 (1.000x) | 71.802 (1.001x) | 71.899 (0.999x) |
+| des_perf d50 | 74.363 | 69.293 (1.000x) | 69.082 (1.003x) | 64.525 (1.074x) |
+| vga_lcd d10 | 30.916 | 30.995 (1.000x) | 16.684 (1.858x) | 15.476 (2.003x) |
+| vga_lcd d20 | 63.374 | 63.094 (1.000x) | 35.144 (1.795x) | 23.440 (2.692x) |
+| vga_lcd d30 | 38.335 | 38.356 (1.000x) | 20.931 (1.832x) | 20.560 (1.866x) |
+| vga_lcd d40 | 81.290 | 81.031 (1.000x) | 35.640 (2.274x) | 25.867 (3.133x) |
+| vga_lcd d50 | 52.536 | 52.654 (1.000x) | 24.687 (2.133x) | 24.132 (2.182x) |
 
 #### Scaled circuits
 
 | Benchmark | A: No descriptors | B: Adaptive-defer (204) | C: +Strip24 | D: +Tight-bound |
 |---|---:|---:|---:|---:|
-| netcard x8 | 10.168 | 10.136 (1.003x) | 10.098 (1.004x) | 11.395 (0.886x) |
-| netcard x16 | 21.914 | 22.071 (0.993x) | 22.223 (0.993x) | 18.349 (1.211x) |
-| leon2 x8 | 16.281 | 16.610 (0.980x) | 16.624 (0.999x) | 13.409 (1.240x) |
-| leon2 x16 | 15.956 | 16.219 (0.984x) | 16.385 (0.990x) | 17.832 (0.919x) |
-| leon3mp x8 | 11.025 | 11.159 (0.988x) | 11.431 (0.976x) | 11.887 (0.962x) |
-| leon3mp x16 | 26.858 | 27.278 (0.985x) | 27.326 (0.998x) | 17.338 (1.576x) |
-| des_perf x8 | 7.653 | 7.576 (1.010x) | 7.540 (1.005x) | 8.064 (0.935x) |
-| des_perf x16 | 51.592 | 51.701 (0.998x) | 51.452 (1.005x) | 9.625 (5.346x) |
-| vga_lcd x8 | 14.460 | 14.528 (0.995x) | 13.170 (1.103x) | 10.205 (1.291x) |
-| vga_lcd x16 | 14.690 | 14.861 (0.988x) | 12.434 (1.195x) | 10.389 (1.197x) |
+| netcard x8 | 10.168 | 10.136 (1.000x) | 10.098 (1.004x) | 11.395 (0.890x) |
+| netcard x16 | 21.914 | 22.071 (1.000x) | 22.223 (0.993x) | 18.349 (1.203x) |
+| leon2 x8 | 16.281 | 16.610 (1.000x) | 16.624 (0.999x) | 13.409 (1.239x) |
+| leon2 x16 | 15.956 | 16.219 (1.000x) | 16.385 (0.990x) | 17.832 (0.910x) |
+| leon3mp x8 | 11.025 | 11.159 (1.000x) | 11.431 (0.976x) | 11.887 (0.939x) |
+| leon3mp x16 | 26.858 | 27.278 (1.000x) | 27.326 (0.998x) | 17.338 (1.573x) |
+| des_perf x8 | 7.653 | 7.576 (1.000x) | 7.540 (1.005x) | 8.064 (0.939x) |
+| des_perf x16 | 51.592 | 51.701 (1.000x) | 51.452 (1.005x) | 9.625 (5.372x) |
+| vga_lcd x8 | 14.460 | 14.528 (1.000x) | 13.170 (1.103x) | 10.205 (1.424x) |
+| vga_lcd x16 | 14.690 | 14.861 (1.000x) | 12.434 (1.195x) | 10.389 (1.430x) |
 
 #### Non-circuit graphs
 
 | Benchmark | A: No descriptors | B: Adaptive-defer (204) | C: +Strip24 | D: +Tight-bound |
 |---|---:|---:|---:|---:|
-| cage15 | 22.554 | 22.510 (1.002x) | 13.406 (1.679x) | 14.255 (0.940x) |
-| M6 | 18.708 | 18.632 (1.004x) | 18.591 (1.002x) | 4.852 (3.832x) |
-| nlpkkt120 | 8.084 | 8.094 (0.999x) | 5.465 (1.481x) | 6.102 (0.896x) |
+| cage15 | 22.554 | 22.510 (1.000x) | 13.406 (1.679x) | 14.255 (1.579x) |
+| M6 | 18.708 | 18.632 (1.000x) | 18.591 (1.002x) | 4.852 (3.840x) |
+| nlpkkt120 | 8.084 | 8.094 (1.000x) | 5.465 (1.481x) | 6.102 (1.326x) |
 
 ### What to emphasize to the audience
 
@@ -360,6 +361,9 @@ contains these four stages and their incremental/cumulative speedups.
   nlpkkt120 5.465→6.102 ms. Saved work can be too small to repay maintenance.
   Tiny changes near 1x are not convincing wins; inspect the CSV's trial ranges.
 
+The parenthesized values in these tables are cumulative from Adaptive-defer.
+For incremental attribution, use the separate `descriptor-progression-20260910.csv`
+columns `strip24_incremental_speedup` and `tight_bound_incremental_speedup`.
 The incremental attribution depends on the chosen order. As a cross-check,
 the full 2×2 experiment also tests Strip24 without 204: with bound off,
 Strip24 alone gives a 1.316x geomean, versus 1.313x when added to 204;
